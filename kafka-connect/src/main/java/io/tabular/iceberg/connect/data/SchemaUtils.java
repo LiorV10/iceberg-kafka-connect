@@ -331,6 +331,7 @@ public class SchemaUtils {
         List<NestedField> structFields =
             map.entrySet().stream()
                 .filter(entry -> entry.getKey() != null && entry.getValue() != null)
+                .filter((field -> !config.excludeFields().contains(field.getKey().toString())))
                 .map(
                     entry -> {
                       Optional<Type> valueType = inferIcebergType(entry.getValue());

@@ -166,27 +166,29 @@ public class RecordConverter {
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
-          if (tableField == null) {
-            // add the column if schema evolution is on, otherwise skip the value,
-            // skip the add column if we can't infer the type
-            if (schemaUpdateConsumer != null) {
-              Optional<Type> type = SchemaUtils.inferIcebergType(recordFieldValue, config);
-              if (type.isPresent()) {
-                String parentFieldName =
-                    structFieldId < 0 ? null : tableSchema.findColumnName(structFieldId);
-                schemaUpdateConsumer.addColumn(parentFieldName, recordFieldName, type.get());
+
+          if (!config.excludeFields().contains(recordFieldName)) {
+            if (tableField == null) {
+              // add the column if schema evolution is on, otherwise skip the value,
+              // skip the add column if we can't infer the type
+              if (schemaUpdateConsumer != null) {
+                Optional<Type> type = SchemaUtils.inferIcebergType(recordFieldValue, config);
+                if (type.isPresent()) {
+                  String parentFieldName =
+                      structFieldId < 0 ? null : tableSchema.findColumnName(structFieldId);
+                  schemaUpdateConsumer.addColumn(parentFieldName, recordFieldName, type.get());
+                }
               }
+            } else {
+              result.setField(
+                  tableField.name(),
+                  convertValue(
+                      recordFieldValue,
+                      tableField.type(),
+                      tableField.fieldId(),
+                      schemaUpdateConsumer));
             }
-          } else {
-            result.setField(
-                tableField.name(),
-                convertValue(
-                    recordFieldValue,
-                    tableField.type(),
-                    tableField.fieldId(),
-                    schemaUpdateConsumer));
-          }
-        });
+        }});
     return result;
   }
 
@@ -199,6 +201,8 @@ public class RecordConverter {
     struct
         .schema()
         .fields()
+        .stream()
+        .filter((field -> !config.excludeFields().contains(field.name())))
         .forEach(
             recordField -> {
               NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);

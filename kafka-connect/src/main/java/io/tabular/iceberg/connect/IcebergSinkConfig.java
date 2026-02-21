@@ -69,6 +69,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_PROP = "iceberg.tables";
   private static final String TABLES_DYNAMIC_PROP = "iceberg.tables.dynamic-enabled";
   private static final String TABLES_ROUTE_FIELD_PROP = "iceberg.tables.route-field";
+  public static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
@@ -117,6 +118,8 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   private static ConfigDef newConfigDef() {
     ConfigDef configDef = new ConfigDef();
+    configDef.define(TABLES_EXCLUDE_FIELDS_PROP, Type.LIST, null, Importance.MEDIUM, "Fields to exclude from final " +
+            "schema");
     configDef.define(
         TABLES_PROP,
         Type.LIST,
@@ -347,6 +350,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String tablesDefaultPartitionBy() {
     return getString(TABLES_DEFAULT_PARTITION_BY);
+  }
+
+  public List<String> excludeFields() {
+    return getList(TABLES_EXCLUDE_FIELDS_PROP);
   }
 
   public TableSinkConfig tableConfig(String tableName) {
