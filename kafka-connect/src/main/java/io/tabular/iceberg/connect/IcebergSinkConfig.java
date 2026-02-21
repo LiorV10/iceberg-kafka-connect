@@ -80,6 +80,8 @@ public class IcebergSinkConfig extends AbstractConfig {
       "iceberg.tables.auto-create-enabled";
   private static final String TABLES_EVOLVE_SCHEMA_ENABLED_PROP =
       "iceberg.tables.evolve-schema-enabled";
+  private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
+      "iceberg.tables.destructive-schema-evolution-enabled";
   private static final String TABLES_SCHEMA_FORCE_OPTIONAL_PROP =
       "iceberg.tables.schema-force-optional";
   private static final String TABLES_SCHEMA_CASE_INSENSITIVE_PROP =
@@ -192,6 +194,13 @@ public class IcebergSinkConfig extends AbstractConfig {
         false,
         Importance.MEDIUM,
         "Set to true to add any missing record fields to the table schema, false otherwise");
+    configDef.define(
+            TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to drop missing record fields from table schema, false otherwise"
+    );
     configDef.define(
         CATALOG_NAME_PROP,
         Type.STRING,
@@ -445,6 +454,8 @@ public class IcebergSinkConfig extends AbstractConfig {
   public boolean evolveSchemaEnabled() {
     return getBoolean(TABLES_EVOLVE_SCHEMA_ENABLED_PROP);
   }
+
+  public boolean destructiveSchemaEvolutionEnabled() { return getBoolean(TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP); }
 
   public boolean schemaForceOptional() {
     return getBoolean(TABLES_SCHEMA_FORCE_OPTIONAL_PROP);

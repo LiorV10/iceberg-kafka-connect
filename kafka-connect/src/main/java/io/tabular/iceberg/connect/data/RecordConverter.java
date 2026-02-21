@@ -40,9 +40,11 @@ import java.time.temporal.Temporal;
 import java.util.Base64;
 import java.util.Date;
 import java.util.List;
+import java.util.Set;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
@@ -63,6 +65,7 @@ import org.apache.iceberg.types.Types.NestedField;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.types.Types.TimestampType;
 import org.apache.iceberg.util.DateTimeUtil;
+import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
 
 public class RecordConverter {
@@ -162,6 +165,7 @@ public class RecordConverter {
       int structFieldId,
       SchemaUpdate.Consumer schemaUpdateConsumer) {
     GenericRecord result = GenericRecord.create(schema);
+    Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
@@ -180,13 +184,27 @@ public class RecordConverter {
                 }
               }
             } else {
-              result.setField(
-                  tableField.name(),
-                  convertValue(
-                      recordFieldValue,
-                      tableField.type(),
-                      tableField.fieldId(),
-                      schemaUpdateConsumer));
+              boolean hasSchemaUpdates = false;
+
+              // drop column if removed for schema and destructive evolution is on
+              if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+                List<NestedField> columnsToDrop = tableSchema.columns().stream()
+                  .filter(col -> !incomingFieldNames.contains(col.name()))
+                  .collect(toList());
+
+                columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+                hasSchemaUpdates = !columnsToDrop.isEmpty();
+              }
+
+              if (!hasSchemaUpdates) {
+                result.setField(
+                        tableField.name(),
+                        convertValue(
+                                recordFieldValue,
+                                tableField.type(),
+                                tableField.fieldId(),
+                                schemaUpdateConsumer));
+              }
             }
         }});
     return result;
@@ -198,11 +216,10 @@ public class RecordConverter {
       int structFieldId,
       SchemaUpdate.Consumer schemaUpdateConsumer) {
     GenericRecord result = GenericRecord.create(schema);
+    Set<String> incomingFieldNames = struct.schema().fields().stream().map(Field::name).collect(Collectors.toSet());
     struct
         .schema()
         .fields()
-        .stream()
-        .filter((field -> !config.excludeFields().contains(field.name())))
         .forEach(
             recordField -> {
               NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);
@@ -230,6 +247,13 @@ public class RecordConverter {
                     String fieldName = tableSchema.findColumnName(tableField.fieldId());
                     schemaUpdateConsumer.makeOptional(fieldName);
                     hasSchemaUpdates = true;
+                  }
+                  // drop column if removed for schema and destructive evolution is on
+                  if (config.destructiveSchemaEvolutionEnabled()) {
+                    tableSchema.columns()
+                        .stream()
+                        .filter(col -> !incomingFieldNames.contains(col.name()))
+                        .forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
                   }
                 }
                 if (!hasSchemaUpdates) {
