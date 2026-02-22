@@ -31,10 +31,12 @@ The zip archive will be found under `./kafka-connect-runtime/build/distributions
 | iceberg.tables.default-commit-branch       | Default branch for commits, main is used if not specified                                                        |
 | iceberg.tables.default-id-columns          | Default comma-separated list of columns that identify a row in tables (primary key)                              |
 | iceberg.tables.default-partition-by        | Default comma-separated list of partition fields to use when creating tables                                     |
+| iceberg.tables.exclude-fields              | comma-separated list of fields to exclude from the target table's schema                                         |
 | iceberg.tables.cdc-field                   | Name of the field containing the CDC operation, `I`, `U`, or `D`, default is none                                |
 | iceberg.tables.upsert-mode-enabled         | Set to `true` to enable upsert mode, default is `false`                                                          |
 | iceberg.tables.auto-create-enabled         | Set to `true` to automatically create destination tables, default is `false`                                     |
 | iceberg.tables.evolve-schema-enabled       | Set to `true` to add any missing record fields to the table schema, default is `false`                           |
+| iceberg.tables.destructive-schema-evolution-enabled       | Set to `true` to drop missing record fields from table schema, `false` otherwise                           |
 | iceberg.tables.schema-force-optional       | Set to `true` to set columns as optional during table create and evolution, default is `false` to respect schema |
 | iceberg.tables.schema-case-insensitive     | Set to `true` to look up table columns by case-insensitive name, default is `false` for case-sensitive           |
 | iceberg.tables.auto-create-props.*         | Properties set on new tables during auto-create                                                                  |
