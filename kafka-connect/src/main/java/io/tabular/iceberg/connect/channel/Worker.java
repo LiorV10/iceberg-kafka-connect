@@ -93,10 +93,12 @@ class Worker implements Writer, AutoCloseable {
         new TopicPartition(record.topic(), record.kafkaPartition()),
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
-    if (config.dynamicTablesEnabled()) {
-      routeRecordDynamically(record);
-    } else {
-      routeRecordStatically(record);
+    if (!Utilities.isFlagRecord(record)) {
+      if (config.dynamicTablesEnabled()) {
+        routeRecordDynamically(record);
+      } else {
+        routeRecordStatically(record);
+      }
     }
   }
 
