@@ -23,12 +23,7 @@ import io.tabular.iceberg.connect.data.Utilities;
 
 import java.util.Collection;
 
-import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.io.CloseableIterable;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
@@ -39,40 +34,15 @@ public class TaskImpl implements Task, AutoCloseable {
   private final Catalog catalog;
   private final Writer writer;
   private final Committer committer;
-  // private final IcebergSinkConfig config;
-
-  private static final Logger LOG = LoggerFactory.getLogger(TaskImpl.class);
 
   public TaskImpl(SinkTaskContext context, IcebergSinkConfig config) {
     this.catalog = Utilities.loadCatalog(config);
     this.writer = new Worker(config, catalog);
     this.committer = new CommitterImpl(context, config, catalog);
-    // this.config = config;
-  }
-
-  private boolean handleFlagRecord(SinkRecord record) {
-    if (!Utilities.isFlagRecord(record)) {
-      return false;
-    } else {
-      LOG.debug("Handling flag record");
-      // TODO: replace '__target_table' with config field value
-      // TODO: replace 'dev' with config field value
-
-      String targetId = Utilities.extractFromRecordValue(record, "__target_table").toString();
-      Table targetTable = catalog.loadTable(TableIdentifier.parse(targetId));
-
-      // targetTable.manageSnapshots().replaceBranch("").commit();
-      targetTable.manageSnapshots().setCurrentSnapshot(targetTable.snapshot("dev").snapshotId()).commit();
-    }
-
-    return true;
   }
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    // filter out flag records
-    sinkRecords.removeIf(this::handleFlagRecord);
-
     writer.write(sinkRecords);
     committer.commit(writer);
   }

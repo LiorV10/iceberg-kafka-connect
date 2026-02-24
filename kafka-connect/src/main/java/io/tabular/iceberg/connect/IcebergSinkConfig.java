@@ -69,6 +69,8 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_PROP = "iceberg.tables";
   private static final String TABLES_DYNAMIC_PROP = "iceberg.tables.dynamic-enabled";
   private static final String TABLES_ROUTE_FIELD_PROP = "iceberg.tables.route-field";
+  private static final String BRANCH_DYNAMIC_PROP = "iceberg.branch.dynamic-enabled";
+  private static final String BRANCH_REGEX_DELIMITER_PROP = "iceberg.branch.regex-delimiter";
   public static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
@@ -78,6 +80,8 @@ public class IcebergSinkConfig extends AbstractConfig {
       "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_AUTO_CREATE_ENABLED_PROP =
       "iceberg.tables.auto-create-enabled";
+  private static final String BRANCHES_AUTO_CREATE_ENABLED_PROP =
+          "iceberg.branch.auto-create-enabled";
   private static final String TABLES_EVOLVE_SCHEMA_ENABLED_PROP =
       "iceberg.tables.evolve-schema-enabled";
   private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
@@ -120,8 +124,7 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   private static ConfigDef newConfigDef() {
     ConfigDef configDef = new ConfigDef();
-    configDef.define(TABLES_EXCLUDE_FIELDS_PROP, Type.LIST, null, Importance.MEDIUM, "Fields to exclude from final " +
-            "schema");
+    configDef.define(TABLES_EXCLUDE_FIELDS_PROP, Type.LIST, null, Importance.MEDIUM, "Fields to exclude from final schema");
     configDef.define(
         TABLES_PROP,
         Type.LIST,
@@ -140,6 +143,18 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Source record field for routing records to tables");
+    configDef.define(
+        BRANCH_DYNAMIC_PROP,
+        Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Enable dynamic routing to branches based on a record value");
+    configDef.define(
+            BRANCH_REGEX_DELIMITER_PROP,
+        Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Source record field for routing records to branches");
     configDef.define(
         TABLES_DEFAULT_COMMIT_BRANCH,
         Type.STRING,
@@ -177,6 +192,12 @@ public class IcebergSinkConfig extends AbstractConfig {
         Importance.MEDIUM,
         "Set to true to automatically create destination tables, false otherwise");
     configDef.define(
+        BRANCHES_AUTO_CREATE_ENABLED_PROP,
+        Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Set to true to automatically create destination branches, false otherwise");
+    configDef.define(
         TABLES_SCHEMA_FORCE_OPTIONAL_PROP,
         Type.BOOLEAN,
         false,
@@ -195,11 +216,11 @@ public class IcebergSinkConfig extends AbstractConfig {
         Importance.MEDIUM,
         "Set to true to add any missing record fields to the table schema, false otherwise");
     configDef.define(
-            TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP,
-            Type.BOOLEAN,
-            false,
-            Importance.MEDIUM,
-            "Set to true to drop missing record fields from table schema, false otherwise"
+        TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP,
+        Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Set to true to drop missing record fields from table schema, false otherwise"
     );
     configDef.define(
         CATALOG_NAME_PROP,
@@ -293,6 +314,9 @@ public class IcebergSinkConfig extends AbstractConfig {
     } else if (dynamicTablesEnabled()) {
       checkState(
           tablesRouteField() != null, "Must specify a route field if using dynamic table names");
+    } else if (dynamicBranchesEnabled()) {
+      checkState(
+            branchesRegexDelimiter() != null, "Must specify a regex delimiter if using dynamic branch names");
     } else {
       throw new ConfigException("Must specify table name(s)");
     }
@@ -347,6 +371,14 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String tablesRouteField() {
     return getString(TABLES_ROUTE_FIELD_PROP);
+  }
+
+  public boolean dynamicBranchesEnabled() {
+    return getBoolean(BRANCH_DYNAMIC_PROP);
+  }
+
+  public String branchesRegexDelimiter() {
+    return getString(BRANCH_REGEX_DELIMITER_PROP);
   }
 
   public String tablesDefaultCommitBranch() {
@@ -449,6 +481,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public boolean autoCreateEnabled() {
     return getBoolean(TABLES_AUTO_CREATE_ENABLED_PROP);
+  }
+
+  public boolean branchAutoCreateEnabled() {
+    return getBoolean(BRANCHES_AUTO_CREATE_ENABLED_PROP);
   }
 
   public boolean evolveSchemaEnabled() {

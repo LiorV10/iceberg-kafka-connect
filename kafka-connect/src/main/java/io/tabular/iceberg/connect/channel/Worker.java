@@ -21,6 +21,7 @@ package io.tabular.iceberg.connect.channel;
 import static java.util.stream.Collectors.toList;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.TableContext;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.RecordWriter;
@@ -30,7 +31,10 @@ import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+
+import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -47,9 +51,11 @@ class Worker implements Writer, AutoCloseable {
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
+  private Catalog catalog;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
     this(config, new IcebergWriterFactory(catalog, config));
+    this.catalog = catalog;
   }
 
   @VisibleForTesting
@@ -86,6 +92,16 @@ class Worker implements Writer, AutoCloseable {
     }
   }
 
+  private void handleFlagRecord(SinkRecord record) {
+    LOG.debug("Handling flag record");
+
+    String targetId = Utilities.extractFromRecordValue(record.value(), this.config.tablesRouteField()).toString();
+    TableContext context = TableContext.parse(TableIdentifier.parse(targetId), this.config.branchesRegexDelimiter());
+    Table targetTable = this.catalog.loadTable(context.tableIdentifier());
+
+    targetTable.manageSnapshots().setCurrentSnapshot(targetTable.snapshot(context.branch()).snapshotId()).commit();
+  }
+
   private void save(SinkRecord record) {
     // the consumer stores the offsets that corresponds to the next record to consume,
     // so increment the record offset by one
@@ -93,7 +109,9 @@ class Worker implements Writer, AutoCloseable {
         new TopicPartition(record.topic(), record.kafkaPartition()),
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
-    if (!Utilities.isFlagRecord(record)) {
+    if (Utilities.isFlagRecord(record)) {
+      handleFlagRecord(record);
+    } else {
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {

@@ -33,6 +33,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
+
+import io.tabular.iceberg.connect.TableContext;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -176,11 +178,20 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private void commitToTable(
-      TableIdentifier tableIdentifier,
+      TableIdentifier paramTableIdentifier,
       List<Envelope> envelopeList,
       String offsetsJson,
       OffsetDateTime vtts) {
     Table table;
+    TableIdentifier tableIdentifier = paramTableIdentifier;
+    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+
+    if (this.config.dynamicBranchesEnabled()) {
+      TableContext tableContext = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
+      tableIdentifier = tableContext.tableIdentifier();
+      branch = Optional.ofNullable(tableContext.branch());
+    }
+
     try {
       table = catalog.loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
@@ -188,7 +199,13 @@ public class Coordinator extends Channel implements AutoCloseable {
       return;
     }
 
-    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+    if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
+      try {
+        table.manageSnapshots().createBranch(branch.get(), table.history().get(0).snapshotId()).commit();
+      } catch (IllegalArgumentException ignored) {
+        // branch already exists
+      }
+    }
 
     Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
 
