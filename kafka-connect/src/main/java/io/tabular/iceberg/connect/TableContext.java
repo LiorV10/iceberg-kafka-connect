@@ -26,7 +26,11 @@ public class TableContext {
   private final String branch;
 
   public static String parseBranch(String tableName, String regex) {
-      return TableContext.parse(TableIdentifier.of("", tableName), regex).branch();
+      return TableContext.parse(TableIdentifier.parse(tableName), regex).branch();
+  }
+
+  public static String parseName(String tableName, String regex) {
+    return TableContext.parse(TableIdentifier.parse(tableName), regex).tableIdentifier().toString();
   }
 
   public static TableContext parse(TableIdentifier tableIdentifier, String regex) {

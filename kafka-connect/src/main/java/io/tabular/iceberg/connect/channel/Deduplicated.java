@@ -20,6 +20,8 @@ package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
 
+import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Objects;
@@ -100,6 +102,26 @@ class Deduplicated {
         "delete",
         DataWritten::deleteFiles,
         deleteFile -> deleteFile.path().toString());
+  }
+
+  /**
+   * Returns all flag messages from the batch of envelopes.
+   * Flag messages are identified by having empty data and delete files.
+   * The branch information is encoded in the table identifier.
+   */
+  public static List<TableContext> flagMessages(
+      UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex) {
+    return envelopes.stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+          // Check if this is a flag message: empty data/delete files
+          List<DataFile> dataFiles = dataWritten.dataFiles();
+          List<DeleteFile> deleteFiles = dataWritten.deleteFiles();
+          return (dataFiles == null || dataFiles.isEmpty()) && 
+                 (deleteFiles == null || deleteFiles.isEmpty());
+        })
+        .map(dataWritten -> TableContext.parse(dataWritten.tableReference().identifier(), regex))
+        .collect(toList());
   }
 
   private static <F> List<F> deduplicatedFiles(

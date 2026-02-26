@@ -66,8 +66,8 @@ public class Utilities {
   private static final List<String> HADOOP_CONF_FILES =
       ImmutableList.of("core-site.xml", "hdfs-site.xml", "hive-site.xml");
 
-  public static boolean isFlagRecord(SinkRecord record) {
-    return record.key().toString().equals("EVENT");
+  public static boolean isFlagRecord(SinkRecord record, String prefix) {
+    return record.key() != null && record.key().toString().startsWith(prefix);
   }
 
   public static Catalog loadCatalog(IcebergSinkConfig config) {

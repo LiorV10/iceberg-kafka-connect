@@ -72,6 +72,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String BRANCH_DYNAMIC_PROP = "iceberg.branch.dynamic-enabled";
   private static final String BRANCH_REGEX_DELIMITER_PROP = "iceberg.branch.regex-delimiter";
   public static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
+  public static final String FLAG_MESSAGE_PREFIX = "iceberg.flags.key-prefix";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
@@ -173,6 +174,13 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Default partition spec to use when creating tables, comma-separated");
+    configDef.define(
+        FLAG_MESSAGE_PREFIX,
+        Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "The key prefix used to detect flag messages"
+    );
     configDef.define(
         TABLES_CDC_FIELD_PROP,
         Type.STRING,
@@ -337,6 +345,7 @@ public class IcebergSinkConfig extends AbstractConfig {
     return originalProps.get(INTERNAL_TRANSACTIONAL_SUFFIX_PROP);
   }
 
+
   public Map<String, String> catalogProps() {
     return catalogProps;
   }
@@ -364,6 +373,8 @@ public class IcebergSinkConfig extends AbstractConfig {
   public List<String> tables() {
     return getList(TABLES_PROP);
   }
+
+  public String flagKeyPrefix() { return getString(FLAG_MESSAGE_PREFIX); }
 
   public boolean dynamicTablesEnabled() {
     return getBoolean(TABLES_DYNAMIC_PROP);

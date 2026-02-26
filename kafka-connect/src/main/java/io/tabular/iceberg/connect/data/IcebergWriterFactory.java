@@ -61,7 +61,7 @@ public class IcebergWriterFactory {
       table = catalog.loadTable(identifier);
     } catch (NoSuchTableException nst) {
       if (config.autoCreateEnabled()) {
-        table = autoCreateTable(tableName, sample);
+        table = autoCreateTable(identifier.toString(), sample);
       } else if (ignoreMissingTable) {
         return new RecordWriter() {};
       } else {
@@ -69,6 +69,7 @@ public class IcebergWriterFactory {
       }
     }
 
+    // keep branch in table name here to latter group commits by branch
     return new IcebergWriter(table, tableName, config);
   }
 

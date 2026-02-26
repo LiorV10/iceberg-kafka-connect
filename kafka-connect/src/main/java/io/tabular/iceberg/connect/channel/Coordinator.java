@@ -52,6 +52,7 @@ import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 import org.apache.kafka.clients.admin.MemberDescription;
@@ -231,6 +232,13 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
+    // Check for flag messages in the envelopes
+    List<TableContext> flagMessages =
+        Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
+                filteredEnvelopeList, this.config.branchesRegexDelimiter());
+
+    LOG.debug("Found {} flag messages", flagMessages.size());
+
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
@@ -290,6 +298,31 @@ public class Coordinator extends Channel implements AutoCloseable {
           snapshotId,
           commitState.currentCommitId(),
           vtts);
+    }
+
+    // Process flag messages after successful commit
+    if (!flagMessages.isEmpty()) {
+      processFlagMessages(table, flagMessages);
+    }
+  }
+
+  private void processFlagMessages(Table table, List<TableContext> flagMessages) {
+    for (TableContext flagMessage : flagMessages) {
+      LOG.debug("About to process flag for: {}", flagMessage.tableIdentifier().toString());
+      String targetBranch = flagMessage.branch();
+      if (targetBranch != null) {
+        LOG.info("Processing flag message for table {}, switching to branch {}",
+                 table.name(), targetBranch);
+        try {
+          // Forward the branch: set current snapshot to the branch's snapshot
+          // and clear the branch for further use
+          table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
+          table.manageSnapshots().replaceBranch(targetBranch, table.history().get(0).snapshotId()).commit();
+          LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
+        } catch (Exception e) {
+          LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
+        }
+      }
     }
   }
 
