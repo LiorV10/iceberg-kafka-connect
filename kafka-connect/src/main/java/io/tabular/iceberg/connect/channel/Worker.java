@@ -53,6 +53,7 @@ class Worker implements Writer, AutoCloseable {
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
+  private String reroute;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
     this(config, new IcebergWriterFactory(catalog, config));
@@ -65,6 +66,7 @@ class Worker implements Writer, AutoCloseable {
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
+    this.reroute = null;
   }
 
   @Override
@@ -80,6 +82,7 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
+    this.reroute = null;
 
     return new Committable(offsets, writeResults);
   }
@@ -90,6 +93,7 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
+    this.reroute = null;
   }
 
   @Override
@@ -112,12 +116,15 @@ class Worker implements Writer, AutoCloseable {
        LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 
                 record.topic(), record.kafkaPartition(), record.kafkaOffset());
        
-       String tableName = Utilities.extractFromRecordValue(record.value(), this.config.tablesRouteField()).toString();
+       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
        TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
        TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
        FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch());
        flagWriterResults.add(flagResult);
+
+       // All records after flag should be re-routed to flag's branch
+       this.reroute = tableName;
        
        LOG.debug("Flag message queued for table: {}, branch: {}", context.tableIdentifier(), context.branch());
     } else {
@@ -168,6 +175,12 @@ class Worker implements Writer, AutoCloseable {
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
       String tableName = routeValue.toLowerCase();
+
+      if (this.reroute != null) {
+        tableName = this.reroute;
+        LOG.debug("Rerouting records from {} to {}", routeValue, tableName);
+      }
+
       writerForTable(tableName, record, true).write(record);
     }
   }
