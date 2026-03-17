@@ -35,6 +35,7 @@ public class SchemaUpdate {
     private final Map<String, DropColumn> dropColumns = Maps.newHashMap();
     private final Map<String, UpdateType> updateTypes = Maps.newHashMap();
     private final Map<String, MakeOptional> makeOptionals = Maps.newHashMap();
+    private final Map<String, ReplaceColumn> replaceColumns = Maps.newHashMap();
 
     public Collection<AddColumn> addColumns() {
       return addColumns.values();
@@ -50,8 +51,13 @@ public class SchemaUpdate {
       return makeOptionals.values();
     }
 
+    public Collection<ReplaceColumn> replaceColumns() {
+      return replaceColumns.values();
+    }
+
     public boolean empty() {
-      return addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
+      return addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty()
+          && makeOptionals.isEmpty() && replaceColumns.isEmpty();
     }
 
     public void addColumn(String parentName, String name, Type type) {
@@ -72,6 +78,10 @@ public class SchemaUpdate {
 
     public void makeOptional(String name) {
       makeOptionals.put(name, new MakeOptional(name));
+    }
+
+    public void replaceColumn(String name, Type newType) {
+      replaceColumns.put(name, new ReplaceColumn(name, newType));
     }
   }
 
@@ -142,6 +152,24 @@ public class SchemaUpdate {
 
     public String name() {
       return name;
+    }
+  }
+
+  public static class ReplaceColumn extends SchemaUpdate {
+    private final String name;
+    private final Type newType;
+
+    public ReplaceColumn(String name, Type newType) {
+      this.name = name;
+      this.newType = newType;
+    }
+
+    public String name() {
+      return name;
+    }
+
+    public Type newType() {
+      return newType;
     }
   }
 }

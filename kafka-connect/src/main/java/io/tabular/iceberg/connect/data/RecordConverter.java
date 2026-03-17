@@ -67,8 +67,12 @@ import org.apache.iceberg.types.Types.TimestampType;
 import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class RecordConverter {
+
+  private static final Logger LOG = LoggerFactory.getLogger(RecordConverter.class);
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -82,11 +86,20 @@ public class RecordConverter {
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
+  // Maps original column name -> shadow column NestedField for in-progress type changes
+  private final Map<String, NestedField> shadowColumnMap = Maps.newHashMap();
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
     this.tableSchema = table.schema();
     this.nameMapping = createNameMapping(table);
     this.config = config;
+    // Scan schema for shadow columns and build mapping: original name -> shadow field
+    table.schema().columns().stream()
+        .filter(field -> SchemaUtils.isShadowColumn(field.name()))
+        .forEach(shadowField -> {
+          String originalName = SchemaUtils.getOriginalColumnName(shadowField.name());
+          shadowColumnMap.put(originalName, shadowField);
+        });
   }
 
   public Record convert(Object data) {
@@ -197,13 +210,72 @@ public class RecordConverter {
               }
 
               if (!hasSchemaUpdates) {
-                result.setField(
+                // Check if a shadow column exists for this field (type change in progress)
+                NestedField shadowField = shadowColumnMap.get(recordFieldName);
+                if (shadowField != null) {
+                  // Dual-write: shadow column gets the correctly-typed value
+                  NestedField shadowTableField = schema.field(shadowField.name());
+                  if (shadowTableField != null) {
+                    try {
+                      result.setField(
+                          shadowTableField.name(),
+                          convertValue(
+                              recordFieldValue,
+                              shadowTableField.type(),
+                              shadowTableField.fieldId(),
+                              schemaUpdateConsumer));
+                    } catch (Exception e) {
+                      LOG.warn("Failed to convert value for shadow column '{}', writing null",
+                          shadowTableField.name(), e);
+                      result.setField(shadowTableField.name(), null);
+                    }
+                  }
+                  // Old column gets best-effort conversion (null on failure)
+                  try {
+                    result.setField(
                         tableField.name(),
                         convertValue(
-                                recordFieldValue,
-                                tableField.type(),
-                                tableField.fieldId(),
-                                schemaUpdateConsumer));
+                            recordFieldValue,
+                            tableField.type(),
+                            tableField.fieldId(),
+                            schemaUpdateConsumer));
+                  } catch (Exception e) {
+                    LOG.warn("Failed best-effort conversion for column '{}' during type change, writing null",
+                        tableField.name(), e);
+                    result.setField(tableField.name(), null);
+                  }
+                } else {
+                  // Check for non-promotable type mismatch (schema evolution, inferred types)
+                  if (schemaUpdateConsumer != null && recordFieldValue != null) {
+                    Optional<Type> inferredType = SchemaUtils.inferIcebergType(recordFieldValue, config);
+                    if (inferredType.isPresent()) {
+                      Type incomingType = inferredType.get();
+                      Type.TypeID currentTypeId = tableField.type().typeId();
+                      Type.TypeID incomingTypeId = incomingType.typeId();
+                      boolean typesDiffer = currentTypeId != incomingTypeId;
+                      // Exclude Iceberg-native promotions: int→long, float→double
+                      boolean isNativePromotion =
+                          (currentTypeId == Type.TypeID.INTEGER && incomingTypeId == Type.TypeID.LONG)
+                          || (currentTypeId == Type.TypeID.FLOAT && incomingTypeId == Type.TypeID.DOUBLE);
+                      if (typesDiffer && !isNativePromotion) {
+                        String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                        if (fieldName != null) {
+                          schemaUpdateConsumer.replaceColumn(fieldName, incomingType);
+                          hasSchemaUpdates = true;
+                        }
+                      }
+                    }
+                  }
+                  if (!hasSchemaUpdates) {
+                    result.setField(
+                        tableField.name(),
+                        convertValue(
+                            recordFieldValue,
+                            tableField.type(),
+                            tableField.fieldId(),
+                            schemaUpdateConsumer));
+                  }
+                }
               }
             }
         }});
@@ -241,6 +313,15 @@ public class RecordConverter {
                     String fieldName = tableSchema.findColumnName(tableField.fieldId());
                     schemaUpdateConsumer.updateType(fieldName, evolveDataType);
                     hasSchemaUpdates = true;
+                  } else {
+                    // Check for non-promotable type mismatch
+                    Type replaceType = SchemaUtils.needsTypeReplacement(
+                        tableField.type(), recordField.schema(), config);
+                    if (replaceType != null) {
+                      String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                      schemaUpdateConsumer.replaceColumn(fieldName, replaceType);
+                      hasSchemaUpdates = true;
+                    }
                   }
                   // make optional if needed and schema evolution is on
                   if (tableField.isRequired() && recordField.schema().isOptional()) {
@@ -257,13 +338,49 @@ public class RecordConverter {
                   }
                 }
                 if (!hasSchemaUpdates) {
-                  result.setField(
-                      tableField.name(),
-                      convertValue(
-                          struct.get(recordField),
-                          tableField.type(),
-                          tableField.fieldId(),
-                          schemaUpdateConsumer));
+                  // Check if a shadow column exists for this field (type change in progress)
+                  NestedField shadowField = shadowColumnMap.get(recordField.name());
+                  if (shadowField != null) {
+                    // Dual-write: shadow column gets the correctly-typed value
+                    NestedField shadowTableField = schema.field(shadowField.name());
+                    if (shadowTableField != null) {
+                      try {
+                        result.setField(
+                            shadowTableField.name(),
+                            convertValue(
+                                struct.get(recordField),
+                                shadowTableField.type(),
+                                shadowTableField.fieldId(),
+                                schemaUpdateConsumer));
+                      } catch (Exception e) {
+                        LOG.warn("Failed to convert value for shadow column '{}', writing null",
+                            shadowTableField.name(), e);
+                        result.setField(shadowTableField.name(), null);
+                      }
+                    }
+                    // Old column gets best-effort conversion (null on failure)
+                    try {
+                      result.setField(
+                          tableField.name(),
+                          convertValue(
+                              struct.get(recordField),
+                              tableField.type(),
+                              tableField.fieldId(),
+                              schemaUpdateConsumer));
+                    } catch (Exception e) {
+                      LOG.warn("Failed best-effort conversion for column '{}' during type change, writing null",
+                          tableField.name(), e);
+                      result.setField(tableField.name(), null);
+                    }
+                  } else {
+                    result.setField(
+                        tableField.name(),
+                        convertValue(
+                            struct.get(recordField),
+                            tableField.type(),
+                            tableField.fieldId(),
+                            schemaUpdateConsumer));
+                  }
                 }
               }
             });
