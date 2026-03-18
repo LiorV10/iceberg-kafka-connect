@@ -763,68 +763,6 @@ public class RecordConverterTest {
   }
 
   @Test
-  public void testSkipIncompatibleTypeStruct() {
-    org.apache.iceberg.Schema tableSchema =
-        new org.apache.iceberg.Schema(
-            Types.NestedField.required(1, "ii", Types.IntegerType.get()),
-            Types.NestedField.required(2, "ss", Types.StringType.get()));
-
-    Table table = mock(Table.class);
-    when(table.schema()).thenReturn(tableSchema);
-    RecordConverter converter = new RecordConverter(table, config);
-
-    // ii is coming in as STRING (incompatible with INTEGER), ss as INT32 (incompatible with STRING)
-    Schema valueSchema =
-        SchemaBuilder.struct()
-            .field("ii", Schema.STRING_SCHEMA)
-            .field("ss", Schema.INT32_SCHEMA);
-    Struct data = new Struct(valueSchema).put("ii", "hello").put("ss", 42);
-
-    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
-    converter.convert(data, consumer);
-
-    // incompatible types are silently skipped — no schema changes, no new columns
-    assertThat(consumer.updateTypes()).isEmpty();
-    assertThat(consumer.addColumns()).isEmpty();
-    assertThat(consumer.makeOptionals()).isEmpty();
-  }
-
-  @Test
-  public void testSkipIncompatibleTypeStructNested() {
-    org.apache.iceberg.Schema structColSchema =
-        new org.apache.iceberg.Schema(
-            Types.NestedField.required(1, "ii", Types.IntegerType.get()),
-            Types.NestedField.required(2, "ss", Types.StringType.get()));
-
-    org.apache.iceberg.Schema tableSchema =
-        new org.apache.iceberg.Schema(
-            Types.NestedField.required(3, "i", Types.IntegerType.get()),
-            Types.NestedField.required(4, "st", structColSchema.asStruct()));
-
-    Table table = mock(Table.class);
-    when(table.schema()).thenReturn(tableSchema);
-    RecordConverter converter = new RecordConverter(table, config);
-
-    // ii is coming in as STRING (incompatible with INTEGER), ss as INT32 (incompatible with STRING)
-    Schema structSchema =
-        SchemaBuilder.struct()
-            .field("ii", Schema.STRING_SCHEMA)
-            .field("ss", Schema.INT32_SCHEMA);
-    Schema schema =
-        SchemaBuilder.struct().field("i", Schema.INT32_SCHEMA).field("st", structSchema);
-    Struct structValue = new Struct(structSchema).put("ii", "hello").put("ss", 42);
-    Struct data = new Struct(schema).put("i", 1).put("st", structValue);
-
-    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
-    converter.convert(data, consumer);
-
-    // incompatible types are silently skipped — no schema changes, no new columns
-    assertThat(consumer.updateTypes()).isEmpty();
-    assertThat(consumer.addColumns()).isEmpty();
-    assertThat(consumer.makeOptionals()).isEmpty();
-  }
-
-  @Test
   public void testRerouteToExistingPendingColumnMap() {
     org.apache.iceberg.Schema tableSchema =
         new org.apache.iceberg.Schema(

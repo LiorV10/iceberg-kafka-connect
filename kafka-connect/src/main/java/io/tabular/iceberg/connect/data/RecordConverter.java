@@ -250,13 +250,6 @@ public class RecordConverter {
                     String fieldName = tableSchema.findColumnName(tableField.fieldId());
                     schemaUpdateConsumer.updateType(fieldName, evolveDataType);
                     hasSchemaUpdates = true;
-                  } else {
-                    // if types are incompatible, skip this field (rerouting is handled by the
-                    // early check above when a _pending_type_update column already exists)
-                    Type incomingType = SchemaUtils.toIcebergType(recordField.schema(), config);
-                    if (incomingType.typeId() != tableField.type().typeId()) {
-                      return;
-                    }
                   }
                   // make optional if needed and schema evolution is on
                   if (tableField.isRequired() && recordField.schema().isOptional()) {
