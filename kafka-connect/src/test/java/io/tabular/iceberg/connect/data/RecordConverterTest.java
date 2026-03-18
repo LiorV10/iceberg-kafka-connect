@@ -26,6 +26,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
+import io.tabular.iceberg.connect.data.SchemaUpdate.ReplaceColumn;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
 import java.time.Duration;
@@ -831,5 +832,108 @@ public class RecordConverterTest {
     GenericRecord rec = (GenericRecord) record;
     assertThat(rec.getField("ii")).isEqualTo(11);
     assertRecordValues((GenericRecord) rec.getField("st"));
+  }
+
+  // --- Shadow column routing tests ---
+
+  /**
+   * When a shadow column (_price_type_pending) already exists in the table schema, the converter
+   * should route values directly to the shadow column WITHOUT re-triggering ReplaceColumn detection
+   * on the schema update consumer.
+   */
+  @Test
+  public void testShadowColumnRoutingStruct() {
+    // Schema with original int column "price" and its shadow string column "_price_type_pending"
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "price", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "_price_type_pending", Types.StringType.get()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // Incoming record: "price" is a String value (type mismatch with original int column)
+    Schema valueSchema =
+        SchemaBuilder.struct()
+            .field("id", Schema.INT64_SCHEMA)
+            .field("price", Schema.STRING_SCHEMA);
+    Struct data = new Struct(valueSchema).put("id", 42L).put("price", "9.99");
+
+    // With a non-null consumer: shadow routing should happen — no ReplaceColumn should be emitted
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    Record row = converter.convert(data, consumer);
+
+    // The consumer should NOT have a ReplaceColumn for "price" — shadow already exists
+    assertThat(consumer.replaceColumns()).isEmpty();
+    // The consumer should be empty (no schema evolution needed)
+    assertThat(consumer.empty()).isTrue();
+
+    // The shadow column should receive the string value
+    GenericRecord rec = (GenericRecord) row;
+    assertThat(rec.getField("_price_type_pending")).isEqualTo("9.99");
+    // The original column gets best-effort conversion (string "9.99" can't convert to int → null)
+    assertThat(rec.getField("price")).isNull();
+  }
+
+  /**
+   * Same as above but with a Map-based record.
+   */
+  @Test
+  public void testShadowColumnRoutingMap() {
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "price", Types.IntegerType.get()),
+            Types.NestedField.optional(3, "_price_type_pending", Types.StringType.get()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    Map<String, Object> data = ImmutableMap.of("id", 42L, "price", "9.99");
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    Record row = converter.convert(data, consumer);
+
+    // No ReplaceColumn should be emitted — shadow exists, routing takes over
+    assertThat(consumer.replaceColumns()).isEmpty();
+    assertThat(consumer.empty()).isTrue();
+
+    GenericRecord rec = (GenericRecord) row;
+    assertThat(rec.getField("_price_type_pending")).isEqualTo("9.99");
+    assertThat(rec.getField("price")).isNull();
+  }
+
+  /**
+   * First record with type mismatch (no shadow yet) should detect the mismatch and emit
+   * ReplaceColumn. The consumer SHOULD be non-empty.
+   */
+  @Test
+  public void testNonPromotableTypeMismatchDetectionStruct() {
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "id", Types.LongType.get()),
+            Types.NestedField.required(2, "price", Types.IntegerType.get()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    Schema valueSchema =
+        SchemaBuilder.struct()
+            .field("id", Schema.INT64_SCHEMA)
+            .field("price", Schema.STRING_SCHEMA);
+    Struct data = new Struct(valueSchema).put("id", 42L).put("price", "9.99");
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    converter.convert(data, consumer);
+
+    // Should detect the non-promotable mismatch and emit ReplaceColumn
+    assertThat(consumer.replaceColumns()).hasSize(1);
+    SchemaUpdate.ReplaceColumn rc = consumer.replaceColumns().iterator().next();
+    assertThat(rc.name()).isEqualTo("price");
+    assertThat(rc.newType()).isInstanceOf(StringType.class);
   }
 }

@@ -106,6 +106,17 @@ public class SchemaUtils {
     return incomingType;
   }
 
+  /**
+   * Returns {@code true} if the transition from {@code currentTypeId} to {@code incomingTypeId}
+   * is a native Iceberg type promotion ({@code int→long} or {@code float→double}) that is handled
+   * by {@link #needsDataTypeUpdate}. Used in the Map-based conversion path where no Kafka
+   * {@link Schema} is available.
+   */
+  public static boolean isNativeTypePromotion(TypeID currentTypeId, TypeID incomingTypeId) {
+    return (currentTypeId == TypeID.INTEGER && incomingTypeId == TypeID.LONG)
+        || (currentTypeId == TypeID.FLOAT && incomingTypeId == TypeID.DOUBLE);
+  }
+
   /** Returns {@code true} if the column name follows the shadow column naming convention. */
   public static boolean isShadowColumn(String colName) {
     return SHADOW_COLUMN_PATTERN.matcher(colName).matches();
@@ -199,7 +210,7 @@ public class SchemaUtils {
       String shadowName = shadowColumnName(update.name());
       LOG.warn(
           "Type change detected for column '{}': {} -> {}. Shadow column '{}' created. "
-              + "Will be swapped on next full refresh.",
+              + "Will be swapped when the next end-of-refresh flag arrives.",
           update.name(), table.schema().findField(update.name()).type(), update.newType(),
           shadowName);
       updateSchema.addColumn(null, shadowName, update.newType());
