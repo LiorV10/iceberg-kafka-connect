@@ -763,7 +763,7 @@ public class RecordConverterTest {
   }
 
   @Test
-  public void testRerouteIncompatibleTypeStruct() {
+  public void testSkipIncompatibleTypeStruct() {
     org.apache.iceberg.Schema tableSchema =
         new org.apache.iceberg.Schema(
             Types.NestedField.required(1, "ii", Types.IntegerType.get()),
@@ -783,29 +783,14 @@ public class RecordConverterTest {
     SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
     converter.convert(data, consumer);
 
+    // incompatible types are silently skipped — no schema changes, no new columns
     assertThat(consumer.updateTypes()).isEmpty();
-
-    Collection<AddColumn> addColumns = consumer.addColumns();
-    assertThat(addColumns).hasSize(2);
-
-    Map<String, AddColumn> addColMap = Maps.newHashMap();
-    addColumns.forEach(col -> addColMap.put(col.key(), col));
-
-    assertThat(addColMap.get("ii_pending_type_update").type()).isInstanceOf(StringType.class);
-    assertThat(addColMap.get("ss_pending_type_update").type()).isInstanceOf(IntegerType.class);
-
-    Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
-    assertThat(makeOptionals).hasSize(2);
-
-    Map<String, SchemaUpdate.MakeOptional> makeOptionalMap = Maps.newHashMap();
-    makeOptionals.forEach(mo -> makeOptionalMap.put(mo.name(), mo));
-
-    assertThat(makeOptionalMap).containsKey("ii");
-    assertThat(makeOptionalMap).containsKey("ss");
+    assertThat(consumer.addColumns()).isEmpty();
+    assertThat(consumer.makeOptionals()).isEmpty();
   }
 
   @Test
-  public void testRerouteIncompatibleTypeStructNested() {
+  public void testSkipIncompatibleTypeStructNested() {
     org.apache.iceberg.Schema structColSchema =
         new org.apache.iceberg.Schema(
             Types.NestedField.required(1, "ii", Types.IntegerType.get()),
@@ -833,25 +818,10 @@ public class RecordConverterTest {
     SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
     converter.convert(data, consumer);
 
+    // incompatible types are silently skipped — no schema changes, no new columns
     assertThat(consumer.updateTypes()).isEmpty();
-
-    Collection<AddColumn> addColumns = consumer.addColumns();
-    assertThat(addColumns).hasSize(2);
-
-    Map<String, AddColumn> addColMap = Maps.newHashMap();
-    addColumns.forEach(col -> addColMap.put(col.key(), col));
-
-    assertThat(addColMap.get("st.ii_pending_type_update").type()).isInstanceOf(StringType.class);
-    assertThat(addColMap.get("st.ss_pending_type_update").type()).isInstanceOf(IntegerType.class);
-
-    Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
-    assertThat(makeOptionals).hasSize(2);
-
-    Map<String, SchemaUpdate.MakeOptional> makeOptionalMap = Maps.newHashMap();
-    makeOptionals.forEach(mo -> makeOptionalMap.put(mo.name(), mo));
-
-    assertThat(makeOptionalMap).containsKey("st.ii");
-    assertThat(makeOptionalMap).containsKey("st.ss");
+    assertThat(consumer.addColumns()).isEmpty();
+    assertThat(consumer.makeOptionals()).isEmpty();
   }
 
   private Map<String, Object> createMapData() {

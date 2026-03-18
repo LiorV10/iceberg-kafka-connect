@@ -237,19 +237,11 @@ public class RecordConverter {
                     schemaUpdateConsumer.updateType(fieldName, evolveDataType);
                     hasSchemaUpdates = true;
                   } else {
-                    // reroute to a new column if the type is incompatible and cannot be evolved
+                    // if types are incompatible, skip this field (rerouting is handled by the
+                    // early check above when a _pending_type_update column already exists)
                     Type incomingType = SchemaUtils.toIcebergType(recordField.schema(), config);
                     if (incomingType.typeId() != tableField.type().typeId()) {
-                      String parentFieldName =
-                          structFieldId < 0 ? null : tableSchema.findColumnName(structFieldId);
-                      schemaUpdateConsumer.addColumn(
-                          parentFieldName,
-                          recordField.name() + "_pending_type_update",
-                          incomingType);
-                      // make original field optional since rerouted records will not set it
-                      String colName = tableSchema.findColumnName(tableField.fieldId());
-                      schemaUpdateConsumer.makeOptional(colName);
-                      hasSchemaUpdates = true;
+                      return;
                     }
                   }
                   // make optional if needed and schema evolution is on
