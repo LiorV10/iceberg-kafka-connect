@@ -791,8 +791,8 @@ public class RecordConverterTest {
     Map<String, AddColumn> addColMap = Maps.newHashMap();
     addColumns.forEach(col -> addColMap.put(col.key(), col));
 
-    assertThat(addColMap.get("ii-new").type()).isInstanceOf(StringType.class);
-    assertThat(addColMap.get("ss-new").type()).isInstanceOf(IntegerType.class);
+    assertThat(addColMap.get("ii_pending_type_update").type()).isInstanceOf(StringType.class);
+    assertThat(addColMap.get("ss_pending_type_update").type()).isInstanceOf(IntegerType.class);
 
     Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
     assertThat(makeOptionals).hasSize(2);
@@ -841,8 +841,8 @@ public class RecordConverterTest {
     Map<String, AddColumn> addColMap = Maps.newHashMap();
     addColumns.forEach(col -> addColMap.put(col.key(), col));
 
-    assertThat(addColMap.get("st.ii-new").type()).isInstanceOf(StringType.class);
-    assertThat(addColMap.get("st.ss-new").type()).isInstanceOf(IntegerType.class);
+    assertThat(addColMap.get("st.ii_pending_type_update").type()).isInstanceOf(StringType.class);
+    assertThat(addColMap.get("st.ss_pending_type_update").type()).isInstanceOf(IntegerType.class);
 
     Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
     assertThat(makeOptionals).hasSize(2);
