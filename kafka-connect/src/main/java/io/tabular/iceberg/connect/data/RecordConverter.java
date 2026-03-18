@@ -169,6 +169,20 @@ public class RecordConverter {
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
+          // check if this field was previously rerouted to a "{name}_pending_type_update" column
+          NestedField reroutedTableField =
+              lookupStructField(recordFieldName + "_pending_type_update", schema, structFieldId);
+          if (reroutedTableField != null) {
+            result.setField(
+                reroutedTableField.name(),
+                convertValue(
+                    recordFieldValue,
+                    reroutedTableField.type(),
+                    reroutedTableField.fieldId(),
+                    schemaUpdateConsumer));
+            return;
+          }
+
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
 
           if (!config.excludeFields().contains(recordFieldName)) {
@@ -222,6 +236,21 @@ public class RecordConverter {
         .fields()
         .forEach(
             recordField -> {
+              // check if this field was previously rerouted to a "{name}_pending_type_update" column
+              NestedField reroutedTableField =
+                  lookupStructField(
+                      recordField.name() + "_pending_type_update", schema, structFieldId);
+              if (reroutedTableField != null) {
+                result.setField(
+                    reroutedTableField.name(),
+                    convertValue(
+                        struct.get(recordField),
+                        reroutedTableField.type(),
+                        reroutedTableField.fieldId(),
+                        schemaUpdateConsumer));
+                return;
+              }
+
               NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);
               if (tableField == null) {
                 // add the column if schema evolution is on, otherwise skip the value
@@ -238,6 +267,7 @@ public class RecordConverter {
                   PrimitiveType evolveDataType =
                       SchemaUtils.needsDataTypeUpdate(tableField.type(), recordField.schema());
                   if (evolveDataType != null) {
+                    // standard Iceberg type evolution (e.g. int -> long, float -> double)
                     String fieldName = tableSchema.findColumnName(tableField.fieldId());
                     schemaUpdateConsumer.updateType(fieldName, evolveDataType);
                     hasSchemaUpdates = true;
