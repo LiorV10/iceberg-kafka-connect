@@ -714,15 +714,19 @@ public class RecordConverterTest {
 
     SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
     converter.convert(data, consumer);
-    Collection<UpdateType> updates = consumer.updateTypes();
 
-    assertThat(updates).hasSize(2);
+    assertThat(consumer.updateTypes()).isEmpty();
 
-    Map<String, UpdateType> updateMap = Maps.newHashMap();
-    updates.forEach(update -> updateMap.put(update.name(), update));
+    Collection<AddColumn> addColumns = consumer.addColumns();
+    assertThat(addColumns).hasSize(2);
 
-    assertThat(updateMap.get("ii").type()).isInstanceOf(LongType.class);
-    assertThat(updateMap.get("ff").type()).isInstanceOf(DoubleType.class);
+    Map<String, AddColumn> addColMap = Maps.newHashMap();
+    addColumns.forEach(col -> addColMap.put(col.key(), col));
+
+    assertThat(addColMap.get("ii-new").type()).isInstanceOf(LongType.class);
+    assertThat(addColMap.get("ff-new").type()).isInstanceOf(DoubleType.class);
+
+    assertThat(consumer.makeOptionals()).hasSize(2);
   }
 
   @Test
@@ -750,15 +754,19 @@ public class RecordConverterTest {
 
     SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
     converter.convert(data, consumer);
-    Collection<UpdateType> updates = consumer.updateTypes();
 
-    assertThat(updates).hasSize(2);
+    assertThat(consumer.updateTypes()).isEmpty();
 
-    Map<String, UpdateType> updateMap = Maps.newHashMap();
-    updates.forEach(update -> updateMap.put(update.name(), update));
+    Collection<AddColumn> addColumns = consumer.addColumns();
+    assertThat(addColumns).hasSize(2);
 
-    assertThat(updateMap.get("st.ii").type()).isInstanceOf(LongType.class);
-    assertThat(updateMap.get("st.ff").type()).isInstanceOf(DoubleType.class);
+    Map<String, AddColumn> addColMap = Maps.newHashMap();
+    addColumns.forEach(col -> addColMap.put(col.key(), col));
+
+    assertThat(addColMap.get("st.ii-new").type()).isInstanceOf(LongType.class);
+    assertThat(addColMap.get("st.ff-new").type()).isInstanceOf(DoubleType.class);
+
+    assertThat(consumer.makeOptionals()).hasSize(2);
   }
 
   private Map<String, Object> createMapData() {
