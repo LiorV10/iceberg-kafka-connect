@@ -67,8 +67,12 @@ import org.apache.iceberg.types.Types.TimestampType;
 import org.apache.iceberg.util.DateTimeUtil;
 import org.apache.kafka.connect.data.Field;
 import org.apache.kafka.connect.data.Struct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class RecordConverter {
+
+  private static final Logger LOG = LoggerFactory.getLogger(RecordConverter.class);
 
   private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -82,11 +86,22 @@ public class RecordConverter {
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
+  // Maps original column name -> shadow NestedField for in-progress type changes.
+  // Populated at construction time by scanning the table schema for shadow columns
+  // (columns whose names match the "_<original>_type_pending" naming convention).
+  private final Map<String, NestedField> shadowColumnMap = Maps.newHashMap();
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
     this.tableSchema = table.schema();
     this.nameMapping = createNameMapping(table);
     this.config = config;
+    // Scan schema for shadow columns and build mapping: original name -> shadow field
+    table.schema().columns().stream()
+        .filter(field -> SchemaUtils.isShadowColumn(field.name()))
+        .forEach(shadowField -> {
+          String originalName = SchemaUtils.getOriginalColumnName(shadowField.name());
+          shadowColumnMap.put(originalName, shadowField);
+        });
   }
 
   public Record convert(Object data) {
@@ -184,26 +199,71 @@ public class RecordConverter {
                 }
               }
             } else {
-              boolean hasSchemaUpdates = false;
+              // Check if a shadow column exists for this field (type change already in progress).
+              // Shadow routing takes priority over schema evolution checks so that subsequent
+              // records don't repeatedly re-trigger ReplaceColumn detection.
+              NestedField shadowField = shadowColumnMap.get(recordFieldName);
+              if (shadowField != null) {
+                // Route the value to the shadow column only.  The original column is intentionally
+                // left null (it was made optional when the shadow was created) and will be
+                // deleted when the end-of-refresh flag triggers the column swap.
+                NestedField shadowTableField = schema.field(shadowField.name());
+                if (shadowTableField != null) {
+                  try {
+                    result.setField(
+                        shadowTableField.name(),
+                        convertValue(
+                            recordFieldValue,
+                            shadowTableField.type(),
+                            shadowTableField.fieldId(),
+                            schemaUpdateConsumer));
+                  } catch (Exception e) {
+                    LOG.warn("Failed to convert value for shadow column '{}', writing null",
+                        shadowTableField.name(), e);
+                    result.setField(shadowTableField.name(), null);
+                  }
+                }
+              } else {
+                boolean hasSchemaUpdates = false;
 
-              // drop column if removed for schema and destructive evolution is on
-              if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
-                List<NestedField> columnsToDrop = tableSchema.columns().stream()
-                  .filter(col -> !incomingFieldNames.contains(col.name()))
-                  .collect(toList());
+                // drop column if removed for schema and destructive evolution is on
+                if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+                  List<NestedField> columnsToDrop = tableSchema.columns().stream()
+                    .filter(col -> !incomingFieldNames.contains(col.name()))
+                    .collect(toList());
 
-                columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
-                hasSchemaUpdates = !columnsToDrop.isEmpty();
-              }
+                  columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+                  hasSchemaUpdates = !columnsToDrop.isEmpty();
+                }
 
-              if (!hasSchemaUpdates) {
-                result.setField(
+                if (!hasSchemaUpdates) {
+                  // Check for non-promotable type mismatch (schema evolution, inferred types)
+                  if (schemaUpdateConsumer != null && recordFieldValue != null) {
+                    Optional<Type> inferredType = SchemaUtils.inferIcebergType(recordFieldValue, config);
+                    if (inferredType.isPresent()) {
+                      Type incomingType = inferredType.get();
+                      Type.TypeID currentTypeId = tableField.type().typeId();
+                      Type.TypeID incomingTypeId = incomingType.typeId();
+                      if (currentTypeId != incomingTypeId
+                          && !SchemaUtils.isNativeTypePromotion(currentTypeId, incomingTypeId)) {
+                        String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                        if (fieldName != null) {
+                          schemaUpdateConsumer.replaceColumn(fieldName, incomingType);
+                          hasSchemaUpdates = true;
+                        }
+                      }
+                    }
+                  }
+                  if (!hasSchemaUpdates) {
+                    result.setField(
                         tableField.name(),
                         convertValue(
-                                recordFieldValue,
-                                tableField.type(),
-                                tableField.fieldId(),
-                                schemaUpdateConsumer));
+                            recordFieldValue,
+                            tableField.type(),
+                            tableField.fieldId(),
+                            schemaUpdateConsumer));
+                  }
+                }
               }
             }
         }});
@@ -232,38 +292,73 @@ public class RecordConverter {
                   schemaUpdateConsumer.addColumn(parentFieldName, recordField.name(), type);
                 }
               } else {
-                boolean hasSchemaUpdates = false;
-                if (schemaUpdateConsumer != null) {
-                  // update the type if needed and schema evolution is on
-                  PrimitiveType evolveDataType =
-                      SchemaUtils.needsDataTypeUpdate(tableField.type(), recordField.schema());
-                  if (evolveDataType != null) {
-                    String fieldName = tableSchema.findColumnName(tableField.fieldId());
-                    schemaUpdateConsumer.updateType(fieldName, evolveDataType);
-                    hasSchemaUpdates = true;
+                // Check if a shadow column exists for this field (type change already in progress).
+                // Shadow routing takes priority over schema evolution checks so that subsequent
+                // records don't repeatedly re-trigger ReplaceColumn detection.
+                NestedField shadowField = shadowColumnMap.get(recordField.name());
+                if (shadowField != null) {
+                  // Route the value to the shadow column only.  The original column is intentionally
+                  // left null (it was made optional when the shadow was created) and will be
+                  // deleted when the end-of-refresh flag triggers the column swap.
+                  NestedField shadowTableField = schema.field(shadowField.name());
+                  if (shadowTableField != null) {
+                    try {
+                      result.setField(
+                          shadowTableField.name(),
+                          convertValue(
+                              struct.get(recordField),
+                              shadowTableField.type(),
+                              shadowTableField.fieldId(),
+                              schemaUpdateConsumer));
+                    } catch (Exception e) {
+                      LOG.warn("Failed to convert value for shadow column '{}', writing null",
+                          shadowTableField.name(), e);
+                      result.setField(shadowTableField.name(), null);
+                    }
                   }
-                  // make optional if needed and schema evolution is on
-                  if (tableField.isRequired() && recordField.schema().isOptional()) {
-                    String fieldName = tableSchema.findColumnName(tableField.fieldId());
-                    schemaUpdateConsumer.makeOptional(fieldName);
-                    hasSchemaUpdates = true;
+                } else {
+                  boolean hasSchemaUpdates = false;
+                  if (schemaUpdateConsumer != null) {
+                    // update the type if needed and schema evolution is on
+                    PrimitiveType evolveDataType =
+                        SchemaUtils.needsDataTypeUpdate(tableField.type(), recordField.schema());
+                    if (evolveDataType != null) {
+                      String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                      schemaUpdateConsumer.updateType(fieldName, evolveDataType);
+                      hasSchemaUpdates = true;
+                    } else {
+                      // Check for non-promotable type mismatch
+                      Type replaceType = SchemaUtils.needsTypeReplacement(
+                          tableField.type(), recordField.schema(), config);
+                      if (replaceType != null) {
+                        String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                        schemaUpdateConsumer.replaceColumn(fieldName, replaceType);
+                        hasSchemaUpdates = true;
+                      }
+                    }
+                    // make optional if needed and schema evolution is on
+                    if (tableField.isRequired() && recordField.schema().isOptional()) {
+                      String fieldName = tableSchema.findColumnName(tableField.fieldId());
+                      schemaUpdateConsumer.makeOptional(fieldName);
+                      hasSchemaUpdates = true;
+                    }
+                    // drop column if removed for schema and destructive evolution is on
+                    if (config.destructiveSchemaEvolutionEnabled()) {
+                      tableSchema.columns()
+                          .stream()
+                          .filter(col -> !incomingFieldNames.contains(col.name()))
+                          .forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+                    }
                   }
-                  // drop column if removed for schema and destructive evolution is on
-                  if (config.destructiveSchemaEvolutionEnabled()) {
-                    tableSchema.columns()
-                        .stream()
-                        .filter(col -> !incomingFieldNames.contains(col.name()))
-                        .forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+                  if (!hasSchemaUpdates) {
+                    result.setField(
+                        tableField.name(),
+                        convertValue(
+                            struct.get(recordField),
+                            tableField.type(),
+                            tableField.fieldId(),
+                            schemaUpdateConsumer));
                   }
-                }
-                if (!hasSchemaUpdates) {
-                  result.setField(
-                      tableField.name(),
-                      convertValue(
-                          struct.get(recordField),
-                          tableField.type(),
-                          tableField.fieldId(),
-                          schemaUpdateConsumer));
                 }
               }
             });

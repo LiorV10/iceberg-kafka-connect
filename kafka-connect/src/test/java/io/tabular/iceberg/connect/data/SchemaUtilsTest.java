@@ -334,4 +334,95 @@ public class SchemaUtilsTest {
     assertThat(SchemaUtils.inferIcebergType(ImmutableMap.of("nested", ImmutableMap.of()), config))
         .isNotPresent();
   }
+
+  @Test
+  public void testShadowColumnHelpers() {
+    // isShadowColumn
+    assertThat(SchemaUtils.isShadowColumn("_price_type_pending")).isTrue();
+    assertThat(SchemaUtils.isShadowColumn("_col_name_type_pending")).isTrue();
+    assertThat(SchemaUtils.isShadowColumn("price")).isFalse();
+    assertThat(SchemaUtils.isShadowColumn("_price_type_pendingX")).isFalse();
+    assertThat(SchemaUtils.isShadowColumn("")).isFalse();
+
+    // getOriginalColumnName
+    assertThat(SchemaUtils.getOriginalColumnName("_price_type_pending")).isEqualTo("price");
+    assertThat(SchemaUtils.getOriginalColumnName("_my_col_type_pending")).isEqualTo("my_col");
+
+    // shadowColumnName
+    assertThat(SchemaUtils.shadowColumnName("price")).isEqualTo("_price_type_pending");
+    assertThat(SchemaUtils.shadowColumnName("my_col")).isEqualTo("_my_col_type_pending");
+  }
+
+  @Test
+  public void testNeedsTypeReplacement() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.schemaForceOptional()).thenReturn(false);
+
+    // Promotable types handled by needsDataTypeUpdate -> null (not a replacement)
+    assertThat(SchemaUtils.needsTypeReplacement(FloatType.get(), Schema.FLOAT64_SCHEMA, config))
+        .isNull();
+    assertThat(SchemaUtils.needsTypeReplacement(IntegerType.get(), Schema.INT64_SCHEMA, config))
+        .isNull();
+
+    // Matching types -> null
+    assertThat(SchemaUtils.needsTypeReplacement(StringType.get(), Schema.STRING_SCHEMA, config))
+        .isNull();
+    assertThat(SchemaUtils.needsTypeReplacement(IntegerType.get(), Schema.INT32_SCHEMA, config))
+        .isNull();
+
+    // Non-promotable mismatches -> returns target type
+    assertThat(SchemaUtils.needsTypeReplacement(IntegerType.get(), Schema.STRING_SCHEMA, config))
+        .isInstanceOf(StringType.class);
+    assertThat(SchemaUtils.needsTypeReplacement(StringType.get(), Schema.INT64_SCHEMA, config))
+        .isInstanceOf(LongType.class);
+    assertThat(SchemaUtils.needsTypeReplacement(StringType.get(), Schema.BOOLEAN_SCHEMA, config))
+        .isInstanceOf(BooleanType.class);
+    assertThat(SchemaUtils.needsTypeReplacement(LongType.get(), Schema.FLOAT64_SCHEMA, config))
+        .isInstanceOf(DoubleType.class);
+  }
+
+  @Test
+  public void testApplySchemaUpdatesWithReplaceColumn() {
+    UpdateSchema updateSchema = mock(UpdateSchema.class);
+    org.apache.iceberg.types.Types.NestedField iField =
+        org.apache.iceberg.types.Types.NestedField.required(1, "i", IntegerType.get());
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(SIMPLE_SCHEMA);
+    when(table.name()).thenReturn("test_table");
+    when(table.updateSchema()).thenReturn(updateSchema);
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    // Replace int column "i" with a string type
+    consumer.replaceColumn("i", StringType.get());
+
+    SchemaUtils.applySchemaUpdates(table, consumer);
+    verify(table).refresh();
+    verify(table).updateSchema();
+    // Shadow column should be added
+    verify(updateSchema).addColumn(isNull(), eq("_i_type_pending"), isA(StringType.class));
+    verify(updateSchema).commit();
+  }
+
+  @Test
+  public void testApplySchemaUpdatesReplaceColumnIdempotent() {
+    // Schema already has the shadow column -> should skip creation
+    org.apache.iceberg.Schema schemaWithShadow =
+        new org.apache.iceberg.Schema(
+            NestedField.required(1, "i", IntegerType.get()),
+            NestedField.optional(2, "_i_type_pending", StringType.get()));
+
+    UpdateSchema updateSchema = mock(UpdateSchema.class);
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(schemaWithShadow);
+    when(table.name()).thenReturn("test_table");
+    when(table.updateSchema()).thenReturn(updateSchema);
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    consumer.replaceColumn("i", StringType.get());
+
+    SchemaUtils.applySchemaUpdates(table, consumer);
+    verify(table).refresh();
+    // Shadow column already exists, so nothing should be committed
+    verify(table, times(0)).updateSchema();
+  }
 }

@@ -24,6 +24,7 @@ import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.DropColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.MakeOptional;
+import io.tabular.iceberg.connect.data.SchemaUpdate.ReplaceColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
 import java.math.BigDecimal;
 import java.time.LocalDate;
@@ -72,6 +73,8 @@ public class SchemaUtils {
   private static final Logger LOG = LoggerFactory.getLogger(SchemaUtils.class);
 
   private static final Pattern TRANSFORM_REGEX = Pattern.compile("(\\w+)\\((.+)\\)");
+  private static final Pattern SHADOW_COLUMN_PATTERN = Pattern.compile("^_(.+)_type_pending$");
+  private static final String SHADOW_COLUMN_FMT = "_%s_type_pending";
 
   public static PrimitiveType needsDataTypeUpdate(Type currentIcebergType, Schema valueSchema) {
     if (currentIcebergType.typeId() == TypeID.FLOAT && valueSchema.type() == Schema.Type.FLOAT64) {
@@ -81,6 +84,61 @@ public class SchemaUtils {
       return LongType.get();
     }
     return null;
+  }
+
+  /**
+   * Returns the target Iceberg type when the column type mismatch is non-promotable
+   * (i.e., not handled by {@link #needsDataTypeUpdate}). Returns {@code null} when types
+   * already match or when {@code needsDataTypeUpdate} already handles the promotion.
+   */
+  public static Type needsTypeReplacement(Type currentIcebergType, Schema valueSchema,
+      IcebergSinkConfig config) {
+    // If needsDataTypeUpdate already handles it, don't duplicate
+    if (needsDataTypeUpdate(currentIcebergType, valueSchema) != null) {
+      return null;
+    }
+    Type incomingType = toIcebergType(valueSchema, config);
+    // If the typeIds match, no replacement needed
+    if (currentIcebergType.typeId() == incomingType.typeId()) {
+      return null;
+    }
+    // Non-promotable mismatch detected: return the target type
+    return incomingType;
+  }
+
+  /**
+   * Returns {@code true} if the transition from {@code currentTypeId} to {@code incomingTypeId}
+   * is a native Iceberg type promotion ({@code int→long} or {@code float→double}) that is handled
+   * by {@link #needsDataTypeUpdate}. Used in the Map-based conversion path where no Kafka
+   * {@link Schema} is available.
+   */
+  public static boolean isNativeTypePromotion(TypeID currentTypeId, TypeID incomingTypeId) {
+    return (currentTypeId == TypeID.INTEGER && incomingTypeId == TypeID.LONG)
+        || (currentTypeId == TypeID.FLOAT && incomingTypeId == TypeID.DOUBLE);
+  }
+
+  /** Returns {@code true} if the column name follows the shadow column naming convention. */
+  public static boolean isShadowColumn(String colName) {
+    return SHADOW_COLUMN_PATTERN.matcher(colName).matches();
+  }
+
+  /**
+   * Extracts the original column name from a shadow column name.
+   * E.g., {@code _price_type_pending} → {@code price}.
+   *
+   * @throws IllegalArgumentException if {@code shadowColName} is not a shadow column name
+   */
+  public static String getOriginalColumnName(String shadowColName) {
+    Matcher m = SHADOW_COLUMN_PATTERN.matcher(shadowColName);
+    if (!m.matches()) {
+      throw new IllegalArgumentException("Not a shadow column name: " + shadowColName);
+    }
+    return m.group(1);
+  }
+
+  /** Returns the shadow column name for the given original column name. */
+  public static String shadowColumnName(String originalColName) {
+    return String.format(SHADOW_COLUMN_FMT, originalColName);
   }
 
   public static void applySchemaUpdates(Table table, SchemaUpdate.Consumer updates) {
@@ -122,7 +180,17 @@ public class SchemaUtils {
             .filter(makeOptional -> !isOptional(table.schema(), makeOptional))
             .collect(toList());
 
-    if (addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty()) {
+    // filter out replace-column requests where the shadow column already exists (idempotent)
+    List<ReplaceColumn> replaceColumns =
+        updates.replaceColumns().stream()
+            .filter(rc -> {
+              String shadowName = shadowColumnName(rc.name());
+              return table.schema().findField(shadowName) == null;
+            })
+            .collect(toList());
+
+    if (addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty()
+        && makeOptionals.isEmpty() && replaceColumns.isEmpty()) {
       // no updates to apply
       LOG.info("Schema for table {} already up-to-date", table.name());
       return;
@@ -138,6 +206,18 @@ public class SchemaUtils {
     });
     updateTypes.forEach(update -> updateSchema.updateColumn(update.name(), update.type()));
     makeOptionals.forEach(update -> updateSchema.makeColumnOptional(update.name()));
+    replaceColumns.forEach(update -> {
+      String shadowName = shadowColumnName(update.name());
+      LOG.warn(
+          "Type change detected for column '{}': {} -> {}. Shadow column '{}' created. "
+              + "Will be swapped when the next end-of-refresh flag arrives.",
+          update.name(), table.schema().findField(update.name()).type(), update.newType(),
+          shadowName);
+      updateSchema.addColumn(null, shadowName, update.newType());
+      // Make the original column optional so that null values written to it during the
+      // shadow transition period do not violate a NOT NULL constraint.
+      updateSchema.makeColumnOptional(update.name());
+    });
     updateSchema.commit();
     LOG.info("Schema for table {} updated with new columns", table.name());
   }

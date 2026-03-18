@@ -23,6 +23,7 @@ import static java.util.stream.Collectors.toList;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.data.SchemaUtils;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -42,6 +43,7 @@ import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.Transaction;
+import org.apache.iceberg.UpdateSchema;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
@@ -314,6 +316,9 @@ public class Coordinator extends Channel implements AutoCloseable {
         LOG.info("Processing flag message for table {}, switching to branch {}",
                  table.name(), targetBranch);
         try {
+          // Before branch swap, perform column type swaps if any shadow columns exist
+          swapShadowColumns(table);
+
           // Forward the branch: set current snapshot to the branch's snapshot
           // and clear the branch for further use
           table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
@@ -323,6 +328,41 @@ public class Coordinator extends Channel implements AutoCloseable {
           LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
         }
       }
+    }
+  }
+
+  private void swapShadowColumns(Table table) {
+    try {
+      table.refresh();
+      List<org.apache.iceberg.types.Types.NestedField> shadowColumns =
+          table.schema().columns().stream()
+              .filter(field -> SchemaUtils.isShadowColumn(field.name()))
+              .collect(toList());
+
+      if (shadowColumns.isEmpty()) {
+        LOG.debug("No shadow columns found in table {}, skipping column swap", table.name());
+        return;
+      }
+
+      UpdateSchema updateSchema = table.updateSchema();
+      for (org.apache.iceberg.types.Types.NestedField shadowField : shadowColumns) {
+        String shadowName = shadowField.name();
+        String originalName = SchemaUtils.getOriginalColumnName(shadowName);
+        LOG.info("Column type swap: deleting old column '{}' and renaming shadow '{}' to '{}'",
+            originalName, shadowName, originalName);
+        updateSchema.deleteColumn(originalName);
+        updateSchema.renameColumn(shadowName, originalName);
+      }
+      updateSchema.commit();
+
+      for (org.apache.iceberg.types.Types.NestedField shadowField : shadowColumns) {
+        String originalName = SchemaUtils.getOriginalColumnName(shadowField.name());
+        LOG.info("Column type swap completed for '{}': shadow column renamed to original",
+            originalName);
+      }
+    } catch (Exception e) {
+      LOG.error("Failed to swap shadow columns for table {}, continuing with branch swap",
+          table.name(), e);
     }
   }
 
