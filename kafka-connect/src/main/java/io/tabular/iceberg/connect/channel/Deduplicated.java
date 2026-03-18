@@ -106,7 +106,8 @@ class Deduplicated {
 
   /**
    * Returns all flag messages from the batch of envelopes.
-   * Flag messages are identified by having empty data and delete files.
+   * Flag messages are identified by containing sentinel data files with paths starting with
+   * {@link FlagWriterResult#FLAG_SENTINEL_PATH}.
    * The branch information is encoded in the table identifier.
    */
   public static List<TableContext> flagMessages(
@@ -114,11 +115,14 @@ class Deduplicated {
     return envelopes.stream()
         .map(envelope -> (DataWritten) envelope.event().payload())
         .filter(dataWritten -> {
-          // Check if this is a flag message: empty data/delete files
           List<DataFile> dataFiles = dataWritten.dataFiles();
-          List<DeleteFile> deleteFiles = dataWritten.deleteFiles();
-          return (dataFiles == null || dataFiles.isEmpty()) && 
-                 (deleteFiles == null || deleteFiles.isEmpty());
+
+          if (dataFiles == null || dataFiles.isEmpty()) {
+            return false;
+          }
+
+          return dataFiles.stream()
+                  .allMatch(f -> f.path().toString().equals(FlagWriterResult.FLAG_SENTINEL_PATH));
         })
         .map(dataWritten -> TableContext.parse(dataWritten.tableReference().identifier(), regex))
         .collect(toList());

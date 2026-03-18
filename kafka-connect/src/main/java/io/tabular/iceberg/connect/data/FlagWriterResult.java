@@ -18,6 +18,11 @@
  */
 package io.tabular.iceberg.connect.data;
 
+import java.util.List;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.types.Types;
@@ -30,16 +35,30 @@ import org.apache.iceberg.types.Types;
 public class FlagWriterResult extends WriterResult {
   
   private static final String FLAG_BRANCH_FIELD = "__flag_branch__";
+  public static final String FLAG_SENTINEL_PATH = "__flag__";
   private final String targetBranch;
 
   public FlagWriterResult(TableIdentifier tableIdentifier, String targetBranch) {
     super(
         tableIdentifier, 
-        ImmutableList.of(), 
+        createFlagDataFiles(), 
         ImmutableList.of(), 
         createFlagPartitionStruct(targetBranch)
     );
     this.targetBranch = targetBranch;
+  }
+
+  private static List<DataFile> createFlagDataFiles() {
+    // Use a few dummy sentinel entries so flag messages can be positively identified
+    // rather than relying on empty lists (which also occur for no-op commits)
+    return ImmutableList.of(
+        DataFiles.builder(PartitionSpec.unpartitioned())
+            .withPath(FLAG_SENTINEL_PATH)
+            .withFormat(FileFormat.PARQUET)
+            .withFileSizeInBytes(0L)
+            .withRecordCount(0)
+            .build()
+    );
   }
 
   private static Types.StructType createFlagPartitionStruct(String targetBranch) {

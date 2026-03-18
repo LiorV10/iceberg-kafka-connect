@@ -27,22 +27,14 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 
 import io.tabular.iceberg.connect.TableContext;
-import org.apache.iceberg.AppendFiles;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DeleteFile;
-import org.apache.iceberg.RowDelta;
-import org.apache.iceberg.Snapshot;
-import org.apache.iceberg.Table;
-import org.apache.iceberg.Transaction;
+import org.apache.iceberg.*;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableCommit;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
@@ -52,6 +44,7 @@ import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
@@ -307,6 +300,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private void processFlagMessages(Table table, List<TableContext> flagMessages) {
+    Set<String> visitedBranches = new HashSet<>();
+
+    // Process branch-unique flags
+    flagMessages.removeIf(flag -> !visitedBranches.add(flag.branch()));
+
     for (TableContext flagMessage : flagMessages) {
       LOG.debug("About to process flag for: {}", flagMessage.tableIdentifier().toString());
       String targetBranch = flagMessage.branch();
