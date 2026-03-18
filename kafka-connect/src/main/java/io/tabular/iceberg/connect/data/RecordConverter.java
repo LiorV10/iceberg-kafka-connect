@@ -165,6 +165,20 @@ public class RecordConverter {
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
+          // check if this field was previously rerouted to a "{name}_pending_type_update" column
+          NestedField reroutedTableField =
+              lookupStructField(recordFieldName + "_pending_type_update", schema, structFieldId);
+          if (reroutedTableField != null) {
+            result.setField(
+                reroutedTableField.name(),
+                convertValue(
+                    recordFieldValue,
+                    reroutedTableField.type(),
+                    reroutedTableField.fieldId(),
+                    schemaUpdateConsumer));
+            return;
+          }
+
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
           if (tableField == null) {
             // add the column if schema evolution is on, otherwise skip the value,
