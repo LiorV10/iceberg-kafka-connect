@@ -55,6 +55,7 @@ import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Type.PrimitiveType;
 import org.apache.iceberg.types.Types;
@@ -165,14 +166,16 @@ public class RecordConverter {
       int structFieldId,
       SchemaUpdate.Consumer schemaUpdateConsumer) {
     GenericRecord result = GenericRecord.create(schema);
-    Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
+    Set<String> pendingColumns = Sets.newHashSet();
+
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
-          // check if this field was previously rerouted to a "{name}_pending_type_update" column
+          // check if this field should be rerouted to a "{name}_pending_type_update" column
           NestedField reroutedTableField =
               lookupStructField(recordFieldName + "_pending_type_update", schema, structFieldId);
           if (reroutedTableField != null) {
+            pendingColumns.add(reroutedTableField.name());
             result.setField(
                 reroutedTableField.name(),
                 convertValue(
@@ -198,29 +201,28 @@ public class RecordConverter {
                 }
               }
             } else {
-              boolean hasSchemaUpdates = false;
-
-              // drop column if removed for schema and destructive evolution is on
-              if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
-                List<NestedField> columnsToDrop = tableSchema.columns().stream()
-                  .filter(col -> !incomingFieldNames.contains(col.name()))
-                  .collect(toList());
-
-                columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
-                hasSchemaUpdates = !columnsToDrop.isEmpty();
-              }
-
-              if (!hasSchemaUpdates) {
                 result.setField(
-                        tableField.name(),
-                        convertValue(
-                                recordFieldValue,
-                                tableField.type(),
-                                tableField.fieldId(),
-                                schemaUpdateConsumer));
-              }
+                  tableField.name(),
+                  convertValue(
+                          recordFieldValue,
+                          tableField.type(),
+                          tableField.fieldId(),
+                          schemaUpdateConsumer));
             }
         }});
+
+    // drop column if removed for schema and destructive evolution is on
+    if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+      Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
+      incomingFieldNames.addAll(pendingColumns);
+
+      List<NestedField> columnsToDrop = tableSchema.columns().stream()
+              .filter(col -> !incomingFieldNames.contains(col.name()))
+              .collect(toList());
+
+      columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+    }
+
     return result;
   }
 
@@ -230,17 +232,19 @@ public class RecordConverter {
       int structFieldId,
       SchemaUpdate.Consumer schemaUpdateConsumer) {
     GenericRecord result = GenericRecord.create(schema);
-    Set<String> incomingFieldNames = struct.schema().fields().stream().map(Field::name).collect(Collectors.toSet());
+    Set<String> pendingColumns = Sets.newHashSet();
+
     struct
         .schema()
         .fields()
         .forEach(
             recordField -> {
-              // check if this field was previously rerouted to a "{name}_pending_type_update" column
+              // check if this field should be rerouted to a "{name}_pending_type_update" column
               NestedField reroutedTableField =
                   lookupStructField(
                       recordField.name() + "_pending_type_update", schema, structFieldId);
               if (reroutedTableField != null) {
+                pendingColumns.add(reroutedTableField.name());
                 result.setField(
                     reroutedTableField.name(),
                     convertValue(
@@ -278,13 +282,6 @@ public class RecordConverter {
                     schemaUpdateConsumer.makeOptional(fieldName);
                     hasSchemaUpdates = true;
                   }
-                  // drop column if removed for schema and destructive evolution is on
-                  if (config.destructiveSchemaEvolutionEnabled()) {
-                    tableSchema.columns()
-                        .stream()
-                        .filter(col -> !incomingFieldNames.contains(col.name()))
-                        .forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
-                  }
                 }
                 if (!hasSchemaUpdates) {
                   result.setField(
@@ -297,6 +294,18 @@ public class RecordConverter {
                 }
               }
             });
+
+    // drop column if removed for schema and destructive evolution is on
+    if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+      Set<String> incomingFieldNames = struct.schema().fields().stream().map(Field::name).collect(Collectors.toSet());
+      incomingFieldNames.addAll(pendingColumns);
+
+      tableSchema.columns()
+              .stream()
+              .filter(col -> !incomingFieldNames.contains(col.name()))
+              .forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+    }
+
     return result;
   }
 
