@@ -201,6 +201,20 @@ public class RecordConverter {
         .fields()
         .forEach(
             recordField -> {
+              // check if this field was previously rerouted to a "{name}-new" column
+              NestedField reroutedTableField =
+                  lookupStructField(recordField.name() + "-new", schema, structFieldId);
+              if (reroutedTableField != null) {
+                result.setField(
+                    reroutedTableField.name(),
+                    convertValue(
+                        struct.get(recordField),
+                        reroutedTableField.type(),
+                        reroutedTableField.fieldId(),
+                        schemaUpdateConsumer));
+                return;
+              }
+
               NestedField tableField = lookupStructField(recordField.name(), schema, structFieldId);
               if (tableField == null) {
                 // add the column if schema evolution is on, otherwise skip the value
@@ -217,9 +231,23 @@ public class RecordConverter {
                   PrimitiveType evolveDataType =
                       SchemaUtils.needsDataTypeUpdate(tableField.type(), recordField.schema());
                   if (evolveDataType != null) {
+                    // standard Iceberg type evolution (e.g. int -> long, float -> double)
                     String fieldName = tableSchema.findColumnName(tableField.fieldId());
                     schemaUpdateConsumer.updateType(fieldName, evolveDataType);
                     hasSchemaUpdates = true;
+                  } else {
+                    // reroute to a new column if the type is incompatible and cannot be evolved
+                    Type incomingType = SchemaUtils.toIcebergType(recordField.schema(), config);
+                    if (incomingType.typeId() != tableField.type().typeId()) {
+                      String parentFieldName =
+                          structFieldId < 0 ? null : tableSchema.findColumnName(structFieldId);
+                      schemaUpdateConsumer.addColumn(
+                          parentFieldName, recordField.name() + "-new", incomingType);
+                      // make original field optional since rerouted records will not set it
+                      String colName = tableSchema.findColumnName(tableField.fieldId());
+                      schemaUpdateConsumer.makeOptional(colName);
+                      hasSchemaUpdates = true;
+                    }
                   }
                   // make optional if needed and schema evolution is on
                   if (tableField.isRequired() && recordField.schema().isOptional()) {

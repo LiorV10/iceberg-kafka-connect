@@ -25,6 +25,7 @@ import static org.mockito.Mockito.when;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
+import io.tabular.iceberg.connect.data.SchemaUpdate.MakeOptional;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
@@ -759,6 +760,98 @@ public class RecordConverterTest {
 
     assertThat(updateMap.get("st.ii").type()).isInstanceOf(LongType.class);
     assertThat(updateMap.get("st.ff").type()).isInstanceOf(DoubleType.class);
+  }
+
+  @Test
+  public void testRerouteIncompatibleTypeStruct() {
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "ii", Types.IntegerType.get()),
+            Types.NestedField.required(2, "ss", Types.StringType.get()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // ii is coming in as STRING (incompatible with INTEGER), ss as INT32 (incompatible with STRING)
+    Schema valueSchema =
+        SchemaBuilder.struct()
+            .field("ii", Schema.STRING_SCHEMA)
+            .field("ss", Schema.INT32_SCHEMA);
+    Struct data = new Struct(valueSchema).put("ii", "hello").put("ss", 42);
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    converter.convert(data, consumer);
+
+    assertThat(consumer.updateTypes()).isEmpty();
+
+    Collection<AddColumn> addColumns = consumer.addColumns();
+    assertThat(addColumns).hasSize(2);
+
+    Map<String, AddColumn> addColMap = Maps.newHashMap();
+    addColumns.forEach(col -> addColMap.put(col.key(), col));
+
+    assertThat(addColMap.get("ii-new").type()).isInstanceOf(StringType.class);
+    assertThat(addColMap.get("ss-new").type()).isInstanceOf(IntegerType.class);
+
+    Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
+    assertThat(makeOptionals).hasSize(2);
+
+    Map<String, SchemaUpdate.MakeOptional> makeOptionalMap = Maps.newHashMap();
+    makeOptionals.forEach(mo -> makeOptionalMap.put(mo.name(), mo));
+
+    assertThat(makeOptionalMap).containsKey("ii");
+    assertThat(makeOptionalMap).containsKey("ss");
+  }
+
+  @Test
+  public void testRerouteIncompatibleTypeStructNested() {
+    org.apache.iceberg.Schema structColSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "ii", Types.IntegerType.get()),
+            Types.NestedField.required(2, "ss", Types.StringType.get()));
+
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(3, "i", Types.IntegerType.get()),
+            Types.NestedField.required(4, "st", structColSchema.asStruct()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // ii is coming in as STRING (incompatible with INTEGER), ss as INT32 (incompatible with STRING)
+    Schema structSchema =
+        SchemaBuilder.struct()
+            .field("ii", Schema.STRING_SCHEMA)
+            .field("ss", Schema.INT32_SCHEMA);
+    Schema schema =
+        SchemaBuilder.struct().field("i", Schema.INT32_SCHEMA).field("st", structSchema);
+    Struct structValue = new Struct(structSchema).put("ii", "hello").put("ss", 42);
+    Struct data = new Struct(schema).put("i", 1).put("st", structValue);
+
+    SchemaUpdate.Consumer consumer = new SchemaUpdate.Consumer();
+    converter.convert(data, consumer);
+
+    assertThat(consumer.updateTypes()).isEmpty();
+
+    Collection<AddColumn> addColumns = consumer.addColumns();
+    assertThat(addColumns).hasSize(2);
+
+    Map<String, AddColumn> addColMap = Maps.newHashMap();
+    addColumns.forEach(col -> addColMap.put(col.key(), col));
+
+    assertThat(addColMap.get("st.ii-new").type()).isInstanceOf(StringType.class);
+    assertThat(addColMap.get("st.ss-new").type()).isInstanceOf(IntegerType.class);
+
+    Collection<SchemaUpdate.MakeOptional> makeOptionals = consumer.makeOptionals();
+    assertThat(makeOptionals).hasSize(2);
+
+    Map<String, SchemaUpdate.MakeOptional> makeOptionalMap = Maps.newHashMap();
+    makeOptionals.forEach(mo -> makeOptionalMap.put(mo.name(), mo));
+
+    assertThat(makeOptionalMap).containsKey("st.ii");
+    assertThat(makeOptionalMap).containsKey("st.ss");
   }
 
   private Map<String, Object> createMapData() {
