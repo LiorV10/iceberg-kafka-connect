@@ -348,8 +348,8 @@ public class Coordinator extends Channel implements AutoCloseable {
       for (org.apache.iceberg.types.Types.NestedField shadowField : shadowColumns) {
         String shadowName = shadowField.name();
         String originalName = SchemaUtils.getOriginalColumnName(shadowName);
-        LOG.info("Column type swap: deleting old column '{}' and renaming shadow '{}' to original",
-            originalName, shadowName);
+        LOG.info("Column type swap: deleting old column '{}' and renaming shadow '{}' to '{}'",
+            originalName, shadowName, originalName);
         updateSchema.deleteColumn(originalName);
         updateSchema.renameColumn(shadowName, originalName);
       }

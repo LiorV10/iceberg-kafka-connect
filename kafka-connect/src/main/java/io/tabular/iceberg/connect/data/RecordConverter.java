@@ -86,7 +86,9 @@ public class RecordConverter {
   private final NameMapping nameMapping;
   private final IcebergSinkConfig config;
   private final Map<Integer, Map<String, NestedField>> structNameMap = Maps.newHashMap();
-  // Maps original column name -> shadow column NestedField for in-progress type changes
+  // Maps original column name -> shadow NestedField for in-progress type changes.
+  // Populated at construction time by scanning the table schema for shadow columns
+  // (columns whose names match the "_<original>_type_pending" naming convention).
   private final Map<String, NestedField> shadowColumnMap = Maps.newHashMap();
 
   public RecordConverter(Table table, IcebergSinkConfig config) {
@@ -202,7 +204,9 @@ public class RecordConverter {
               // records don't repeatedly re-trigger ReplaceColumn detection.
               NestedField shadowField = shadowColumnMap.get(recordFieldName);
               if (shadowField != null) {
-                // Dual-write: shadow column gets the correctly-typed value
+                // Route the value to the shadow column only.  The original column is intentionally
+                // left null (it was made optional when the shadow was created) and will be
+                // deleted when the end-of-refresh flag triggers the column swap.
                 NestedField shadowTableField = schema.field(shadowField.name());
                 if (shadowTableField != null) {
                   try {
@@ -218,20 +222,6 @@ public class RecordConverter {
                         shadowTableField.name(), e);
                     result.setField(shadowTableField.name(), null);
                   }
-                }
-                // Old column gets best-effort conversion (null on failure)
-                try {
-                  result.setField(
-                      tableField.name(),
-                      convertValue(
-                          recordFieldValue,
-                          tableField.type(),
-                          tableField.fieldId(),
-                          schemaUpdateConsumer));
-                } catch (Exception e) {
-                  LOG.warn("Failed best-effort conversion for column '{}' during type change, writing null",
-                      tableField.name(), e);
-                  result.setField(tableField.name(), null);
                 }
               } else {
                 boolean hasSchemaUpdates = false;
@@ -307,7 +297,9 @@ public class RecordConverter {
                 // records don't repeatedly re-trigger ReplaceColumn detection.
                 NestedField shadowField = shadowColumnMap.get(recordField.name());
                 if (shadowField != null) {
-                  // Dual-write: shadow column gets the correctly-typed value
+                  // Route the value to the shadow column only.  The original column is intentionally
+                  // left null (it was made optional when the shadow was created) and will be
+                  // deleted when the end-of-refresh flag triggers the column swap.
                   NestedField shadowTableField = schema.field(shadowField.name());
                   if (shadowTableField != null) {
                     try {
@@ -323,20 +315,6 @@ public class RecordConverter {
                           shadowTableField.name(), e);
                       result.setField(shadowTableField.name(), null);
                     }
-                  }
-                  // Old column gets best-effort conversion (null on failure)
-                  try {
-                    result.setField(
-                        tableField.name(),
-                        convertValue(
-                            struct.get(recordField),
-                            tableField.type(),
-                            tableField.fieldId(),
-                            schemaUpdateConsumer));
-                  } catch (Exception e) {
-                    LOG.warn("Failed best-effort conversion for column '{}' during type change, writing null",
-                        tableField.name(), e);
-                    result.setField(tableField.name(), null);
                   }
                 } else {
                   boolean hasSchemaUpdates = false;

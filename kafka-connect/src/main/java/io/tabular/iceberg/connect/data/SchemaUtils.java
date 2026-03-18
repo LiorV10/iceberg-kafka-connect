@@ -214,6 +214,9 @@ public class SchemaUtils {
           update.name(), table.schema().findField(update.name()).type(), update.newType(),
           shadowName);
       updateSchema.addColumn(null, shadowName, update.newType());
+      // Make the original column optional so that null values written to it during the
+      // shadow transition period do not violate a NOT NULL constraint.
+      updateSchema.makeColumnOptional(update.name());
     });
     updateSchema.commit();
     LOG.info("Schema for table {} updated with new columns", table.name());

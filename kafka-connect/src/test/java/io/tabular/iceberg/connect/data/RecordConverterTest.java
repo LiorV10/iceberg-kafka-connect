@@ -839,15 +839,17 @@ public class RecordConverterTest {
   /**
    * When a shadow column (_price_type_pending) already exists in the table schema, the converter
    * should route values directly to the shadow column WITHOUT re-triggering ReplaceColumn detection
-   * on the schema update consumer.
+   * on the schema update consumer. The original column is intentionally left null (it was made
+   * optional at shadow-creation time) and will be deleted when the flag triggers the swap.
    */
   @Test
   public void testShadowColumnRoutingStruct() {
-    // Schema with original int column "price" and its shadow string column "_price_type_pending"
+    // Schema with original int column "price" (optional — made so when shadow was created)
+    // and its shadow string column "_price_type_pending"
     org.apache.iceberg.Schema tableSchema =
         new org.apache.iceberg.Schema(
             Types.NestedField.required(1, "id", Types.LongType.get()),
-            Types.NestedField.required(2, "price", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "price", Types.IntegerType.get()),
             Types.NestedField.optional(3, "_price_type_pending", Types.StringType.get()));
 
     Table table = mock(Table.class);
@@ -873,7 +875,7 @@ public class RecordConverterTest {
     // The shadow column should receive the string value
     GenericRecord rec = (GenericRecord) row;
     assertThat(rec.getField("_price_type_pending")).isEqualTo("9.99");
-    // The original column gets best-effort conversion (string "9.99" can't convert to int → null)
+    // The original column is left null (not written — it will be deleted on flag swap)
     assertThat(rec.getField("price")).isNull();
   }
 
@@ -885,7 +887,7 @@ public class RecordConverterTest {
     org.apache.iceberg.Schema tableSchema =
         new org.apache.iceberg.Schema(
             Types.NestedField.required(1, "id", Types.LongType.get()),
-            Types.NestedField.required(2, "price", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "price", Types.IntegerType.get()),
             Types.NestedField.optional(3, "_price_type_pending", Types.StringType.get()));
 
     Table table = mock(Table.class);
@@ -903,6 +905,7 @@ public class RecordConverterTest {
 
     GenericRecord rec = (GenericRecord) row;
     assertThat(rec.getField("_price_type_pending")).isEqualTo("9.99");
+    // The original column is left null (not written — will be deleted on flag swap)
     assertThat(rec.getField("price")).isNull();
   }
 
