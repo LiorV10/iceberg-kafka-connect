@@ -21,6 +21,8 @@ package io.tabular.iceberg.connect.data;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
+
+import io.tabular.iceberg.connect.TableContext;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
@@ -48,13 +50,18 @@ public class IcebergWriterFactory {
 
   public RecordWriter createWriter(
           String tableName, SinkRecord sample, boolean ignoreMissingTable) {
-    TableIdentifier identifier = TableIdentifier.parse(tableName);
     Table table;
+    TableIdentifier identifier = TableIdentifier.parse(tableName);
+
+    if (this.config.dynamicBranchesEnabled()) {
+       identifier = TableContext.parse(identifier, this.config.branchesRegexDelimiter()).tableIdentifier();
+    }
+
     try {
       table = catalog.loadTable(identifier);
     } catch (NoSuchTableException nst) {
       if (config.autoCreateEnabled()) {
-        table = autoCreateTable(tableName, sample);
+        table = autoCreateTable(identifier.toString(), sample);
       } else if (ignoreMissingTable) {
         return new RecordWriter() {};
       } else {
@@ -62,6 +69,7 @@ public class IcebergWriterFactory {
       }
     }
 
+    // keep branch in table name here to latter group commits by branch
     return new IcebergWriter(table, tableName, config);
   }
 
@@ -79,7 +87,10 @@ public class IcebergWriterFactory {
       }
 
       org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(structType.fields());
-      TableIdentifier identifier = TableIdentifier.parse(tableName);
+      TableIdentifier temp = TableIdentifier.parse(tableName);
+      TableIdentifier identifier = this.config.dynamicBranchesEnabled()
+              ? temp
+              : TableContext.parse(temp, this.config.branchesRegexDelimiter()).tableIdentifier();
 
       List<String> partitionBy = config.tableConfig(tableName).partitionBy();
       PartitionSpec spec;
@@ -109,6 +120,9 @@ public class IcebergWriterFactory {
                           LOG.info("Created new table {} from record at topic: {}, partition: {}, offset: {}", identifier, sample.topic(), sample.kafkaPartition(), sample.kafkaOffset());
                         }
                       });
+
+      // create initial empty snapshot
+      result.get().newAppend().commit();
       return result.get();
     } catch (Exception e) {
       LOG.error("Error creating new table {} from record at topic: {}, partition: {}, offset: {}", tableName, sample.topic(), sample.kafkaPartition(), sample.kafkaOffset());
