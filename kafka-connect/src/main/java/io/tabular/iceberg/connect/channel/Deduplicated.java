@@ -21,8 +21,12 @@ package io.tabular.iceberg.connect.channel;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.TableContext;
 import io.tabular.iceberg.connect.data.FlagWriterResult;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
@@ -73,6 +77,7 @@ import org.slf4j.LoggerFactory;
  */
 class Deduplicated {
   private static final Logger LOG = LoggerFactory.getLogger(Deduplicated.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
 
   private Deduplicated() {}
 
@@ -110,10 +115,13 @@ class Deduplicated {
    * Returns all flag messages from the batch of envelopes.
    * Flag messages are identified by containing sentinel data files with paths starting with
    * {@link FlagWriterResult#FLAG_PREFIX}.
-   * The branch information is encoded in the table identifier.
+   * The full flag record is deserialized from the JSON embedded in the DataFile path.
+   * The map key is the flag type (extracted from the record using {@code flagTypeField}),
+   * and the map value is a pair of the {@link TableContext} and the full flag record as a map.
    */
-  public static Map<String, TableContext> flagMessages(
-      UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex) {
+  public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
+      UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
+      String flagTypeField) {
     return envelopes.stream()
         .map(envelope -> (DataWritten) envelope.event().payload())
         .filter(dataWritten -> {
@@ -126,8 +134,32 @@ class Deduplicated {
           return dataFiles.stream()
                   .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
         })
-        .collect(toMap(dataWritten -> dataWritten.dataFiles().stream().findFirst().get().path().toString().split(FlagWriterResult.FLAG_PREFIX)[1],
-                dataWritten -> TableContext.parse(dataWritten.tableReference().identifier(), regex)));
+        .collect(toMap(
+                dataWritten -> extractFlagType(dataWritten, flagTypeField),
+                dataWritten -> {
+                  String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+                      .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+                  Map<String, Object> record = parseRecordJson(recordJson);
+                  TableContext tableContext = TableContext.parse(
+                      dataWritten.tableReference().identifier(), regex);
+                  return Pair.of(tableContext, record);
+                }));
+  }
+
+  private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
+    String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+        .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+    Map<String, Object> record = parseRecordJson(recordJson);
+    Object type = record.get(flagTypeField);
+    return type != null ? type.toString() : "";
+  }
+
+  private static Map<String, Object> parseRecordJson(String recordJson) {
+    try {
+      return MAPPER.readValue(recordJson, new TypeReference<Map<String, Object>>() {});
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private static <F> List<F> deduplicatedFiles(

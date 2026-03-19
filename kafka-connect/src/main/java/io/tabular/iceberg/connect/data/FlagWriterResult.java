@@ -29,6 +29,8 @@ import org.apache.iceberg.types.Types;
  * A special WriterResult that represents a flag message.
  * It has no data files but carries branch switching information in the partition struct.
  * The partition struct will have a special field "__flag_branch__" containing the target branch name.
+ * The entire flag record is serialized as JSON and embedded in the dummy DataFile path using the
+ * format: {@link #FLAG_PREFIX} + recordJson.
  */
 public class FlagWriterResult extends WriterResult {
   
@@ -36,12 +38,12 @@ public class FlagWriterResult extends WriterResult {
   public static final String FLAG_PREFIX = "__flag__";
   private final String targetBranch;
 
-  public FlagWriterResult(TableIdentifier tableIdentifier, String targetBranch, String flagType) {
+  public FlagWriterResult(TableIdentifier tableIdentifier, String targetBranch, String recordJson) {
     super(
         tableIdentifier,
             ImmutableList.of(
                     DataFiles.builder((PartitionSpec.unpartitioned()))
-                            .withPath(FLAG_PREFIX.concat(flagType))
+                            .withPath(FLAG_PREFIX.concat(recordJson))
                             .withFormat(FileFormat.PARQUET)
                             .withFileSizeInBytes(0L)
                             .withRecordCount(0)

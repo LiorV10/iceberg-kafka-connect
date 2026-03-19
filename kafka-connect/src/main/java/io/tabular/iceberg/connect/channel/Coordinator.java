@@ -226,9 +226,10 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     // Check for flag messages in the envelopes
-    Map<String, TableContext> flagMessages =
+    Map<String, Pair<TableContext, Map<String, Object>>> flagMessages =
         Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
-                filteredEnvelopeList, this.config.branchesRegexDelimiter());
+                filteredEnvelopeList, this.config.branchesRegexDelimiter(),
+                this.config.flagTypeField());
 
     LOG.debug("Found {} flag messages", flagMessages.size());
 
@@ -299,8 +300,10 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
-  private void processFlagMessages(Table table, Map<String, TableContext> flagMessages) {
-    flagMessages.forEach((type, flagMessage) -> {
+  private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
+    flagMessages.forEach((type, flagEntry) -> {
+      TableContext flagMessage = flagEntry.first();
+      Map<String, Object> flagRecord = flagEntry.second();
       LOG.debug("About to process flag of type {} for: {}", type, flagMessage.tableIdentifier().toString());
 
       switch (type) {

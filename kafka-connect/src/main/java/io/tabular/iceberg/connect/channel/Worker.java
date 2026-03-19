@@ -20,6 +20,8 @@ package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.TableContext;
 import io.tabular.iceberg.connect.data.FlagWriterResult;
@@ -29,7 +31,9 @@ import io.tabular.iceberg.connect.data.RecordWriter;
 import io.tabular.iceberg.connect.data.Utilities;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -42,6 +46,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -50,6 +55,7 @@ import org.slf4j.LoggerFactory;
 class Worker implements Writer, AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(Worker.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
   private final IcebergSinkConfig config;
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
@@ -121,8 +127,8 @@ class Worker implements Writer, AutoCloseable {
        TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
        TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
-       String flagType = extractString(record.value(), this.config.flagTypeField());
-       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), flagType);
+       String recordJson = serializeRecordToJson(record.value());
+       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);
        flagWriterResults.add(flagResult);
 
        // All records after flag should be re-routed to flag's branch
@@ -198,6 +204,22 @@ class Worker implements Writer, AutoCloseable {
 
     Object value = Utilities.extractFromRecordValue(recordValue, field);
     return value == null ? null : value.toString();
+  }
+
+  private String serializeRecordToJson(Object recordValue) {
+    try {
+      if (recordValue instanceof Map) {
+        return MAPPER.writeValueAsString(recordValue);
+      } else if (recordValue instanceof Struct) {
+        Struct struct = (Struct) recordValue;
+        Map<String, Object> map = new LinkedHashMap<>();
+        struct.schema().fields().forEach(field -> map.put(field.name(), struct.get(field)));
+        return MAPPER.writeValueAsString(map);
+      }
+      return MAPPER.writeValueAsString(recordValue);
+    } catch (JsonProcessingException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private RecordWriter writerForTable(
