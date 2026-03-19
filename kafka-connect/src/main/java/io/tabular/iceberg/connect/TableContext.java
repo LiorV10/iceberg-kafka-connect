@@ -35,13 +35,15 @@ public class TableContext {
 
   public static TableContext parse(TableIdentifier tableIdentifier, String regex) {
     Namespace namespace = tableIdentifier.namespace();
-    String[] nameParts = tableIdentifier.name().split(regex);
     String name = tableIdentifier.name();
     String branch = null;
 
-    if (nameParts.length == 2) {
-      name = nameParts[0];
-      branch = nameParts[1];
+    if (regex != null) {
+      String[] nameParts = name.split(regex);
+      if (nameParts.length == 2) {
+        name = nameParts[0];
+        branch = nameParts[1];
+      }
     }
 
     return new TableContext(TableIdentifier.of(namespace, name), branch);

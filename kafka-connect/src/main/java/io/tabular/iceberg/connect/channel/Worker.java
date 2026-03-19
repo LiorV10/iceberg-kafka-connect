@@ -155,35 +155,20 @@ class Worker implements Writer, AutoCloseable {
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
-      int expectedPartition = this.config.flagSourcePartition();
-      if (expectedPartition != -1 && record.kafkaPartition() != expectedPartition) {
-        LOG.warn(
-            "Ignoring flag-like record at topic: {}, partition: {}, offset: {} — "
-                + "it arrived on partition {} but iceberg.flags.source-partition is set to {}. "
-                + "Flag records must be produced to partition {} to guarantee ordering.",
-            record.topic(), record.kafkaPartition(), record.kafkaOffset(),
-            record.kafkaPartition(), expectedPartition, expectedPartition);
-        // Treat as a regular data record so ordering invariant is preserved
-        if (config.dynamicTablesEnabled()) {
-          routeRecordDynamically(record);
-        } else {
-          routeRecordStatically(record);
-        }
-        return;
-      }
-
       // Flag records are tracked in offsets but not written to data files.
       // They are staged as PENDING and will be activated at the START of the next
       // write() call, after all other partitions in this batch have been processed.
+      // In a multi-task deployment each task processes its own subset of partitions;
+      // the producer must broadcast the flag to ALL partitions so every task sees it,
+      // sets its own reroute, and reports it to the Coordinator. The commit cycle
+      // (which waits for DataComplete from all partitions) is the global barrier that
+      // ensures all tasks' data is committed before the Coordinator processes the flag.
       LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}. "
                + "Staging as pending until all partitions in this batch are processed.",
                record.topic(), record.kafkaPartition(), record.kafkaOffset());
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
-      String branchesRegexDelimiter = this.config.branchesRegexDelimiter();
-      TableContext context = branchesRegexDelimiter != null
-          ? TableContext.parse(tableIdentifier, branchesRegexDelimiter)
-          : new TableContext(tableIdentifier, null);
+      TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
       String recordJson = serializeRecordToJson(record.value());
       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);

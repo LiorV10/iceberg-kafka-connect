@@ -112,12 +112,19 @@ class Deduplicated {
   }
 
   /**
-   * Returns all flag messages from the batch of envelopes.
+   * Returns all flag messages from the batch of envelopes, deduplicated by flag type.
    * Flag messages are identified by containing sentinel data files with paths starting with
    * {@link FlagWriterResult#FLAG_PREFIX}.
    * The full flag record is deserialized from the JSON embedded in the DataFile path.
    * The map key is the flag type (extracted from the record using {@code flagTypeField}),
    * and the map value is a pair of the {@link TableContext} and the full flag record as a map.
+   *
+   * <p>In a multi-task deployment the producer broadcasts the same flag to every Kafka
+   * partition so that every task sees it, sets its own reroute, and reports a
+   * {@link FlagWriterResult} to the Coordinator. The Coordinator therefore receives one
+   * flag per partition for the same logical flag event. This method deduplicates those
+   * copies by flag type, keeping the first occurrence, so the Coordinator processes each
+   * logical flag exactly once.
    */
   public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
       UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
@@ -143,6 +150,12 @@ class Deduplicated {
                   TableContext tableContext = TableContext.parse(
                       dataWritten.tableReference().identifier(), regex);
                   return Pair.of(tableContext, record);
+                },
+                // Deduplicate: when the same flag type is reported by multiple tasks (one per
+                // partition in a broadcast scenario) keep the first occurrence and discard the rest.
+                (existing, duplicate) -> {
+                  LOG.debug("Deduplicating flag: type already seen, discarding copy from additional partition");
+                  return existing;
                 }));
   }
 

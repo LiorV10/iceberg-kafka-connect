@@ -74,7 +74,6 @@ public class IcebergSinkConfig extends AbstractConfig {
   public static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
   public static final String FLAG_MESSAGE_PREFIX = "iceberg.flags.key-prefix";
   public static final String FLAG_TYPE_FIELD = "iceberg.flags.type-field";
-  public static final String FLAG_SOURCE_PARTITION = "iceberg.flags.source-partition";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
@@ -189,15 +188,6 @@ public class IcebergSinkConfig extends AbstractConfig {
             null,
             Importance.MEDIUM,
             "The field that identifies the type of the flag"
-    );
-    configDef.define(
-            FLAG_SOURCE_PARTITION,
-            Type.INT,
-            -1,
-            Importance.MEDIUM,
-            "Kafka source partition that flag messages must arrive on (-1 means any partition). "
-                + "Setting this guarantees flag ordering relative to other flags and data messages "
-                + "by restricting all flags to a single, predictable partition."
     );
     configDef.define(
         TABLES_CDC_FIELD_PROP,
@@ -395,8 +385,6 @@ public class IcebergSinkConfig extends AbstractConfig {
   public String flagKeyPrefix() { return getString(FLAG_MESSAGE_PREFIX); }
 
   public String flagTypeField() { return getString(FLAG_TYPE_FIELD); }
-
-  public int flagSourcePartition() { return getInt(FLAG_SOURCE_PARTITION); }
 
   public boolean dynamicTablesEnabled() {
     return getBoolean(TABLES_DYNAMIC_PROP);
