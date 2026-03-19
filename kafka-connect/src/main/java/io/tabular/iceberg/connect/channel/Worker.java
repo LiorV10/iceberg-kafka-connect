@@ -60,7 +60,15 @@ class Worker implements Writer, AutoCloseable {
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
+  // Flags that have been fully activated (all partitions in their batch were processed).
   private final List<WriterResult> flagWriterResults;
+  // Flags detected in the current write() call, waiting for all other partition records
+  // in the same batch to finish before activation (barrier pattern).
+  private final List<WriterResult> pendingFlagWriterResults;
+  // Reroute destination queued by the current batch's flag, applied at the start of
+  // the next write() call so records from other partitions in the same batch are
+  // unaffected.
+  private String pendingReroute;
   private String reroute;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
@@ -74,6 +82,8 @@ class Worker implements Writer, AutoCloseable {
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
+    this.pendingFlagWriterResults = Lists.newArrayList();
+    this.pendingReroute = null;
     this.reroute = null;
   }
 
@@ -101,13 +111,39 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
+    pendingFlagWriterResults.clear();
+    this.pendingReroute = null;
     this.reroute = null;
   }
 
   @Override
   public void write(Collection<SinkRecord> sinkRecords) {
+    // Activate any flags that were buffered in the previous write() call.
+    // By this point every partition that was present in that earlier batch has
+    // already been processed, satisfying the cross-partition ordering guarantee.
+    activatePendingFlags();
+
     if (sinkRecords != null && !sinkRecords.isEmpty()) {
       sinkRecords.forEach(this::save);
+    }
+  }
+
+  /**
+   * Promotes flags buffered from the previous write() batch into the active
+   * {@code flagWriterResults} list and applies the pending reroute destination.
+   * This is the barrier point: all records from ALL partitions in the previous
+   * batch have been processed before this method runs.
+   */
+  private void activatePendingFlags() {
+    if (!pendingFlagWriterResults.isEmpty()) {
+      flagWriterResults.addAll(pendingFlagWriterResults);
+      pendingFlagWriterResults.clear();
+      LOG.debug("Activated {} pending flag(s) after all partitions in previous batch were processed",
+          flagWriterResults.size());
+    }
+    if (pendingReroute != null) {
+      this.reroute = pendingReroute;
+      this.pendingReroute = null;
     }
   }
 
@@ -136,22 +172,27 @@ class Worker implements Writer, AutoCloseable {
         return;
       }
 
-       // Flag records are tracked in offsets but not written to data files
-       // They will be sent to coordinator during commit to trigger branch switching
-       LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 
-                record.topic(), record.kafkaPartition(), record.kafkaOffset());
-       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
-       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
-       TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
+      // Flag records are tracked in offsets but not written to data files.
+      // They are staged as PENDING and will be activated at the START of the next
+      // write() call, after all other partitions in this batch have been processed.
+      LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}. "
+               + "Staging as pending until all partitions in this batch are processed.",
+               record.topic(), record.kafkaPartition(), record.kafkaOffset());
+      String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
+      TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
+      String branchesRegexDelimiter = this.config.branchesRegexDelimiter();
+      TableContext context = branchesRegexDelimiter != null
+          ? TableContext.parse(tableIdentifier, branchesRegexDelimiter)
+          : new TableContext(tableIdentifier, null);
 
-       String recordJson = serializeRecordToJson(record.value());
-       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);
-       flagWriterResults.add(flagResult);
+      String recordJson = serializeRecordToJson(record.value());
+      FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);
+      pendingFlagWriterResults.add(flagResult);
 
-       // All records after flag should be re-routed to flag's branch
-       this.reroute = tableName;
-       
-       LOG.debug("Flag message queued for table: {}, branch: {}", context.tableIdentifier(), context.branch());
+      // Queue the reroute; it will be applied at the start of the NEXT write() call.
+      this.pendingReroute = tableName;
+
+      LOG.debug("Flag message staged for table: {}, branch: {}", context.tableIdentifier(), context.branch());
     } else {
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
