@@ -64,19 +64,30 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   private final Catalog catalog;
   private final IcebergSinkConfig config;
+  // Total number of source-topic partitions across all tasks in this consumer group.
+  // There is exactly ONE coordinator per sink connector (the task that owns the lowest
+  // TopicPartition elected as leader). All other tasks are workers that write data files
+  // and report them via the control topic. The coordinator receives DataWritten events
+  // from EVERY task and waits for isCommitReady(totalPartitionCount) before committing.
+  //
+  // Flag ordering guarantee:
+  //   The producer must broadcast the flag to ALL source partitions (one copy per partition).
+  //   Each partition's flag becomes one FlagWriterResult in the task that processes it, and
+  //   therefore exactly ONE DataWritten event on the control topic.  Across all tasks the
+  //   coordinator accumulates these DataWritten-flag events until their count reaches
+  //   totalPartitionCount (one per source partition), at which point every task has seen and
+  //   activated its reroute, and all pre-flag data has been committed — only then is the flag
+  //   action (e.g. branch switch) executed.
   private final int totalPartitionCount;
-  // Number of Kafka Connect tasks in this consumer group. Flags are broadcast to all
-  // partitions, so each task reports one copy per commit cycle. We accumulate votes
-  // across cycles and only process a flag once all tasks have reported it.
-  private final int totalTaskCount;
   private final String snapshotOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
 
   // Accumulated vote counts per table per flag type across commit cycles.
-  // Keyed by table identifier → (flag type → number of tasks that have reported it so far).
+  // Keyed by table identifier → (flag type → number of flag DataWritten events seen so far).
+  // One DataWritten event = one source partition's flag record (broadcast copy).
   private final Map<TableIdentifier, Map<String, Integer>> pendingFlagVotes = Maps.newHashMap();
-  // First-seen flag data per table per flag type, held until vote count is complete.
+  // First-seen flag payload per table per flag type, held until the vote count is complete.
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
   public Coordinator(
@@ -91,7 +102,6 @@ public class Coordinator extends Channel implements AutoCloseable {
     this.config = config;
     this.totalPartitionCount =
         members.stream().mapToInt(desc -> desc.assignment().topicPartitions().size()).sum();
-    this.totalTaskCount = members.size();
     this.snapshotOffsetsProp =
         String.format(OFFSETS_SNAPSHOT_PROP_FMT, config.controlTopic(), config.controlGroupId());
     this.exec = ThreadPools.newWorkerPool("iceberg-committer", config.commitThreads());
@@ -237,10 +247,11 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    // Accumulate flag votes from this cycle. A flag is only processed once all tasks
-    // have reported their copy (vote count reaches totalTaskCount). Different tasks may
-    // receive the broadcast flag in different commit cycles, so votes are persisted
-    // across cycles until the quorum is reached.
+    // Accumulate flag votes from this cycle. Each source partition's broadcast flag copy
+    // produces one DataWritten event (= one vote). A flag is only processed once the
+    // accumulated vote count reaches totalPartitionCount (all partitions have reported).
+    // Because different tasks receive the broadcast flag in different commit cycles, votes
+    // are persisted across cycles until the quorum is reached.
     accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
@@ -312,9 +323,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
-   * Counts the flag-containing DataWritten events in {@code envelopes} (one per task that
-   * reported the flag this cycle) and merges those counts into {@link #pendingFlagVotes}.
-   * The first-seen flag data for each type is also stored in {@link #pendingFlagData}.
+   * Counts the flag-containing DataWritten events in {@code envelopes} and merges those
+   * counts into {@link #pendingFlagVotes}. Each DataWritten event represents one source
+   * partition's broadcast copy of the flag (one FlagWriterResult produced by the task that
+   * processed that partition). The first-seen flag payload for each type is stored in
+   * {@link #pendingFlagData}.
    */
   private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
     Map<String, Integer> votesThisCycle =
@@ -334,14 +347,16 @@ public class Coordinator extends Channel implements AutoCloseable {
     votesThisCycle.forEach((type, count) -> {
       int newTotal = votes.merge(type, count, Integer::sum);
       data.putIfAbsent(type, dataThisCycle.get(type));
-      LOG.info("Flag '{}' for table {}: accumulated {}/{} task votes",
-          type, tableIdentifier, newTotal, totalTaskCount);
+      LOG.info("Flag '{}' for table {}: accumulated {}/{} partition votes",
+          type, tableIdentifier, newTotal, totalPartitionCount);
     });
   }
 
   /**
    * Returns and removes all flag types for {@code tableIdentifier} that have accumulated
-   * votes from every task (vote count {@code >= totalTaskCount}).
+   * a vote from every source partition (vote count {@code >= totalPartitionCount}).
+   * Because the flag is broadcast to all N source partitions, N DataWritten events
+   * (one per partition) must arrive before the flag is safe to process.
    */
   private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
       TableIdentifier tableIdentifier) {
@@ -350,7 +365,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
     List<String> readyTypes = votes.entrySet().stream()
-        .filter(e -> e.getValue() >= totalTaskCount)
+        .filter(e -> e.getValue() >= totalPartitionCount)
         .map(Map.Entry::getKey)
         .collect(toList());
 
@@ -362,8 +377,8 @@ public class Coordinator extends Channel implements AutoCloseable {
     readyTypes.forEach(type -> {
       ready.put(type, data.remove(type));
       votes.remove(type);
-      LOG.info("Flag '{}' for table {} ready: all {} tasks have reported it",
-          type, tableIdentifier, totalTaskCount);
+      LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
+          type, tableIdentifier, totalPartitionCount);
     });
     return ready;
   }

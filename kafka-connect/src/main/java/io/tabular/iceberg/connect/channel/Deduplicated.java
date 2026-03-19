@@ -160,12 +160,15 @@ class Deduplicated {
   }
 
   /**
-   * Returns the number of distinct tasks (DataWritten events) that reported each flag type
-   * in this batch of envelopes. Each DataWritten event corresponds to exactly one task.
+   * Returns the number of flag-containing DataWritten events per flag type in this batch
+   * of envelopes. Each DataWritten event corresponds to exactly one FlagWriterResult,
+   * which in turn corresponds to exactly one source partition's broadcast copy of the flag.
    *
-   * <p>This count is used by the Coordinator to accumulate votes across commit cycles:
-   * a flag is safe to process only when the accumulated vote count reaches
-   * {@code totalTaskCount} (i.e. every task has reported the flag at least once).
+   * <p>A task that owns K source partitions will send K DataWritten events carrying flag data
+   * (one per partition). Summing these across tasks and across commit cycles gives the total
+   * number of source-partition-level votes. A flag is safe to process once this total reaches
+   * {@code totalPartitionCount} — meaning every source partition has broadcast the flag and
+   * every task has activated its reroute.
    */
   static Map<String, Integer> flagMessageVoteCounts(List<Envelope> envelopes, String flagTypeField) {
     return envelopes.stream()
