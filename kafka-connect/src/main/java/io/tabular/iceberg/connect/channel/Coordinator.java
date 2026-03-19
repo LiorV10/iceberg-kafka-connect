@@ -226,7 +226,7 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     // Check for flag messages in the envelopes
-    List<TableContext> flagMessages =
+    Map<String, TableContext> flagMessages =
         Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
                 filteredEnvelopeList, this.config.branchesRegexDelimiter());
 
@@ -299,29 +299,54 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
-  private void processFlagMessages(Table table, List<TableContext> flagMessages) {
-    Set<String> visitedBranches = new HashSet<>();
+  private void processFlagMessages(Table table, Map<String, TableContext> flagMessages) {
+    flagMessages.forEach((type, flagMessage) -> {
+      LOG.debug("About to process flag of type {} for: {}", type, flagMessage.tableIdentifier().toString());
 
-    // Process branch-unique flags
-    flagMessages.removeIf(flag -> !visitedBranches.add(flag.branch()));
+      switch (type) {
+        case "END-LOAD":
+          String targetBranch = flagMessage.branch();
+          if (targetBranch != null) {
+            LOG.info("Processing flag message for table {}, switching to branch {}",
+                    table.name(), targetBranch);
 
-    for (TableContext flagMessage : flagMessages) {
-      LOG.debug("About to process flag for: {}", flagMessage.tableIdentifier().toString());
-      String targetBranch = flagMessage.branch();
-      if (targetBranch != null) {
-        LOG.info("Processing flag message for table {}, switching to branch {}",
-                 table.name(), targetBranch);
-        try {
-          // Forward the branch: set current snapshot to the branch's snapshot
-          // and clear the branch for further use
-          table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
-          table.manageSnapshots().replaceBranch(targetBranch, table.history().get(0).snapshotId()).commit();
-          LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
-        } catch (Exception e) {
-          LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
-        }
+            UpdateSchema updateSchemaCommit = table.updateSchema();
+
+            table.schema().columns().stream()
+                    .filter(field -> field.name().endsWith("_pending_type_update"))
+                    .forEach(field -> {
+                      String original = field.name().split("_pending_type_update")[0];
+
+                      updateSchemaCommit.deleteColumn(original).renameColumn(field.name(), original);
+                    });
+
+            try {
+              updateSchemaCommit.commit();
+              LOG.info("Successfully updated types for table {}", table.name());
+            } catch (Exception e) {
+              LOG.error("Failed to update types for table {}. {}", table.name(), e.getMessage());
+            }
+
+            try {
+              // Forward the branch: set current snapshot to the branch's snapshot
+              // and clear the branch for further use
+              table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
+              table.manageSnapshots().replaceBranch(targetBranch, table.history().get(0).snapshotId()).commit();
+              LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
+            } catch (Exception e) {
+              LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
+            }
+          }
+          break;
+        case "TYPE-CHANGE":
+          UpdateSchema updateSchemaCommit = table.updateSchema();
+
+
+          break;
+        default:
+          LOG.error("Couldn't process flag of type {}", type);
       }
-    }
+    });
   }
 
   private Snapshot latestSnapshot(Table table, String branch) {

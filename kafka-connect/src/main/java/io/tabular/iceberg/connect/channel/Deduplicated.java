@@ -19,11 +19,13 @@
 package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
 import io.tabular.iceberg.connect.TableContext;
 import io.tabular.iceberg.connect.data.FlagWriterResult;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.BiFunction;
@@ -107,10 +109,10 @@ class Deduplicated {
   /**
    * Returns all flag messages from the batch of envelopes.
    * Flag messages are identified by containing sentinel data files with paths starting with
-   * {@link FlagWriterResult#FLAG_SENTINEL_PATH}.
+   * {@link FlagWriterResult#FLAG_PREFIX}.
    * The branch information is encoded in the table identifier.
    */
-  public static List<TableContext> flagMessages(
+  public static Map<String, TableContext> flagMessages(
       UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex) {
     return envelopes.stream()
         .map(envelope -> (DataWritten) envelope.event().payload())
@@ -122,10 +124,10 @@ class Deduplicated {
           }
 
           return dataFiles.stream()
-                  .allMatch(f -> f.path().toString().equals(FlagWriterResult.FLAG_SENTINEL_PATH));
+                  .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
         })
-        .map(dataWritten -> TableContext.parse(dataWritten.tableReference().identifier(), regex))
-        .collect(toList());
+        .collect(toMap(dataWritten -> dataWritten.dataFiles().stream().findFirst().get().path().toString().split(FlagWriterResult.FLAG_PREFIX)[1],
+                dataWritten -> TableContext.parse(dataWritten.tableReference().identifier(), regex)));
   }
 
   private static <F> List<F> deduplicatedFiles(

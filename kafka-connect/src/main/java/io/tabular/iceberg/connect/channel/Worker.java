@@ -35,10 +35,12 @@ import java.util.Map;
 
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.types.Types;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
@@ -115,12 +117,12 @@ class Worker implements Writer, AutoCloseable {
        // They will be sent to coordinator during commit to trigger branch switching
        LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 
                 record.topic(), record.kafkaPartition(), record.kafkaOffset());
-       
        String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
        TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
        TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
-       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch());
+       String flagType = extractString(record.value(), this.config.flagTypeField());
+       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), flagType);
        flagWriterResults.add(flagResult);
 
        // All records after flag should be re-routed to flag's branch
@@ -186,11 +188,16 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private String extractRouteValue(Object recordValue, String routeField) {
+    return extractString(recordValue, routeField);
+  }
+
+  private String extractString(Object recordValue, String field) {
     if (recordValue == null) {
       return null;
     }
-    Object routeValue = Utilities.extractFromRecordValue(recordValue, routeField);
-    return routeValue == null ? null : routeValue.toString();
+
+    Object value = Utilities.extractFromRecordValue(recordValue, field);
+    return value == null ? null : value.toString();
   }
 
   private RecordWriter writerForTable(
