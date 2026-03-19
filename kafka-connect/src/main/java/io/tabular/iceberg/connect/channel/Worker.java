@@ -119,6 +119,23 @@ class Worker implements Writer, AutoCloseable {
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
+      int expectedPartition = this.config.flagSourcePartition();
+      if (expectedPartition != -1 && record.kafkaPartition() != expectedPartition) {
+        LOG.warn(
+            "Ignoring flag-like record at topic: {}, partition: {}, offset: {} — "
+                + "it arrived on partition {} but iceberg.flags.source-partition is set to {}. "
+                + "Flag records must be produced to partition {} to guarantee ordering.",
+            record.topic(), record.kafkaPartition(), record.kafkaOffset(),
+            record.kafkaPartition(), expectedPartition, expectedPartition);
+        // Treat as a regular data record so ordering invariant is preserved
+        if (config.dynamicTablesEnabled()) {
+          routeRecordDynamically(record);
+        } else {
+          routeRecordStatically(record);
+        }
+        return;
+      }
+
        // Flag records are tracked in offsets but not written to data files
        // They will be sent to coordinator during commit to trigger branch switching
        LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 

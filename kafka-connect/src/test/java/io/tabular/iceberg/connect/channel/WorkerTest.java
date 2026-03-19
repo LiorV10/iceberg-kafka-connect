@@ -25,6 +25,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.data.IcebergWriter;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.WriterResult;
@@ -41,6 +42,7 @@ public class WorkerTest {
   private static final String SRC_TOPIC_NAME = "src-topic";
   private static final String TABLE_NAME = "db.tbl";
   private static final String FIELD_NAME = "fld";
+  private static final String FLAG_PREFIX = "__flag__";
 
   @Test
   public void testStaticRoute() {
@@ -60,6 +62,92 @@ public class WorkerTest {
 
     Map<String, Object> value = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     workerTest(config, value);
+  }
+
+  @Test
+  public void testFlagOnCorrectSourcePartitionIsAccepted() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.flagSourcePartition()).thenReturn(0);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    // Flag record on partition 0 — matches the configured source partition
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    Committable committable = worker.committable();
+
+    // The flag record should be captured as a FlagWriterResult, not as a data file
+    assertThat(committable.writerResults())
+        .hasSize(1)
+        .allMatch(r -> r instanceof FlagWriterResult);
+  }
+
+  @Test
+  public void testFlagOnWrongSourcePartitionIsIgnoredAsFlag() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    // Flags must come from partition 0
+    when(config.flagSourcePartition()).thenReturn(0);
+
+    WriterResult dataWriteResult =
+        new WriterResult(
+            TableIdentifier.parse(TABLE_NAME),
+            ImmutableList.of(EventTestUtil.createDataFile()),
+            ImmutableList.of(),
+            StructType.of());
+    IcebergWriter writer = mock(IcebergWriter.class);
+    when(writer.complete()).thenReturn(ImmutableList.of(dataWriteResult));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(writer);
+
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    // Flag-looking record on partition 1 — does NOT match the configured source partition 0
+    SinkRecord wrongPartitionFlag = new SinkRecord(SRC_TOPIC_NAME, 1, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(wrongPartitionFlag));
+
+    Committable committable = worker.committable();
+
+    // The record should be treated as a data record, not a flag
+    assertThat(committable.writerResults())
+        .hasSize(1)
+        .noneMatch(r -> r instanceof FlagWriterResult);
+  }
+
+  @Test
+  public void testFlagWithNoSourcePartitionConfiguredAcceptsAnyPartition() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    // -1 means any partition is accepted
+    when(config.flagSourcePartition()).thenReturn(-1);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    // Flag record on partition 3 — should be accepted because source partition is -1
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 3, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    Committable committable = worker.committable();
+
+    assertThat(committable.writerResults())
+        .hasSize(1)
+        .allMatch(r -> r instanceof FlagWriterResult);
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
