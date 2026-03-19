@@ -56,6 +56,7 @@ import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,6 +65,10 @@ public class Utilities {
   private static final Logger LOG = LoggerFactory.getLogger(Utilities.class.getName());
   private static final List<String> HADOOP_CONF_FILES =
       ImmutableList.of("core-site.xml", "hdfs-site.xml", "hive-site.xml");
+
+  public static boolean isFlagRecord(SinkRecord record, String prefix) {
+    return record.key() != null && record.key().toString().startsWith(prefix);
+  }
 
   public static Catalog loadCatalog(IcebergSinkConfig config) {
     return CatalogUtil.buildIcebergCatalog(
