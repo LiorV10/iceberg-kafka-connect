@@ -44,6 +44,7 @@ import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.rest.RESTCatalog;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
@@ -64,9 +65,19 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final Catalog catalog;
   private final IcebergSinkConfig config;
   private final int totalPartitionCount;
+  // Number of Kafka Connect tasks in this consumer group. Flags are broadcast to all
+  // partitions, so each task reports one copy per commit cycle. We accumulate votes
+  // across cycles and only process a flag once all tasks have reported it.
+  private final int totalTaskCount;
   private final String snapshotOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
+
+  // Accumulated vote counts per table per flag type across commit cycles.
+  // Keyed by table identifier → (flag type → number of tasks that have reported it so far).
+  private final Map<TableIdentifier, Map<String, Integer>> pendingFlagVotes = Maps.newHashMap();
+  // First-seen flag data per table per flag type, held until vote count is complete.
+  private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
   public Coordinator(
       Catalog catalog,
@@ -80,6 +91,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     this.config = config;
     this.totalPartitionCount =
         members.stream().mapToInt(desc -> desc.assignment().topicPartitions().size()).sum();
+    this.totalTaskCount = members.size();
     this.snapshotOffsetsProp =
         String.format(OFFSETS_SNAPSHOT_PROP_FMT, config.controlTopic(), config.controlGroupId());
     this.exec = ThreadPools.newWorkerPool("iceberg-committer", config.commitThreads());
@@ -225,13 +237,11 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    // Check for flag messages in the envelopes
-    Map<String, Pair<TableContext, Map<String, Object>>> flagMessages =
-        Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
-                filteredEnvelopeList, this.config.branchesRegexDelimiter(),
-                this.config.flagTypeField());
-
-    LOG.debug("Found {} flag messages", flagMessages.size());
+    // Accumulate flag votes from this cycle. A flag is only processed once all tasks
+    // have reported their copy (vote count reaches totalTaskCount). Different tasks may
+    // receive the broadcast flag in different commit cycles, so votes are persisted
+    // across cycles until the quorum is reached.
+    accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
@@ -294,10 +304,68 @@ public class Coordinator extends Channel implements AutoCloseable {
           vtts);
     }
 
-    // Process flag messages after successful commit
-    if (!flagMessages.isEmpty()) {
-      processFlagMessages(table, flagMessages);
+    // Process flag messages for which all tasks have now voted.
+    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
+    if (!readyFlags.isEmpty()) {
+      processFlagMessages(table, readyFlags);
     }
+  }
+
+  /**
+   * Counts the flag-containing DataWritten events in {@code envelopes} (one per task that
+   * reported the flag this cycle) and merges those counts into {@link #pendingFlagVotes}.
+   * The first-seen flag data for each type is also stored in {@link #pendingFlagData}.
+   */
+  private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
+    Map<String, Integer> votesThisCycle =
+        Deduplicated.flagMessageVoteCounts(envelopes, this.config.flagTypeField());
+    if (votesThisCycle.isEmpty()) {
+      return;
+    }
+    Map<String, Pair<TableContext, Map<String, Object>>> dataThisCycle =
+        Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
+            envelopes, this.config.branchesRegexDelimiter(), this.config.flagTypeField());
+
+    Map<String, Integer> votes =
+        pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
+    Map<String, Pair<TableContext, Map<String, Object>>> data =
+        pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
+
+    votesThisCycle.forEach((type, count) -> {
+      int newTotal = votes.merge(type, count, Integer::sum);
+      data.putIfAbsent(type, dataThisCycle.get(type));
+      LOG.info("Flag '{}' for table {}: accumulated {}/{} task votes",
+          type, tableIdentifier, newTotal, totalTaskCount);
+    });
+  }
+
+  /**
+   * Returns and removes all flag types for {@code tableIdentifier} that have accumulated
+   * votes from every task (vote count {@code >= totalTaskCount}).
+   */
+  private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
+      TableIdentifier tableIdentifier) {
+    Map<String, Integer> votes = pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
+    Map<String, Pair<TableContext, Map<String, Object>>> data =
+        pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
+
+    List<String> readyTypes = votes.entrySet().stream()
+        .filter(e -> e.getValue() >= totalTaskCount)
+        .map(Map.Entry::getKey)
+        .collect(toList());
+
+    if (readyTypes.isEmpty()) {
+      return Collections.emptyMap();
+    }
+
+    Map<String, Pair<TableContext, Map<String, Object>>> ready = Maps.newHashMap();
+    readyTypes.forEach(type -> {
+      ready.put(type, data.remove(type));
+      votes.remove(type);
+      LOG.info("Flag '{}' for table {} ready: all {} tasks have reported it",
+          type, tableIdentifier, totalTaskCount);
+    });
+    return ready;
   }
 
   private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {

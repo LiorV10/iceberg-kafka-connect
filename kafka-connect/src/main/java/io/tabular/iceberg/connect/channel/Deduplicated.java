@@ -159,6 +159,28 @@ class Deduplicated {
                 }));
   }
 
+  /**
+   * Returns the number of distinct tasks (DataWritten events) that reported each flag type
+   * in this batch of envelopes. Each DataWritten event corresponds to exactly one task.
+   *
+   * <p>This count is used by the Coordinator to accumulate votes across commit cycles:
+   * a flag is safe to process only when the accumulated vote count reaches
+   * {@code totalTaskCount} (i.e. every task has reported the flag at least once).
+   */
+  static Map<String, Integer> flagMessageVoteCounts(List<Envelope> envelopes, String flagTypeField) {
+    return envelopes.stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+          List<DataFile> dataFiles = dataWritten.dataFiles();
+          return dataFiles != null && !dataFiles.isEmpty()
+              && dataFiles.stream()
+                  .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+        })
+        .collect(Collectors.groupingBy(
+            dw -> extractFlagType(dw, flagTypeField),
+            Collectors.summingInt(dw -> 1)));
+  }
+
   private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
     String recordJson = dataWritten.dataFiles().stream().findFirst().get()
         .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
