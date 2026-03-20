@@ -387,7 +387,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
       Map<String, Object> flagRecord = flagEntry.second();
-      LOG.debug("About to process flag of type {} for: {}", type, flagMessage.tableIdentifier().toString());
+      LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecord);
 
       switch (type) {
         case "END-LOAD":

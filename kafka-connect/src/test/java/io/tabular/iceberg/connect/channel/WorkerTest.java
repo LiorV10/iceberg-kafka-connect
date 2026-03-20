@@ -67,13 +67,11 @@ public class WorkerTest {
   }
 
   /**
-   * Two-phase barrier: a flag seen in write() batch N is PENDING — not yet active.
-   * It is only promoted to active at the start of batch N+1, after all partitions in
-   * batch N (including those from other tasks on the same pod, or the other records
-   * within the same task's batch) have been fully processed.
+   * A flag record seen in write() is immediately included in the next committable() —
+   * the Worker handles exactly one partition so no cross-partition barrier is needed.
    */
   @Test
-  public void testFlagIsPendingAfterBatchItArrivedIn() {
+  public void testFlagIsImmediatelyIncludedInCommittable() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -85,65 +83,13 @@ public class WorkerTest {
 
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
-    // Batch 1: flag arrives
     worker.write(ImmutableList.of(flagRec));
 
-    // Flag is still PENDING; committable for batch 1 must NOT contain it yet
+    // Flag must be present immediately in the committable after the write
     assertThat(worker.committable().writerResults())
-        .as("Flag must still be pending immediately after the batch it arrived in")
-        .isEmpty();
-
-    // Batch 2: any write (even empty) triggers activatePendingFlags()
-    worker.write(ImmutableList.of());
-
-    assertThat(worker.committable().writerResults())
-        .as("Flag must be activated in the committable AFTER the subsequent write() call")
+        .as("Flag must be immediately active in the committable after write()")
         .hasSize(1)
         .allMatch(r -> r instanceof FlagWriterResult);
-  }
-
-  /**
-   * Records from other partitions that arrive in the SAME batch as the flag must be
-   * written to the original (non-rerouted) destination, not the flag's branch.
-   * The reroute only kicks in for the NEXT write() batch, ensuring every task processes
-   * all its same-batch records before the flag takes effect.
-   */
-  @Test
-  public void testRecordsFromOtherPartitionsInFlagBatchAreNotRerouted() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    WriterResult dataWriteResult =
-        new WriterResult(
-            TableIdentifier.parse(TABLE_NAME),
-            ImmutableList.of(EventTestUtil.createDataFile()),
-            ImmutableList.of(),
-            StructType.of());
-    IcebergWriter writer = mock(IcebergWriter.class);
-    when(writer.complete()).thenReturn(ImmutableList.of(dataWriteResult));
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(writer);
-
-    Worker worker = new Worker(config, writerFactory);
-
-    Map<String, Object> dataValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-
-    // Batch 1: data from partition 1 arrives in the same batch as the flag on partition 0
-    SinkRecord dataRec = new SinkRecord(SRC_TOPIC_NAME, 1, null, "pk1", null, dataValue, 0L);
-    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
-    worker.write(ImmutableList.of(dataRec, flagRec));
-
-    Committable committable = worker.committable();
-    // Only the data write result — flag is still pending (barrier not crossed yet)
-    assertThat(committable.writerResults())
-        .as("Data from same batch as flag should be written; flag itself still pending")
-        .hasSize(1)
-        .noneMatch(r -> r instanceof FlagWriterResult);
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
