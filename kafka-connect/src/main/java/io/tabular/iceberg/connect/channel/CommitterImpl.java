@@ -21,7 +21,6 @@ package io.tabular.iceberg.connect.channel;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toMap;
 
-import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.Offset;
 import java.io.IOException;
@@ -32,6 +31,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -135,6 +135,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
       sendCommitResponse(commitId, committableSupplier);
       return true;
     }
+    if (envelope.event().type() == PayloadType.COMMIT_COMPLETE) {
+      CommitComplete complete = (CommitComplete) envelope.event().payload();
+      // The Coordinator broadcasts a sentinel CommitComplete (with the all-zeros UUID) after
+      // processing all pending flag messages.  Workers clear their reroute state on this signal
+      // so that records written after the branch switch go to the normal routing target.
+      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(complete.commitId())) {
+        committableSupplier.onFlagProcessed();
+      }
+      return true;
+    }
     return false;
   }
 
@@ -186,14 +196,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     Map<TopicPartition, Offset> offsets = committable.offsetsByTopicPartition();
     send(events, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
     send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
-
-    // If this committable contained flag results, the flag has now been sent to the Coordinator.
-    // Notify the supplier immediately so it can clear its reroute state and resume its partitions.
-    // This is done here — not via a Coordinator broadcast — so only the worker that actually sent
-    // a flag receives the notification.
-    if (committable.writerResults().stream().anyMatch(r -> r instanceof FlagWriterResult)) {
-      committableSupplier.onFlagProcessed();
-    }
   }
 
   @Override

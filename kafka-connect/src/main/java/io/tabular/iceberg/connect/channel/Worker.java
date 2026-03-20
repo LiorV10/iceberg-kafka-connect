@@ -113,17 +113,20 @@ class Worker implements Writer, AutoCloseable {
     // NOTE: do NOT clear reroute here.  The partition is paused while reroute is active,
     // so no new records will arrive until onFlagProcessed() resumes it.  But reroute must
     // remain set across commit cycles because the flag result is sent in this cycle's
-    // sendCommitResponse(), which calls onFlagProcessed() and clears reroute only after the
-    // send completes — and committable() is called before that send.
+    // sendCommitResponse(), and onFlagProcessed() is only triggered later when the Coordinator
+    // broadcasts the sentinel CommitComplete after all partitions have reported — which may
+    // happen in a subsequent commit cycle.
 
     return new Committable(offsets, writeResults);
   }
 
   /**
-   * Called by {@link CommitterImpl} after the flag result has been sent to the Coordinator
-   * (i.e. a {@link io.tabular.iceberg.connect.data.FlagWriterResult} was included in the
-   * {@code DataWritten} event).  Only the worker that actually sent a flag receives this call;
-   * the Coordinator no longer broadcasts a sentinel event to all workers.
+   * Called by {@link CommitterImpl} when it receives the sentinel {@link
+   * org.apache.iceberg.connect.events.CommitComplete} event that the Coordinator broadcasts after
+   * it has collected flag-containing {@code DataWritten} events from <em>all</em> source
+   * partitions and executed the flag action (e.g. branch switch).  Every worker receives this
+   * event, but only the worker that actually paused on a flag (i.e. whose {@code reroute} field
+   * is non-null) needs to act on it.
    * <p>
    * Guards against spurious calls: if {@code reroute} is already null this worker did not detect
    * a flag and has nothing to do.
