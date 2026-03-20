@@ -112,19 +112,18 @@ class Deduplicated {
   }
 
   /**
-   * Returns all flag messages from the batch of envelopes, deduplicated by flag type.
-   * Flag messages are identified by containing sentinel data files with paths starting with
-   * {@link FlagWriterResult#FLAG_PREFIX}.
-   * The full flag record is deserialized from the JSON embedded in the DataFile path.
-   * The map key is the flag type (extracted from the record using {@code flagTypeField}),
-   * and the map value is a pair of the {@link TableContext} and the full flag record as a map.
+   * Returns all flag messages from the batch of envelopes, keyed by their unique flag key
+   * ({@code "type:seqno"}). Each occurrence of a flag type is treated as a separate logical
+   * event thanks to the sequence number embedded in the record by the {@link Worker}.
    *
    * <p>In a multi-task deployment the producer broadcasts the same flag to every Kafka
-   * partition so that every task sees it, sets its own reroute, and reports a
-   * {@link FlagWriterResult} to the Coordinator. The Coordinator therefore receives one
-   * flag per partition for the same logical flag event. This method deduplicates those
-   * copies by flag type, keeping the first occurrence, so the Coordinator processes each
-   * logical flag exactly once.
+   * partition. Every task produces a {@link FlagWriterResult} that ends up as one DataWritten
+   * event on the control topic. Because each occurrence of the flag carries the same seqno
+   * (assigned by the Worker), the Coordinator can collect one vote per source partition for
+   * <em>that specific occurrence</em> before acting on it.
+   *
+   * <p>Two occurrences of the same flag type (e.g. two sequential END-LOAD flags) get
+   * different seqnos (1 and 2), so they are keyed distinctly and voted on independently.
    */
   public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
       UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
@@ -142,7 +141,7 @@ class Deduplicated {
                   .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
         })
         .collect(toMap(
-                dataWritten -> extractFlagType(dataWritten, flagTypeField),
+                dataWritten -> extractFlagKey(dataWritten, flagTypeField),
                 dataWritten -> {
                   String recordJson = dataWritten.dataFiles().stream().findFirst().get()
                       .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
@@ -151,24 +150,29 @@ class Deduplicated {
                       dataWritten.tableReference().identifier(), regex);
                   return Pair.of(tableContext, record);
                 },
-                // Deduplicate: when the same flag type is reported by multiple tasks (one per
-                // partition in a broadcast scenario) keep the first occurrence and discard the rest.
+                // Each unique (type:seqno) combination is a distinct logical flag event.
+                // Duplicate delivery of the exact same Kafka message would produce the same
+                // flagKey; keep the first occurrence in that case.
                 (existing, duplicate) -> {
-                  LOG.debug("Deduplicating flag: type already seen, discarding copy from additional partition");
+                  LOG.debug("Deduplicating flag: flagKey already seen, discarding duplicate");
                   return existing;
                 }));
   }
 
   /**
-   * Returns the number of flag-containing DataWritten events per flag type in this batch
-   * of envelopes. Each DataWritten event corresponds to exactly one FlagWriterResult,
-   * which in turn corresponds to exactly one source partition's broadcast copy of the flag.
+   * Returns the number of flag-containing DataWritten events per flag key
+   * ({@code "type:seqno"}) in this batch of envelopes. Each DataWritten event corresponds to
+   * exactly one FlagWriterResult, which in turn corresponds to exactly one source partition's
+   * broadcast copy of the flag.
    *
    * <p>A task that owns K source partitions will send K DataWritten events carrying flag data
    * (one per partition). Summing these across tasks and across commit cycles gives the total
    * number of source-partition-level votes. A flag is safe to process once this total reaches
    * {@code totalPartitionCount} — meaning every source partition has broadcast the flag and
    * every task has activated its reroute.
+   *
+   * <p>Two occurrences of the same flag type get different seqnos and are therefore counted
+   * independently, allowing [row, flag, row, flag] to trigger two separate flag actions.
    */
   static Map<String, Integer> flagMessageVoteCounts(List<Envelope> envelopes, String flagTypeField) {
     return envelopes.stream()
@@ -180,8 +184,22 @@ class Deduplicated {
                   .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
         })
         .collect(Collectors.groupingBy(
-            dw -> extractFlagType(dw, flagTypeField),
+            dw -> extractFlagKey(dw, flagTypeField),
             Collectors.summingInt(dw -> 1)));
+  }
+
+  /**
+   * Returns the flag key for voting purposes: {@code "type:seqno"}.
+   * The {@code __seqno__} field is embedded in the record JSON by the {@link Worker}.
+   * If not present (e.g. messages produced by an older worker version), seqno defaults to 0.
+   */
+  static String extractFlagKey(DataWritten dataWritten, String flagTypeField) {
+    String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+        .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+    Map<String, Object> record = parseRecordJson(recordJson);
+    Object type = record.get(flagTypeField);
+    Object seqno = record.get(Worker.FLAG_SEQNO_FIELD);
+    return (type != null ? type.toString() : "") + ":" + (seqno != null ? seqno.toString() : "0");
   }
 
   private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {

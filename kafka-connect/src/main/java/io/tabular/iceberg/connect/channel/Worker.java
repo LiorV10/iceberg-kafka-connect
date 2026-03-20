@@ -36,6 +36,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -54,11 +55,25 @@ class Worker implements Writer, AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(Worker.class);
   private static final ObjectMapper MAPPER = new ObjectMapper();
+  /** Internal JSON field used to distinguish multiple occurrences of the same flag type. */
+  static final String FLAG_SEQNO_FIELD = "__seqno__";
   private final IcebergSinkConfig config;
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
-  private final List<WriterResult> flagWriterResults;
+  /**
+   * Ordered list of writer results interleaved with flag results. Data results that were
+   * accumulated before a flag are flushed at the flag boundary so the coordinator can commit
+   * each data segment and then process its trailing flag in sequence:
+   * [data1, flag1, data2, flag2, ...]
+   */
+  private final List<WriterResult> orderedResults;
+  /**
+   * Monotonically-increasing sequence number per flag type within a single commit cycle.
+   * Used to distinguish two occurrences of the same flag type (e.g. two "END-LOAD" flags)
+   * so the coordinator votes on them independently rather than deduplicating them.
+   */
+  private final Map<String, Integer> flagSequenceNumbers;
   private String reroute;
 
   Worker(IcebergSinkConfig config, Catalog catalog) {
@@ -71,26 +86,28 @@ class Worker implements Writer, AutoCloseable {
     this.writerFactory = writerFactory;
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
-    this.flagWriterResults = Lists.newArrayList();
+    this.orderedResults = Lists.newArrayList();
+    this.flagSequenceNumbers = Maps.newHashMap();
     this.reroute = null;
   }
 
   @Override
   public Committable committable() {
-    List<WriterResult> writeResults =
+    // Flush remaining writers (the final data segment with no trailing flag).
+    List<WriterResult> remaining =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
-    
-    // Add flag writer results to the list
-    writeResults.addAll(flagWriterResults);
-    
+    orderedResults.addAll(remaining);
+    writers.clear();
+
+    List<WriterResult> results = Lists.newArrayList(orderedResults);
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
-    writers.clear();
     sourceOffsets.clear();
-    flagWriterResults.clear();
+    orderedResults.clear();
+    flagSequenceNumbers.clear();
     this.reroute = null;
 
-    return new Committable(offsets, writeResults);
+    return new Committable(offsets, results);
   }
 
   @Override
@@ -98,7 +115,8 @@ class Worker implements Writer, AutoCloseable {
     writers.values().forEach(RecordWriter::close);
     writers.clear();
     sourceOffsets.clear();
-    flagWriterResults.clear();
+    orderedResults.clear();
+    flagSequenceNumbers.clear();
     this.reroute = null;
   }
 
@@ -119,20 +137,38 @@ class Worker implements Writer, AutoCloseable {
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
        // Flag records are tracked in offsets but not written to data files
        // They will be sent to coordinator during commit to trigger branch switching
-       LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 
+       LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}",
                 record.topic(), record.kafkaPartition(), record.kafkaOffset());
        String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
        TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
        TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
-       String recordJson = serializeRecordToJson(record.value());
+       // --- segment boundary: flush all in-flight writers so data rows that arrived BEFORE
+       // this flag are committed as their own segment. Rows arriving AFTER this flag will
+       // create fresh writers and form the next segment.
+       List<WriterResult> preSegmentResults =
+           writers.values().stream()
+               .flatMap(writer -> writer.complete().stream())
+               .collect(toList());
+       writers.clear();
+       orderedResults.addAll(preSegmentResults);
+
+       // Assign a monotonically-increasing sequence number so the coordinator can vote on
+       // each occurrence independently (e.g. two "END-LOAD" flags → seqno 1 and 2).
+       String flagTypeField = this.config.flagTypeField();
+       String flagType = flagTypeField != null ? extractString(record.value(), flagTypeField) : null;
+       int seqno = flagSequenceNumbers.merge(flagType != null ? flagType : "", 1, Integer::sum);
+
+       // Embed the seqno in the serialised record so it survives the Kafka round-trip.
+       String recordJson = serializeRecordToJsonWithSeqno(record.value(), seqno);
        FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);
-       flagWriterResults.add(flagResult);
+       orderedResults.add(flagResult);
 
        // All records after flag should be re-routed to flag's branch
        this.reroute = tableName;
        
-       LOG.debug("Flag message queued for table: {}, branch: {}", context.tableIdentifier(), context.branch());
+       LOG.debug("Flag message queued for table: {}, branch: {}, seqno: {}",
+           context.tableIdentifier(), context.branch(), seqno);
     } else {
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
@@ -202,6 +238,28 @@ class Worker implements Writer, AutoCloseable {
 
     Object value = Utilities.extractFromRecordValue(recordValue, field);
     return value == null ? null : value.toString();
+  }
+
+  private String serializeRecordToJsonWithSeqno(Object recordValue, int seqno) {
+    try {
+      Map<String, Object> map;
+      if (recordValue instanceof Map) {
+        map = new LinkedHashMap<>((Map<?, ?>) recordValue).entrySet().stream()
+            .collect(Collectors.toMap(e -> e.getKey().toString(), Map.Entry::getValue,
+                (a, b) -> a, LinkedHashMap::new));
+      } else if (recordValue instanceof Struct) {
+        Struct struct = (Struct) recordValue;
+        map = new LinkedHashMap<>();
+        struct.schema().fields().forEach(field -> map.put(field.name(), struct.get(field)));
+      } else {
+        map = new LinkedHashMap<>();
+        map.put("__raw__", recordValue);
+      }
+      map.put(FLAG_SEQNO_FIELD, seqno);
+      return MAPPER.writeValueAsString(map);
+    } catch (JsonProcessingException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private String serializeRecordToJson(Object recordValue) {
