@@ -155,15 +155,9 @@ class Worker implements Writer, AutoCloseable {
 
        // Assign a monotonically-increasing sequence number so the coordinator can vote on
        // each occurrence independently (e.g. two "END-LOAD" flags → seqno 1 and 2).
-       // The counter is scoped to (flagType, sourcePartition) so that broadcast copies of
-       // the same logical flag arriving from different Kafka partitions within the same task
-       // all receive the same seqno.  Without per-partition tracking, the first broadcast copy
-       // would get seqno=1 and the second seqno=2, causing the Coordinator to accumulate votes
-       // in separate buckets and never reach quorum for either.
        String flagTypeField = this.config.flagTypeField();
        String flagType = flagTypeField != null ? extractString(record.value(), flagTypeField) : null;
-       String perPartitionKey = (flagType != null ? flagType : "") + "|" + record.kafkaPartition();
-       int seqno = flagSequenceNumbers.merge(perPartitionKey, 1, Integer::sum);
+       int seqno = flagSequenceNumbers.merge(flagType != null ? flagType : "", 1, Integer::sum);
 
        // Embed the seqno in the serialised record so it survives the Kafka round-trip.
        String recordJson = serializeRecordToJsonWithSeqno(record.value(), seqno);
