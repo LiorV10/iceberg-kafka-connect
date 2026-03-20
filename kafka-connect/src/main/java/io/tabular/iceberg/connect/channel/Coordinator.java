@@ -32,14 +32,12 @@ import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 
 import io.tabular.iceberg.connect.TableContext;
-import io.tabular.iceberg.connect.data.FlagWriterResult;
 import org.apache.iceberg.*;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableCommit;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
-import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
@@ -236,224 +234,126 @@ public class Coordinator extends Channel implements AutoCloseable {
                 })
             .collect(toList());
 
-    // Split the ordered envelope list into segments bounded by flag events.
-    // Each segment contains: data envelopes (may be empty) + an optional trailing flag.
-    // Processing in segment order ensures:
-    //   data₁ committed → flag₁ processed → data₂ committed → flag₂ processed
-    List<Pair<List<Envelope>, Optional<Envelope>>> segments =
-        splitIntoSegments(filteredEnvelopeList);
+    List<DataFile> dataFiles =
+        Deduplicated.dataFiles(commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
+            .stream()
+            .filter(dataFile -> dataFile.recordCount() > 0)
+            .collect(toList());
 
-    final TableIdentifier finalTableIdentifier = tableIdentifier;
-    final Optional<String> finalBranch = branch;
+    List<DeleteFile> deleteFiles =
+        Deduplicated.deleteFiles(
+                commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
+            .stream()
+            .filter(deleteFile -> deleteFile.recordCount() > 0)
+            .collect(toList());
 
-    for (Pair<List<Envelope>, Optional<Envelope>> segment : segments) {
-      List<Envelope> dataEnvelopes = segment.first();
-      Optional<Envelope> maybeFlagEnv = segment.second();
+    // Accumulate flag votes from this cycle. Each source partition's broadcast flag copy
+    // produces one DataWritten event (= one vote). A flag is only processed once the
+    // accumulated vote count reaches totalPartitionCount (all partitions have reported).
+    // Because different tasks receive the broadcast flag in different commit cycles, votes
+    // are persisted across cycles until the quorum is reached.
+    accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
-      // --- commit this segment's data files ---
-      List<DataFile> dataFiles =
-          Deduplicated.dataFiles(commitState.currentCommitId(), finalTableIdentifier, dataEnvelopes)
-              .stream()
-              .filter(dataFile -> dataFile.recordCount() > 0)
-              .collect(toList());
-
-      List<DeleteFile> deleteFiles =
-          Deduplicated.deleteFiles(
-                  commitState.currentCommitId(), finalTableIdentifier, dataEnvelopes)
-              .stream()
-              .filter(deleteFile -> deleteFile.recordCount() > 0)
-              .collect(toList());
-
-      if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
-        if (!maybeFlagEnv.isPresent()) {
-          LOG.info("Nothing to commit to table {}, skipping", finalTableIdentifier);
-        }
-      } else {
-        commitSegmentData(
-            table, finalTableIdentifier, finalBranch, dataFiles, deleteFiles, offsetsJson, vtts);
-      }
-
-      // --- vote for and (if quorum reached) process the trailing flag ---
-      maybeFlagEnv.ifPresent(flagEnv -> {
-        accumulateFlagVote(finalTableIdentifier, flagEnv);
-        Map<String, Pair<TableContext, Map<String, Object>>> readyFlags =
-            drainReadyFlags(finalTableIdentifier);
-        if (!readyFlags.isEmpty()) {
-          processFlagMessages(table, readyFlags);
-        }
-      });
-    }
-  }
-
-  /**
-   * Commits {@code dataFiles} / {@code deleteFiles} for {@code tableIdentifier} as a single
-   * Iceberg operation and sends a {@link CommitToTable} event on the control topic.
-   */
-  private void commitSegmentData(
-      Table table,
-      TableIdentifier tableIdentifier,
-      Optional<String> branch,
-      List<DataFile> dataFiles,
-      List<DeleteFile> deleteFiles,
-      String offsetsJson,
-      OffsetDateTime vtts) {
-    if (deleteFiles.isEmpty()) {
-      Transaction transaction = table.newTransaction();
-
-      Map<Integer, List<DataFile>> filesBySpec =
-          dataFiles.stream()
-              .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
-
-      List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
-      int lastIdx = list.size() - 1;
-      for (int i = 0; i <= lastIdx; i++) {
-        AppendFiles appendOp = transaction.newAppend();
-        branch.ifPresent(appendOp::toBranch);
-
-        list.get(i).forEach(appendOp::appendFile);
-        appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-        if (i == lastIdx) {
-          appendOp.set(snapshotOffsetsProp, offsetsJson);
-          if (vtts != null) {
-            appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-          }
-        }
-
-        appendOp.commit();
-      }
-
-      transaction.commitTransaction();
+    if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
+      LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
-      RowDelta deltaOp = table.newRowDelta();
-      branch.ifPresent(deltaOp::toBranch);
-      deltaOp.set(snapshotOffsetsProp, offsetsJson);
-      deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-      if (vtts != null) {
-        deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-      }
-      dataFiles.forEach(deltaOp::addRows);
-      deleteFiles.forEach(deltaOp::addDeletes);
-      deltaOp.commit();
-    }
+      if (deleteFiles.isEmpty()) {
+        Transaction transaction = table.newTransaction();
 
-    Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
-    Event event =
-        new Event(
-            config.controlGroupId(),
-            new CommitToTable(
-                commitState.currentCommitId(),
-                TableReference.of(config.catalogName(), tableIdentifier),
-                snapshotId,
-                vtts));
-    send(event);
+        Map<Integer, List<DataFile>> filesBySpec =
+            dataFiles.stream()
+                .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
 
-    LOG.info(
-        "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
-        tableIdentifier,
-        snapshotId,
-        commitState.currentCommitId(),
-        vtts);
-  }
+        List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
+        int lastIdx = list.size() - 1;
+        for (int i = 0; i <= lastIdx; i++) {
+          AppendFiles appendOp = transaction.newAppend();
+          branch.ifPresent(appendOp::toBranch);
 
-  /**
-   * Splits an ordered envelope list into segments. Each segment ends with an optional
-   * flag envelope; non-flag envelopes form the data portion of their segment.
-   *
-   * <p>Example: [data1, data2, flag1, data3, flag2]
-   * → [([data1,data2], flag1), ([data3], flag2)]
-   *
-   * <p>A trailing group of non-flag envelopes that follows the last flag (or that forms
-   * the entire list when no flags are present) becomes a final segment with no trailing flag.
-   */
-  private List<Pair<List<Envelope>, Optional<Envelope>>> splitIntoSegments(
-      List<Envelope> envelopes) {
-    List<Pair<List<Envelope>, Optional<Envelope>>> segments = Lists.newArrayList();
-    List<Envelope> currentData = Lists.newArrayList();
+          list.get(i).forEach(appendOp::appendFile);
+          appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+          if (i == lastIdx) {
+            appendOp.set(snapshotOffsetsProp, offsetsJson);
+            if (vtts != null) {
+              appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+            }
+          }
 
-    for (Envelope envelope : envelopes) {
-      if (isFlagEnvelope(envelope)) {
-        segments.add(Pair.of(Lists.newArrayList(currentData), Optional.of(envelope)));
-        currentData = Lists.newArrayList();
+          appendOp.commit();
+        }
+
+        transaction.commitTransaction();
       } else {
-        currentData.add(envelope);
+        RowDelta deltaOp = table.newRowDelta();
+        branch.ifPresent(deltaOp::toBranch);
+        deltaOp.set(snapshotOffsetsProp, offsetsJson);
+        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        if (vtts != null) {
+          deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+        }
+        dataFiles.forEach(deltaOp::addRows);
+        deleteFiles.forEach(deltaOp::addDeletes);
+        deltaOp.commit();
       }
+
+      Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
+      Event event =
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  commitState.currentCommitId(),
+                  TableReference.of(config.catalogName(), tableIdentifier),
+                  snapshotId,
+                  vtts));
+      send(event);
+
+      LOG.info(
+          "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
+          tableIdentifier,
+          snapshotId,
+          commitState.currentCommitId(),
+          vtts);
     }
 
-    // Trailing data with no flag (or an entirely flag-free list)
-    if (!currentData.isEmpty()) {
-      segments.add(Pair.of(currentData, Optional.empty()));
+    // Process flag messages for which all tasks have now voted.
+    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
+    if (!readyFlags.isEmpty()) {
+      processFlagMessages(table, readyFlags);
     }
-
-    return segments;
   }
 
   /**
-   * Returns {@code true} if all of an envelope's DataWritten data files are flag sentinels
-   * (paths starting with {@link FlagWriterResult#FLAG_PREFIX}).
+   * Counts the flag-containing DataWritten events in {@code envelopes} and merges those
+   * counts into {@link #pendingFlagVotes}. Each DataWritten event represents one source
+   * partition's broadcast copy of the flag (one FlagWriterResult produced by the task that
+   * processed that partition). The first-seen flag payload for each type is stored in
+   * {@link #pendingFlagData}.
    */
-  private static boolean isFlagEnvelope(Envelope envelope) {
-    DataWritten payload =
-        (DataWritten) envelope.event().payload();
-    List<DataFile> files = payload.dataFiles();
-    return files != null
-        && !files.isEmpty()
-        && files.stream()
-            .allMatch(
-                f ->
-                    f.path()
-                        .toString()
-                        .startsWith(
-                            FlagWriterResult.FLAG_PREFIX));
-  }
-
-  /**
-   * Accumulates a single flag vote for {@code tableIdentifier} from the supplied
-   * flag envelope. Votes are keyed by {@code "type:seqno"} so two occurrences of the same
-   * flag type (different seqnos) are tracked independently.
-   *
-   * <p>Replaces the former bulk {@code accumulateFlagVotes(tableIdentifier, envelopes)} call;
-   * now invoked once per flag envelope as segment processing advances through the envelope list.
-   */
-  private void accumulateFlagVote(TableIdentifier tableIdentifier, Envelope flagEnvelope) {
-    DataWritten dataWritten =
-        (DataWritten) flagEnvelope.event().payload();
-    String flagKey = Deduplicated.extractFlagKey(dataWritten, this.config.flagTypeField());
-    if (flagKey.isEmpty() || flagKey.equals(":0")) {
+  private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
+    Map<String, Integer> votesThisCycle =
+        Deduplicated.flagMessageVoteCounts(envelopes, this.config.flagTypeField());
+    if (votesThisCycle.isEmpty()) {
       return;
     }
-
-    String recordJson =
-        dataWritten.dataFiles().stream()
-            .findFirst()
-            .get()
-            .path()
-            .toString()
-            .substring(FlagWriterResult.FLAG_PREFIX.length());
-    Map<String, Object> record;
-    try {
-      record =
-          MAPPER.readValue(
-              recordJson, new TypeReference<Map<String, Object>>() {});
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
-    TableContext tableContext =
-        TableContext.parse(dataWritten.tableReference().identifier(),
-            this.config.branchesRegexDelimiter());
+    Map<String, Pair<TableContext, Map<String, Object>>> dataThisCycle =
+        Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
+            envelopes, this.config.branchesRegexDelimiter(), this.config.flagTypeField());
 
     Map<String, Integer> votes =
         pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
     Map<String, Pair<TableContext, Map<String, Object>>> data =
         pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
 
-    int newTotal = votes.merge(flagKey, 1, Integer::sum);
-    data.putIfAbsent(flagKey, Pair.of(tableContext, record));
-    LOG.info("Flag '{}' for table {}: accumulated {}/{} partition votes",
-        flagKey, tableIdentifier, newTotal, totalPartitionCount);
+    votesThisCycle.forEach((type, count) -> {
+      int newTotal = votes.merge(type, count, Integer::sum);
+      data.putIfAbsent(type, dataThisCycle.get(type));
+      LOG.info("Flag '{}' for table {}: accumulated {}/{} partition votes",
+          type, tableIdentifier, newTotal, totalPartitionCount);
+    });
   }
 
   /**
-   * Returns and removes all flag keys for {@code tableIdentifier} that have accumulated
+   * Returns and removes all flag types for {@code tableIdentifier} that have accumulated
    * a vote from every source partition (vote count {@code >= totalPartitionCount}).
    * Because the flag is broadcast to all N source partitions, N DataWritten events
    * (one per partition) must arrive before the flag is safe to process.
@@ -464,34 +364,30 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<String, Pair<TableContext, Map<String, Object>>> data =
         pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
-    List<String> readyKeys = votes.entrySet().stream()
+    List<String> readyTypes = votes.entrySet().stream()
         .filter(e -> e.getValue() >= totalPartitionCount)
         .map(Map.Entry::getKey)
         .collect(toList());
 
-    if (readyKeys.isEmpty()) {
+    if (readyTypes.isEmpty()) {
       return Collections.emptyMap();
     }
 
     Map<String, Pair<TableContext, Map<String, Object>>> ready = Maps.newHashMap();
-    readyKeys.forEach(flagKey -> {
-      ready.put(flagKey, data.remove(flagKey));
-      votes.remove(flagKey);
+    readyTypes.forEach(type -> {
+      ready.put(type, data.remove(type));
+      votes.remove(type);
       LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
-          flagKey, tableIdentifier, totalPartitionCount);
+          type, tableIdentifier, totalPartitionCount);
     });
     return ready;
   }
 
   private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
-    flagMessages.forEach((flagKey, flagEntry) -> {
+    flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
       Map<String, Object> flagRecord = flagEntry.second();
-      // Extract the flag type from the record payload (the map key is "type:seqno", not the type).
-      String type = flagRecord.get(config.flagTypeField()) != null
-          ? flagRecord.get(config.flagTypeField()).toString() : "";
-      LOG.debug("About to process flag with key {} (type={}) for: {}, record: {}",
-          flagKey, type, flagMessage.tableIdentifier().toString(), flagRecordToString(flagRecord));
+      LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecordToString(flagRecord));
 
       switch (type) {
         case "END-LOAD":

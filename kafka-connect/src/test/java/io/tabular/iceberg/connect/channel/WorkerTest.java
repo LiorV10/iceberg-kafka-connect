@@ -30,7 +30,6 @@ import io.tabular.iceberg.connect.data.IcebergWriter;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.WriterResult;
 import io.tabular.iceberg.connect.events.EventTestUtil;
-import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -65,76 +64,6 @@ public class WorkerTest {
 
     Map<String, Object> value = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     workerTest(config, value);
-  }
-
-  /**
-   * Validates the fix for the "N-flags-from-one-partition" bug.
-   *
-   * <p>Message queue: [row, end-flag, row, end-flag].
-   * Before the fix the two data rows ended up merged in a single writer and the two flag
-   * events were deduplicated into one, producing [row+row, flag].
-   * After the fix the worker segments its output at each flag boundary, producing:
-   *   [data1, flag1, data2, flag2]
-   * — i.e. each data segment is followed immediately by its own flag.
-   */
-  @Test
-  public void testRowFlagRowFlag_producesOrderedSegments() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.flagTypeField()).thenReturn("type");
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    // Each write() call on the mocked writer completes immediately (no files produced,
-    // but complete() returns a distinct WriterResult so we can track segment identity).
-    WriterResult segmentResult1 = new WriterResult(
-        TableIdentifier.parse(TABLE_NAME), ImmutableList.of(), ImmutableList.of(), StructType.of());
-    WriterResult segmentResult2 = new WriterResult(
-        TableIdentifier.parse(TABLE_NAME), ImmutableList.of(), ImmutableList.of(), StructType.of());
-
-    IcebergWriter writer1 = mock(IcebergWriter.class);
-    IcebergWriter writer2 = mock(IcebergWriter.class);
-    when(writer1.complete()).thenReturn(ImmutableList.of(segmentResult1));
-    when(writer2.complete()).thenReturn(ImmutableList.of(segmentResult2));
-
-    // writerFactory returns writer1 the first time and writer2 the second time
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    when(writerFactory.createWriter(any(), any(), anyBoolean()))
-        .thenReturn(writer1)   // for the first "row" (before flag1)
-        .thenReturn(writer2);  // for the second "row" (after flag1, before flag2)
-
-    Worker worker = new Worker(config, writerFactory);
-
-    Map<String, Object> rowValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME, "type", "END-LOAD");
-
-    SinkRecord row1 = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key",  null, rowValue,  0L);
-    SinkRecord flag1 = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
-    SinkRecord row2 = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key",  null, rowValue,  2L);
-    SinkRecord flag2 = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 3L);
-
-    worker.write(ImmutableList.of(row1, flag1, row2, flag2));
-
-    List<WriterResult> results = worker.committable().writerResults();
-
-    // Expected ordering: [data1, flag1, data2, flag2]
-    assertThat(results).hasSize(4);
-    assertThat(results.get(0)).isSameAs(segmentResult1);
-    assertThat(results.get(1)).isInstanceOf(FlagWriterResult.class);
-    assertThat(results.get(2)).isSameAs(segmentResult2);
-    assertThat(results.get(3)).isInstanceOf(FlagWriterResult.class);
-
-    // The two flags must carry different seqnos (1 and 2) so the Coordinator can vote on them
-    // independently.
-    FlagWriterResult fwr1 = (FlagWriterResult) results.get(1);
-    FlagWriterResult fwr2 = (FlagWriterResult) results.get(3);
-    String path1 = fwr1.dataFiles().get(0).path().toString()
-        .substring(FlagWriterResult.FLAG_PREFIX.length());
-    String path2 = fwr2.dataFiles().get(0).path().toString()
-        .substring(FlagWriterResult.FLAG_PREFIX.length());
-    assertThat(path1).contains("\"" + Worker.FLAG_SEQNO_FIELD + "\":1");
-    assertThat(path2).contains("\"" + Worker.FLAG_SEQNO_FIELD + "\":2");
   }
 
   /**
