@@ -21,7 +21,10 @@ package io.tabular.iceberg.connect.channel;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
@@ -90,6 +93,59 @@ public class WorkerTest {
         .as("Flag must be immediately active in the committable after write()")
         .hasSize(1)
         .allMatch(r -> r instanceof FlagWriterResult);
+  }
+
+  /**
+   * Verifies that reroute persists across {@code committable()} calls and is only cleared
+   * once {@code onFlagProcessed()} is called — as would happen when the Coordinator broadcasts
+   * the reroute-clear sentinel after all partition votes have been processed.
+   *
+   * <p>Scenario: a flag arrives in cycle K; the reroute must stay active in cycle K+1 (before the
+   * Coordinator has processed all votes) and must stop in cycle K+2 after {@code onFlagProcessed}.
+   */
+  @Test
+  public void testReroutePersistsAcrossCommitCyclesUntilFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory);
+
+    // --- Cycle K: flag arrives ---
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    // Simulate the coordinator sending START_COMMIT → worker.committable() is called
+    Committable cycleK = worker.committable();
+    assertThat(cycleK.writerResults()).as("Flag must be in cycle-K committable").hasSize(1);
+
+    // --- Cycle K+1: Coordinator has NOT processed the flag yet ---
+    // A data record whose natural route is "db.other" should be rerouted to TABLE_NAME
+    String otherTable = "db.other";
+    Map<String, Object> dataValue = ImmutableMap.of(FIELD_NAME, otherTable);
+    SinkRecord dataRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null, dataValue, 2L);
+    worker.write(ImmutableList.of(dataRec));
+    // Reroute is still active: writer must be created for TABLE_NAME, not "db.other"
+    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    worker.committable(); // drain cycle K+1
+
+    // --- Coordinator signals flag processed (simulates the sentinel CommitComplete) ---
+    worker.onFlagProcessed();
+
+    // --- Cycle K+2: reroute cleared, data should go to its own route ---
+    String yetAnotherTable = "db.yet_another";
+    Map<String, Object> dataValue2 = ImmutableMap.of(FIELD_NAME, yetAnotherTable);
+    SinkRecord dataRec2 = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key2", null, dataValue2, 3L);
+    worker.write(ImmutableList.of(dataRec2));
+    // Reroute cleared: writer must be created for yetAnotherTable (not TABLE_NAME)
+    verify(writerFactory, times(1)).createWriter(eq(yetAnotherTable), any(), anyBoolean());
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {

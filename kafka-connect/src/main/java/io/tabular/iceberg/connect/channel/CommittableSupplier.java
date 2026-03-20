@@ -20,4 +20,14 @@ package io.tabular.iceberg.connect.channel;
 
 interface CommittableSupplier {
   Committable committable();
+
+  /**
+   * Called by {@link CommitterImpl} when the {@link Coordinator} signals that all pending flag
+   * reroutes for the current commit cycle have been processed (i.e. the branch switch has been
+   * executed). Workers should stop rerouting records after receiving this signal.
+   *
+   * <p>The default implementation is a no-op so that anonymous/lambda suppliers used in tests and
+   * the CommitterImpl constructor do not need to implement it.
+   */
+  default void onFlagProcessed() {}
 }

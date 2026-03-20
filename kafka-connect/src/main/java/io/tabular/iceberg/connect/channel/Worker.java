@@ -88,9 +88,21 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    this.reroute = null;
+    // NOTE: do NOT clear reroute here.  With multiple partitions the flag may arrive in
+    // different commit cycles; rerouting must stay active until the Coordinator has processed
+    // all flag votes and performed the branch switch.  The reroute is cleared via
+    // onFlagProcessed() once the Coordinator sends the sentinel CommitComplete signal.
 
     return new Committable(offsets, writeResults);
+  }
+
+  /** Clears the active reroute target once the Coordinator confirms the flag was processed. */
+  @Override
+  public void onFlagProcessed() {
+    if (this.reroute != null) {
+      LOG.debug("Flag-processed signal received, clearing reroute for table {}", this.reroute);
+      this.reroute = null;
+    }
   }
 
   @Override

@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -132,6 +133,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     if (envelope.event().type() == PayloadType.START_COMMIT) {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
+      return true;
+    }
+    if (envelope.event().type() == PayloadType.COMMIT_COMPLETE) {
+      CommitComplete complete = (CommitComplete) envelope.event().payload();
+      // The Coordinator broadcasts a sentinel CommitComplete (with the all-zeros UUID) after
+      // processing all pending flag messages.  Workers clear their reroute state on this signal
+      // so that records written after the branch switch go to the normal routing target.
+      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(complete.commitId())) {
+        committableSupplier.onFlagProcessed();
+      }
       return true;
     }
     return false;
