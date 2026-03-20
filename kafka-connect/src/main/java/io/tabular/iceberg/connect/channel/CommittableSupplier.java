@@ -18,17 +18,20 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import org.apache.iceberg.catalog.TableIdentifier;
+
 interface CommittableSupplier {
   Committable committable();
 
   /**
-   * Called by {@link CommitterImpl} immediately after it sends the flag result to the Coordinator
-   * (i.e. the {@link io.tabular.iceberg.connect.data.FlagWriterResult} has been included in a
-   * {@code DataWritten} event on the control topic).  At that point the worker's reroute state is
-   * no longer needed and its paused source-topic partitions can be resumed.
+   * Called by {@link CommitterImpl} when it receives the per-table sentinel
+   * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
+   * after collecting flag votes from <em>all</em> source partitions for a specific table and
+   * executing the flag action (e.g. branch switch).  Only workers whose {@code reroute} table
+   * matches {@code tableIdentifier} need to act; others are unaffected.
    *
    * <p>The default implementation is a no-op so that anonymous/lambda suppliers used in tests and
    * the CommitterImpl constructor do not need to implement it.
    */
-  default void onFlagProcessed() {}
+  default void onFlagProcessed(TableIdentifier tableIdentifier) {}
 }

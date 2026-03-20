@@ -121,23 +121,25 @@ class Worker implements Writer, AutoCloseable {
   }
 
   /**
-   * Called by {@link CommitterImpl} when it receives the sentinel {@link
-   * org.apache.iceberg.connect.events.CommitComplete} event that the Coordinator broadcasts after
-   * it has collected flag-containing {@code DataWritten} events from <em>all</em> source
-   * partitions and executed the flag action (e.g. branch switch).  Every worker receives this
-   * event, but only the worker that actually paused on a flag (i.e. whose {@code reroute} field
-   * is non-null) needs to act on it.
+   * Called by {@link CommitterImpl} when it receives the per-table sentinel
+   * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
+   * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
+   * partitions for a specific table and executed the flag action (e.g. branch switch).
    * <p>
-   * Guards against spurious calls: if {@code reroute} is already null this worker did not detect
-   * a flag and has nothing to do.
+   * Only acts when this worker is currently rerouting to {@code tableIdentifier}.  Workers for
+   * other tables, or workers that never detected a flag, are unaffected.
    */
   @Override
-  public void onFlagProcessed() {
+  public void onFlagProcessed(TableIdentifier tableIdentifier) {
     if (this.reroute == null) {
       // This worker did not detect a flag — it was never paused, nothing to do.
       return;
     }
-    LOG.debug("Flag-processed signal received, clearing reroute for table {}", this.reroute);
+    if (!TableIdentifier.parse(this.reroute).equals(tableIdentifier)) {
+      // The flag was processed for a different table; this worker's reroute is still needed.
+      return;
+    }
+    LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
     this.reroute = null;
     resumeAssignment();
   }

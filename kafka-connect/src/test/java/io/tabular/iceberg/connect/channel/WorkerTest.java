@@ -170,10 +170,8 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that {@link Worker#onFlagProcessed()} is a no-op for a worker that never detected
-   * a flag.  {@link CommitterImpl} only calls it when the committable contains a
-   * {@link io.tabular.iceberg.connect.data.FlagWriterResult}, but as a guard against accidental
-   * future calls, the Worker must still be safe when called without a flag.
+   * Verifies that {@link Worker#onFlagProcessed} is a no-op for a worker that never detected
+   * a flag, regardless of which table is passed.
    */
   @Test
   public void testOnFlagProcessedIsNoOpWhenNoFlagSeen() {
@@ -191,7 +189,7 @@ public class WorkerTest {
     Worker worker = new Worker(config, writerFactory, context);
 
     // No flag was ever written to this worker — simulate a spurious/erroneous call anyway
-    worker.onFlagProcessed();
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
 
     // Neither pause nor resume should have been called
     verify(context, never()).pause(tp);
@@ -199,8 +197,8 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that {@link Worker#onFlagProcessed()} resumes the paused partitions and clears the
-   * reroute, so that records delivered after resume go to their natural destination.
+   * Verifies that {@link Worker#onFlagProcessed} resumes the paused partitions and clears the
+   * reroute when called with the matching table identifier.
    */
   @Test
   public void testRerouteIsClearedAndPartitionsResumedOnFlagProcessed() {
@@ -221,14 +219,14 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // Activate reroute by writing a flag record
+    // Activate reroute by writing a flag record for TABLE_NAME
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // Signal that the Coordinator finished the branch switch
-    worker.onFlagProcessed();
+    // Signal that the Coordinator finished the branch switch for TABLE_NAME
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
 
     // Partitions must be resumed
     verify(context, times(1)).resume(tp);
@@ -242,6 +240,50 @@ public class WorkerTest {
 
     verify(writerFactory, times(1)).createWriter(eq(naturalTable), any(), anyBoolean());
     verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+  }
+
+  /**
+   * Verifies that {@link Worker#onFlagProcessed} is a no-op when called with a different table
+   * identifier than the one the worker is currently rerouting to.  This ensures a per-table sentinel
+   * for another table does not accidentally resume a worker that is waiting for its own table.
+   */
+  @Test
+  public void testOnFlagProcessedIsNoOpForDifferentTable() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Activate reroute by writing a flag for TABLE_NAME
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // Signal flag processed for a DIFFERENT table — this worker's reroute must not be cleared
+    worker.onFlagProcessed(TableIdentifier.parse("db.other_table"));
+
+    // Resume must NOT have been called — this worker is still paused for its own table's flag
+    verify(context, never()).resume(tp);
+
+    // The reroute should still be active (a new record gets rerouted)
+    SinkRecord postRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
+            ImmutableMap.of(FIELD_NAME, "db.should_not_be_used"), 2L);
+    worker.write(ImmutableList.of(postRec));
+    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
   }
 
   /**

@@ -29,7 +29,6 @@ import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import io.tabular.iceberg.connect.TableContext;
@@ -61,10 +60,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final String OFFSETS_SNAPSHOT_PROP_FMT = "kafka.connect.offsets.%s.%s";
 
   /**
-   * Sentinel commit-ID used in an extra {@link CommitComplete} event that the Coordinator sends
-   * immediately after processing all pending flag messages (branch switches) for a commit cycle.
+   * Sentinel commit-ID used in a per-table {@link CommitToTable} event that the Coordinator sends
+   * immediately after processing all pending flag messages (branch switches) for a specific table.
    * {@link CommitterImpl} watches for this specific ID and calls
-   * {@link CommittableSupplier#onFlagProcessed()} so that {@link Worker} stops rerouting records.
+   * {@link CommittableSupplier#onFlagProcessed(org.apache.iceberg.catalog.TableIdentifier)} for
+   * the matching table so that only the {@link Worker} routing to that table resumes.
    *
    * <p>The all-zeros UUID is safe to use as a sentinel because real commit IDs are generated with
    * {@link UUID#randomUUID()}, making a collision statistically impossible.
@@ -174,21 +174,10 @@ public class Coordinator extends Channel implements AutoCloseable {
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
 
-    // Track whether any flag messages were processed across all tables in this cycle.
-    // commitToTable() runs concurrently (executeWith(exec)), so we use AtomicBoolean.
-    AtomicBoolean anyFlagsProcessed = new AtomicBoolean(false);
-
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
         .stopOnFailure()
-        .run(
-            entry -> {
-              boolean flagsForTable =
-                  commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts);
-              if (flagsForTable) {
-                anyFlagsProcessed.set(true);
-              }
-            });
+        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts));
 
     // we should only get here if all tables committed successfully...
     commitConsumerOffsets();
@@ -203,21 +192,6 @@ public class Coordinator extends Channel implements AutoCloseable {
         commitState.currentCommitId(),
         commitMap.size(),
         vtts);
-
-    // If at least one table had its flag processed in this cycle, broadcast the sentinel
-    // CommitComplete so that every worker's CommitterImpl calls onFlagProcessed() and clears
-    // its reroute state.  This is sent AFTER the regular CommitComplete to guarantee that
-    // workers see it after the cycle's data commit is already acknowledged.
-    if (anyFlagsProcessed.get()) {
-      LOG.info(
-          "Flags were processed in commit {}, sending reroute-clear signal to workers",
-          commitState.currentCommitId());
-      Event clearSignal =
-          new Event(
-              config.controlGroupId(),
-              new CommitComplete(FLAG_PROCESSED_SENTINEL_ID, null));
-      send(clearSignal);
-    }
   }
 
   private String offsetsJson() {
@@ -229,12 +203,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
-   * Commits data and flag messages for a single table.
-   *
-   * @return {@code true} if at least one flag message was processed (i.e. a branch switch was
-   *     executed) for this table in this call, {@code false} otherwise.
+   * Commits data and flag messages for a single table.  If flag messages were processed, sends
+   * a per-table sentinel {@link CommitToTable} event so that only workers routing to this table
+   * clear their reroute state and resume their partitions.
    */
-  private boolean commitToTable(
+  private void commitToTable(
       TableIdentifier paramTableIdentifier,
       List<Envelope> envelopeList,
       String offsetsJson,
@@ -253,7 +226,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       table = catalog.loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
       LOG.warn("Table not found, skipping commit: {}", tableIdentifier);
-      return false;
+      return;
     }
 
     if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
@@ -360,9 +333,23 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
     if (!readyFlags.isEmpty()) {
       processFlagMessages(table, readyFlags);
-      return true;
+      // Send a per-table sentinel CommitToTable so that only workers routing to this table's
+      // original identifier (before any branch-stripping) clear their reroute state and resume.
+      // Using FLAG_PROCESSED_SENTINEL_ID as the commitId lets CommitterImpl distinguish this
+      // sentinel from a real CommitToTable event.
+      LOG.info(
+          "Flags processed for table {} in commit {}, sending per-table resume signal",
+          paramTableIdentifier, commitState.currentCommitId());
+      Event flagSentinel =
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  FLAG_PROCESSED_SENTINEL_ID,
+                  TableReference.of(config.catalogName(), paramTableIdentifier),
+                  0L,
+                  null));
+      send(flagSentinel);
     }
-    return false;
   }
 
   /**

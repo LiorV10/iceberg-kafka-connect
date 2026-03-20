@@ -49,11 +49,13 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.common.DynConstructors;
 import org.apache.iceberg.connect.events.AvroUtil;
 import org.apache.iceberg.connect.events.CommitComplete;
+import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.PayloadType;
 import org.apache.iceberg.connect.events.StartCommit;
+import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -594,15 +596,15 @@ class CommitterImplTest {
   }
 
   /**
-   * Verifies that {@link CommitterImpl} calls {@link CommittableSupplier#onFlagProcessed()} when
-   * it receives a sentinel {@link CommitComplete} event (commit-ID == all-zeros UUID) from the
-   * Coordinator.  The sentinel is broadcast by the Coordinator only after it has collected flag
-   * votes from every source partition and executed the flag action.  Workers that had no flag
-   * (reroute == null) are unaffected because {@link Worker#onFlagProcessed()} is a no-op in that
-   * case.
+   * Verifies that {@link CommitterImpl} calls {@link CommittableSupplier#onFlagProcessed} when
+   * it receives a per-table sentinel {@link org.apache.iceberg.connect.events.CommitToTable} event
+   * (commit-ID == all-zeros UUID) from the Coordinator.  The sentinel is sent by the Coordinator
+   * only after it has collected flag votes from every source partition for that specific table and
+   * executed the flag action.  Workers for other tables are unaffected because {@link Worker}
+   * checks the table identifier.
    */
   @Test
-  public void testOnFlagProcessedIsCalledOnSentinelCommitComplete() throws IOException {
+  public void testOnFlagProcessedIsCalledOnSentinelCommitToTable() throws IOException {
     SinkTaskContext mockContext = mockContext();
     NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
 
@@ -610,7 +612,7 @@ class CommitterImplTest {
         ImmutableMap.of(
             CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
 
-    boolean[] onFlagProcessedCalled = {false};
+    TableIdentifier[] receivedTableId = {null};
     CommittableSupplier committableSupplier = new CommittableSupplier() {
       @Override
       public Committable committable() {
@@ -618,8 +620,8 @@ class CommitterImplTest {
       }
 
       @Override
-      public void onFlagProcessed() {
-        onFlagProcessedCalled[0] = true;
+      public void onFlagProcessed(TableIdentifier tableIdentifier) {
+        receivedTableId[0] = tableIdentifier;
       }
     };
 
@@ -628,7 +630,8 @@ class CommitterImplTest {
       initConsumer();
       Committer committer = committerImpl;
 
-      // Deliver the sentinel CommitComplete (all-zeros UUID) as if broadcast by the Coordinator.
+      // Deliver the per-table sentinel CommitToTable (all-zeros UUID) as if broadcast by the
+      // Coordinator after processing TABLE_1's flag.
       consumer.addRecord(
           new ConsumerRecord<>(
               CONTROL_TOPIC_PARTITION.topic(),
@@ -638,22 +641,26 @@ class CommitterImplTest {
               AvroUtil.encode(
                   new Event(
                       CONFIG.controlGroupId(),
-                      new CommitComplete(Coordinator.FLAG_PROCESSED_SENTINEL_ID, null)))));
+                      new CommitToTable(
+                          Coordinator.FLAG_PROCESSED_SENTINEL_ID,
+                          TableReference.of(CATALOG_NAME, TABLE_1_IDENTIFIER),
+                          0L,
+                          null)))));
 
       committer.commit(committableSupplier);
 
-      assertThat(onFlagProcessedCalled[0])
-          .as("onFlagProcessed() must be called when sentinel CommitComplete is received")
-          .isTrue();
+      assertThat(receivedTableId[0])
+          .as("onFlagProcessed() must be called with TABLE_1_IDENTIFIER when per-table sentinel received")
+          .isEqualTo(TABLE_1_IDENTIFIER);
     }
   }
 
   /**
-   * Verifies that a regular (non-sentinel) {@link CommitComplete} does NOT trigger
-   * {@link CommittableSupplier#onFlagProcessed()}.
+   * Verifies that a regular (non-sentinel) {@link org.apache.iceberg.connect.events.CommitToTable}
+   * does NOT trigger {@link CommittableSupplier#onFlagProcessed}.
    */
   @Test
-  public void testOnFlagProcessedIsNotCalledOnRegularCommitComplete() throws IOException {
+  public void testOnFlagProcessedIsNotCalledOnRegularCommitToTable() throws IOException {
     SinkTaskContext mockContext = mockContext();
     NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
 
@@ -669,7 +676,7 @@ class CommitterImplTest {
       }
 
       @Override
-      public void onFlagProcessed() {
+      public void onFlagProcessed(TableIdentifier tableIdentifier) {
         onFlagProcessedCalled[0] = true;
       }
     };
@@ -679,7 +686,7 @@ class CommitterImplTest {
       initConsumer();
       Committer committer = committerImpl;
 
-      // Deliver a regular CommitComplete (non-sentinel UUID).
+      // Deliver a regular CommitToTable (non-sentinel UUID).
       consumer.addRecord(
           new ConsumerRecord<>(
               CONTROL_TOPIC_PARTITION.topic(),
@@ -689,12 +696,16 @@ class CommitterImplTest {
               AvroUtil.encode(
                   new Event(
                       CONFIG.controlGroupId(),
-                      new CommitComplete(UUID.randomUUID(), null)))));
+                      new CommitToTable(
+                          UUID.randomUUID(),
+                          TableReference.of(CATALOG_NAME, TABLE_1_IDENTIFIER),
+                          12345L,
+                          null)))));
 
       committer.commit(committableSupplier);
 
       assertThat(onFlagProcessedCalled[0])
-          .as("onFlagProcessed() must NOT be called for a regular CommitComplete")
+          .as("onFlagProcessed() must NOT be called for a regular CommitToTable")
           .isFalse();
     }
   }
