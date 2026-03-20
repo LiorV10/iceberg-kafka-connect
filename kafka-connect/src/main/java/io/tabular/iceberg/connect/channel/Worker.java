@@ -62,9 +62,9 @@ class Worker implements Writer, AutoCloseable {
   private final List<WriterResult> flagWriterResults;
   /**
    * When a flag record is encountered, subsequent records in the same polled batch are rerouted
-   * to this table name. Once the coordinator confirms the flag was processed, this field is cleared
-   * via {@link #onFlagProcessed()} so that newly delivered records (after partition resume) are
-   * routed normally.
+   * to this table name. Once {@link CommitterImpl} has sent the flag result to the Coordinator,
+   * it calls {@link #onFlagProcessed()} which clears this field so that newly delivered records
+   * (after partition resume) are routed normally.
    */
   private String reroute;
   /**
@@ -112,18 +112,21 @@ class Worker implements Writer, AutoCloseable {
     flagWriterResults.clear();
     // NOTE: do NOT clear reroute here.  The partition is paused while reroute is active,
     // so no new records will arrive until onFlagProcessed() resumes it.  But reroute must
-    // remain set across commit cycles in case the flag arrives in one cycle and the
-    // Coordinator sends the sentinel in a later cycle.
+    // remain set across commit cycles because the flag result is sent in this cycle's
+    // sendCommitResponse(), which calls onFlagProcessed() and clears reroute only after the
+    // send completes — and committable() is called before that send.
 
     return new Committable(offsets, writeResults);
   }
 
   /**
-   * Called by {@link CommitterImpl} when the Coordinator broadcasts the flag-processed sentinel.
-   * This sentinel is broadcast to all workers, but only workers that actually detected a flag
-   * (i.e. have {@code reroute != null}) should act on it — they are the only ones that paused
-   * their partitions and need to resume.  Workers that never saw a flag are not paused and
-   * must not resume (a spurious resume call would be a no-op in Kafka but is semantically wrong).
+   * Called by {@link CommitterImpl} after the flag result has been sent to the Coordinator
+   * (i.e. a {@link io.tabular.iceberg.connect.data.FlagWriterResult} was included in the
+   * {@code DataWritten} event).  Only the worker that actually sent a flag receives this call;
+   * the Coordinator no longer broadcasts a sentinel event to all workers.
+   * <p>
+   * Guards against spurious calls: if {@code reroute} is already null this worker did not detect
+   * a flag and has nothing to do.
    */
   @Override
   public void onFlagProcessed() {

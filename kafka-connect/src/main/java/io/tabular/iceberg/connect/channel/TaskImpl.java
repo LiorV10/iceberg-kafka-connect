@@ -44,8 +44,8 @@ public class TaskImpl implements Task, AutoCloseable {
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
     // Poll the control topic BEFORE writing records so that any pending state changes
-    // (e.g. the flag-processed sentinel that calls onFlagProcessed() → resumes partitions and
-    // processes buffered post-flag records) are applied first.
+    // (e.g. START_COMMIT that calls sendCommitResponse() → triggers onFlagProcessed() →
+    // resumes partitions and processes buffered post-flag records) are applied first.
     committer.commit(writer);
     writer.write(sinkRecords);
   }

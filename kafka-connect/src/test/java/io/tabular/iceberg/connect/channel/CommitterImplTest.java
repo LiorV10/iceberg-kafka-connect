@@ -29,6 +29,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
@@ -590,6 +591,61 @@ class CommitterImplTest {
           .isEqualTo(ImmutableMap.of(CONFIG.controlGroupId(), expectedConsumerOffset));
       assertThat(producer.consumerGroupOffsetsHistory().get(1))
           .isEqualTo(ImmutableMap.of(CONFIG.connectGroupId(), expectedConsumerOffset));
+    }
+  }
+
+  /**
+   * Verifies that {@link CommitterImpl} calls {@link CommittableSupplier#onFlagProcessed()} on
+   * the supplier immediately after a commit response that contains a
+   * {@link FlagWriterResult} is sent.  This removes the need for the Coordinator to broadcast a
+   * sentinel event to all workers; only the worker that actually sent a flag is notified.
+   */
+  @Test
+  public void testOnFlagProcessedIsCalledWhenCommittableContainsFlagResult() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+    UUID commitId = UUID.randomUUID();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    FlagWriterResult flagResult = new FlagWriterResult(TABLE_1_IDENTIFIER, "my-branch", "{}");
+
+    boolean[] onFlagProcessedCalled = {false};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(
+            ImmutableMap.of(SOURCE_TP0, new Offset(100L, 200L)),
+            ImmutableList.of(flagResult));
+      }
+
+      @Override
+      public void onFlagProcessed() {
+        onFlagProcessedCalled[0] = true;
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+
+      committer.commit(committableSupplier);
+
+      assertThat(onFlagProcessedCalled[0])
+          .as("onFlagProcessed() must be called when committable contains a FlagWriterResult")
+          .isTrue();
     }
   }
 }

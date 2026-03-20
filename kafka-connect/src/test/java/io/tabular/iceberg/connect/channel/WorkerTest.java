@@ -171,8 +171,9 @@ public class WorkerTest {
 
   /**
    * Verifies that {@link Worker#onFlagProcessed()} is a no-op for a worker that never detected
-   * a flag.  The Coordinator broadcasts the sentinel to all workers, but only workers that were
-   * actually paused (i.e. saw a flag) should resume their partitions.
+   * a flag.  {@link CommitterImpl} only calls it when the committable contains a
+   * {@link io.tabular.iceberg.connect.data.FlagWriterResult}, but as a guard against accidental
+   * future calls, the Worker must still be safe when called without a flag.
    */
   @Test
   public void testOnFlagProcessedIsNoOpWhenNoFlagSeen() {
@@ -189,7 +190,7 @@ public class WorkerTest {
     IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
     Worker worker = new Worker(config, writerFactory, context);
 
-    // No flag was ever written to this worker — simulate the broadcast sentinel arriving anyway
+    // No flag was ever written to this worker — simulate a spurious/erroneous call anyway
     worker.onFlagProcessed();
 
     // Neither pause nor resume should have been called
