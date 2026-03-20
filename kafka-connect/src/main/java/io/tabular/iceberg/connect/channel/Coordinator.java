@@ -387,7 +387,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
       Map<String, Object> flagRecord = flagEntry.second();
-      LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecord);
+      LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecordToString(flagRecord));
 
       switch (type) {
         case "END-LOAD":
@@ -459,6 +459,14 @@ public class Coordinator extends Channel implements AutoCloseable {
       snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
     }
     return ImmutableMap.of();
+  }
+
+  private String flagRecordToString(Map<String, Object> flagRecord) {
+    try {
+      return MAPPER.writeValueAsString(flagRecord);
+    } catch (Exception e) {
+      return String.valueOf(flagRecord);
+    }
   }
 
   @Override
