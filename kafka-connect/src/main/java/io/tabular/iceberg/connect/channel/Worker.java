@@ -61,11 +61,12 @@ class Worker implements Writer, AutoCloseable {
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
   /**
-   * Records that arrived after a flag in the same {@code put()} batch.  Their offsets are NOT
-   * advanced until they are actually processed (when {@link #onFlagProcessed()} fires), so a
-   * connector restart before processing would safely re-deliver them from Kafka.
+   * When a flag record is encountered, subsequent records in the same polled batch are rerouted
+   * to this table name. Once the coordinator confirms the flag was processed, this field is cleared
+   * via {@link #onFlagProcessed()} so that newly delivered records (after partition resume) are
+   * routed normally.
    */
-  private final List<SinkRecord> pendingAfterFlag;
+  private String reroute;
   /**
    * The {@link SinkTaskContext} used to pause/resume source-topic partitions around a flag.
    * May be {@code null} in unit tests that use the package-private test constructor.
@@ -92,7 +93,7 @@ class Worker implements Writer, AutoCloseable {
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
-    this.pendingAfterFlag = Lists.newArrayList();
+    this.reroute = null;
     this.context = context;
   }
 
@@ -109,29 +110,26 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear pendingAfterFlag here.  Those records have not been written yet
-    // and will be processed when onFlagProcessed() is called after the Coordinator confirms
-    // the branch switch.  Their offsets are also not yet committed.
+    // NOTE: do NOT clear reroute here.  The partition is paused while reroute is active,
+    // so no new records will arrive until onFlagProcessed() resumes it.  But reroute must
+    // remain set across commit cycles in case the flag arrives in one cycle and the
+    // Coordinator sends the sentinel in a later cycle.
 
     return new Committable(offsets, writeResults);
   }
 
   /**
    * Called by {@link CommitterImpl} when the Coordinator broadcasts the flag-processed sentinel.
-   * Resumes the paused source-topic partitions and then processes any records that were buffered
-   * after the flag in the same batch.
+   * Resumes the paused source-topic partitions and clears the reroute so that records delivered
+   * after resume are routed normally.
    */
   @Override
   public void onFlagProcessed() {
-    LOG.debug("Flag-processed signal received — resuming source partitions");
-    resumeAssignment();
-    if (!pendingAfterFlag.isEmpty()) {
-      List<SinkRecord> pending = Lists.newArrayList(pendingAfterFlag);
-      pendingAfterFlag.clear();
-      // write() may encounter another flag in the buffered records; in that case it will
-      // buffer the remainder again and wait for the next onFlagProcessed() signal.
-      write(pending);
+    if (this.reroute != null) {
+      LOG.debug("Flag-processed signal received, clearing reroute for table {}", this.reroute);
+      this.reroute = null;
     }
+    resumeAssignment();
   }
 
   @Override
@@ -140,27 +138,13 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    pendingAfterFlag.clear();
+    this.reroute = null;
   }
 
   @Override
   public void write(Collection<SinkRecord> sinkRecords) {
-    if (sinkRecords == null || sinkRecords.isEmpty()) {
-      return;
-    }
-    boolean flagFound = false;
-    for (SinkRecord record : sinkRecords) {
-      if (flagFound) {
-        // Buffer records that arrive after the flag in this batch.  Their offsets are NOT
-        // advanced here; they will be processed (and their offsets committed) only after
-        // onFlagProcessed() fires, so a crash before that safely re-delivers them.
-        pendingAfterFlag.add(record);
-      } else {
-        save(record);
-        if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
-          flagFound = true;
-        }
-      }
+    if (sinkRecords != null && !sinkRecords.isEmpty()) {
+      sinkRecords.forEach(this::save);
     }
   }
 
@@ -187,11 +171,12 @@ class Worker implements Writer, AutoCloseable {
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
 
-      // Pause all assigned source-topic partitions so that no further records are delivered
-      // until the Coordinator confirms the branch switch via onFlagProcessed().
+      // Reroute any remaining same-batch records to the flag branch, and pause so that
+      // Kafka stops delivering new records until onFlagProcessed() resumes the partition.
+      this.reroute = tableName;
       LOG.info(
-          "Flag detected — pausing source partitions until Coordinator processes the flag "
-              + "(table: {}, branch: {})",
+          "Flag detected — pausing source partitions and rerouting same-batch records to {} "
+              + "(branch: {})",
           tableContext.tableIdentifier(),
           tableContext.branch());
       pauseAssignment();
@@ -240,10 +225,15 @@ class Worker implements Writer, AutoCloseable {
     String routeField = config.tablesRouteField();
     Preconditions.checkNotNull(routeField, String.format("Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d", record.topic(), record.kafkaPartition(), record.kafkaOffset()));
 
+    if (this.reroute != null) {
+      LOG.debug("Rerouting record to {}", this.reroute);
+      writerForTable(this.reroute, record, true).write(record);
+      return;
+    }
+
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
-      String tableName = routeValue.toLowerCase();
-      writerForTable(tableName, record, true).write(record);
+      writerForTable(routeValue.toLowerCase(), record, true).write(record);
     }
   }
 
