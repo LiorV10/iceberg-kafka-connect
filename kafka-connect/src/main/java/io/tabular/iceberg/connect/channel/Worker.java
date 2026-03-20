@@ -120,15 +120,19 @@ class Worker implements Writer, AutoCloseable {
 
   /**
    * Called by {@link CommitterImpl} when the Coordinator broadcasts the flag-processed sentinel.
-   * Resumes the paused source-topic partitions and clears the reroute so that records delivered
-   * after resume are routed normally.
+   * This sentinel is broadcast to all workers, but only workers that actually detected a flag
+   * (i.e. have {@code reroute != null}) should act on it — they are the only ones that paused
+   * their partitions and need to resume.  Workers that never saw a flag are not paused and
+   * must not resume (a spurious resume call would be a no-op in Kafka but is semantically wrong).
    */
   @Override
   public void onFlagProcessed() {
-    if (this.reroute != null) {
-      LOG.debug("Flag-processed signal received, clearing reroute for table {}", this.reroute);
-      this.reroute = null;
+    if (this.reroute == null) {
+      // This worker did not detect a flag — it was never paused, nothing to do.
+      return;
     }
+    LOG.debug("Flag-processed signal received, clearing reroute for table {}", this.reroute);
+    this.reroute = null;
     resumeAssignment();
   }
 

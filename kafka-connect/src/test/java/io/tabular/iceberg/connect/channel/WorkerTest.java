@@ -170,6 +170,34 @@ public class WorkerTest {
   }
 
   /**
+   * Verifies that {@link Worker#onFlagProcessed()} is a no-op for a worker that never detected
+   * a flag.  The Coordinator broadcasts the sentinel to all workers, but only workers that were
+   * actually paused (i.e. saw a flag) should resume their partitions.
+   */
+  @Test
+  public void testOnFlagProcessedIsNoOpWhenNoFlagSeen() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // No flag was ever written to this worker — simulate the broadcast sentinel arriving anyway
+    worker.onFlagProcessed();
+
+    // Neither pause nor resume should have been called
+    verify(context, never()).pause(tp);
+    verify(context, never()).resume(tp);
+  }
+
+  /**
    * Verifies that {@link Worker#onFlagProcessed()} resumes the paused partitions and clears the
    * reroute, so that records delivered after resume go to their natural destination.
    */
