@@ -114,15 +114,21 @@ public class IcebergWriterFactory {
                         try {
                           result.set(catalog.loadTable(identifier));
                         } catch (NoSuchTableException e) {
-                          result.set(
-                                  catalog.createTable(
-                                          identifier, schema, partitionSpec, config.autoCreateProps()));
+                          Table created =
+                              catalog.createTable(
+                                  identifier, schema, partitionSpec, config.autoCreateProps());
+                          // Create one initial empty snapshot only when the table is newly
+                          // created.  This must NOT run when the table already exists
+                          // (i.e. when loadTable succeeded): every worker that processes a
+                          // new source partition calls autoCreateTable, and running
+                          // newAppend().commit() unconditionally would create one empty
+                          // snapshot per worker/partition instead of just one.
+                          created.newAppend().commit();
+                          result.set(created);
                           LOG.info("Created new table {} from record at topic: {}, partition: {}, offset: {}", identifier, sample.topic(), sample.kafkaPartition(), sample.kafkaOffset());
                         }
                       });
 
-      // create initial empty snapshot
-      result.get().newAppend().commit();
       return result.get();
     } catch (Exception e) {
       LOG.error("Error creating new table {} from record at topic: {}, partition: {}, offset: {}", tableName, sample.topic(), sample.kafkaPartition(), sample.kafkaOffset());
