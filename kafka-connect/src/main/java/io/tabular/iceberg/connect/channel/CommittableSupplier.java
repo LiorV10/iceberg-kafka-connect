@@ -23,8 +23,9 @@ interface CommittableSupplier {
 
   /**
    * Called by {@link CommitterImpl} when the {@link Coordinator} signals that all pending flag
-   * reroutes for the current commit cycle have been processed (i.e. the branch switch has been
-   * executed). Workers should stop rerouting records after receiving this signal.
+   * actions for the current commit cycle have been executed (i.e. the branch switch is done).
+   * Workers should resume their paused source-topic partitions and process any records that were
+   * buffered after the flag record.
    *
    * <p>The default implementation is a no-op so that anonymous/lambda suppliers used in tests and
    * the CommitterImpl constructor do not need to implement it.

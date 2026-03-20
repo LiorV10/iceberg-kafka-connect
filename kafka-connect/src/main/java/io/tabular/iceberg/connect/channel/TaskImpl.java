@@ -37,16 +37,15 @@ public class TaskImpl implements Task, AutoCloseable {
 
   public TaskImpl(SinkTaskContext context, IcebergSinkConfig config) {
     this.catalog = Utilities.loadCatalog(config);
-    this.writer = new Worker(config, catalog);
+    this.writer = new Worker(config, catalog, context);
     this.committer = new CommitterImpl(context, config, catalog);
   }
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
     // Poll the control topic BEFORE writing records so that any pending state changes
-    // (e.g. the flag-processed sentinel that clears the reroute) are applied first.
-    // This eliminates the race window where records written in the current batch would be
-    // unnecessarily rerouted even though the Coordinator has already finished the branch switch.
+    // (e.g. the flag-processed sentinel that calls onFlagProcessed() → resumes partitions and
+    // processes buffered post-flag records) are applied first.
     committer.commit(writer);
     writer.write(sinkRecords);
   }
