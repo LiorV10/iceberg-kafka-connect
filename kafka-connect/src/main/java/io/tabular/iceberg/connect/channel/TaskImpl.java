@@ -43,8 +43,12 @@ public class TaskImpl implements Task, AutoCloseable {
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    writer.write(sinkRecords);
+    // Poll the control topic BEFORE writing records so that any pending state changes
+    // (e.g. the flag-processed sentinel that clears the reroute) are applied first.
+    // This eliminates the race window where records written in the current batch would be
+    // unnecessarily rerouted even though the Coordinator has already finished the branch switch.
     committer.commit(writer);
+    writer.write(sinkRecords);
   }
 
   @Override

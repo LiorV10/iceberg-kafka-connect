@@ -148,6 +148,46 @@ public class WorkerTest {
     verify(writerFactory, times(1)).createWriter(eq(yetAnotherTable), any(), anyBoolean());
   }
 
+  /**
+   * Mirrors the new {@link TaskImpl#put()} order: {@code onFlagProcessed()} is called BEFORE
+   * {@code write()}, so the records written in the same call are NOT rerouted.
+   * This verifies that the sentinel-then-write ordering eliminates the race window where
+   * records would be unnecessarily routed to the flag branch after the branch switch.
+   */
+  @Test
+  public void testRerouteIsClearedBeforeWriteWhenSentinelPrecedesWrite() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory);
+
+    // Activate reroute by writing a flag record
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    worker.committable(); // end cycle K
+
+    // Simulate the TaskImpl.put() order: sentinel first, then write
+    worker.onFlagProcessed();   // committer.commit() detects sentinel BEFORE write()
+
+    String naturalRoute = "db.natural";
+    Map<String, Object> dataValue = ImmutableMap.of(FIELD_NAME, naturalRoute);
+    SinkRecord dataRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null, dataValue, 2L);
+    worker.write(ImmutableList.of(dataRec));
+
+    // Record must be routed to its natural destination, not to TABLE_NAME
+    verify(writerFactory, times(1)).createWriter(eq(naturalRoute), any(), anyBoolean());
+    verify(writerFactory, times(0)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+  }
+
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
     WriterResult writeResult =
         new WriterResult(
