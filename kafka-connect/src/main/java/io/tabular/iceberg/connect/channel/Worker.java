@@ -103,13 +103,6 @@ class Worker implements Writer, AutoCloseable {
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
-    // If this cycle contains flag results, pause source-topic partitions now (at the batch
-    // boundary) so Kafka Connect won't deliver new records until onFlagProcessed() resumes them.
-    // We pause here rather than mid-batch (in save()) to avoid interrupting the current write.
-    if (!flagWriterResults.isEmpty()) {
-      pauseAssignment();
-    }
-
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
@@ -160,6 +153,14 @@ class Worker implements Writer, AutoCloseable {
   public void write(Collection<SinkRecord> sinkRecords) {
     if (sinkRecords != null && !sinkRecords.isEmpty()) {
       sinkRecords.forEach(this::save);
+      // Pause source-topic partitions at the batch boundary if a flag was detected, so that
+      // Kafka Connect will not deliver new records until onFlagProcessed() resumes them.
+      // We pause here (after the full batch) rather than mid-batch in save() to avoid
+      // interrupting the current write, and rather than in committable() so the pause takes
+      // effect immediately — not deferred until the next START_COMMIT arrives.
+      if (!flagWriterResults.isEmpty()) {
+        pauseAssignment();
+      }
     }
   }
 
@@ -187,7 +188,7 @@ class Worker implements Writer, AutoCloseable {
       flagWriterResults.add(flagResult);
 
       // Reroute any remaining same-batch records to the flag branch.  The partition will be
-      // paused at committable() time, preventing new records from arriving after this batch.
+      // paused at the end of write(), preventing new records from arriving after this batch.
       this.reroute = tableName;
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",

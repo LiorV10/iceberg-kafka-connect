@@ -101,8 +101,10 @@ public class WorkerTest {
 
   /**
    * Verifies that when a flag record is encountered, the worker pauses all assigned
-   * source-topic partitions via {@link SinkTaskContext#pause} at {@code committable()} time
-   * (not immediately in {@code write()}).
+   * source-topic partitions via {@link SinkTaskContext#pause} immediately at the end of
+   * {@code write()} — at the batch boundary — not deferred until {@code committable()} time.
+   * This ensures Kafka Connect stops delivering new records right away, rather than only
+   * after the next START_COMMIT arrives.
    */
   @Test
   public void testWorkerPausesWhenFlagDetected() {
@@ -124,14 +126,14 @@ public class WorkerTest {
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // pause() must NOT yet be called — the pause is deferred until committable() time
-    verify(context, never()).pause(tp);
-
-    // After committable() is called the pause must have been requested
-    worker.committable();
+    // pause() MUST be called immediately at the end of write() (batch boundary)
     verify(context, times(1)).pause(tp);
     // resume() must NOT have been called yet
     verify(context, never()).resume(tp);
+
+    // Calling committable() afterwards must NOT trigger a second pause() call
+    worker.committable();
+    verify(context, times(1)).pause(tp);
   }
 
   /**
