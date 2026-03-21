@@ -146,13 +146,22 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
         .writerResults()
         .forEach(
             writerResult -> {
+              String catalogName = config.catalogName();
+              if (writerResult.isFullRefreshComplete()) {
+                catalogName = catalogName
+                    + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX
+                    + writerResult.fullRefreshCycleSeq();
+              } else if (writerResult.isFullRefreshData()) {
+                catalogName = catalogName + IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX;
+              }
+
               Event commitResponse =
                   new Event(
                       config.controlGroupId(),
                       new DataWritten(
                           writerResult.partitionStruct(),
                           commitId,
-                          TableReference.of(config.catalogName(), writerResult.tableIdentifier()),
+                          TableReference.of(catalogName, writerResult.tableIdentifier()),
                           writerResult.dataFiles(),
                           writerResult.deleteFiles()));
 
