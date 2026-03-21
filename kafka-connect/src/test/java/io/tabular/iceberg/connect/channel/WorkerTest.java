@@ -101,8 +101,10 @@ public class WorkerTest {
 
   /**
    * Verifies that when a flag record is encountered, the worker pauses all assigned
-   * source-topic partitions via {@link SinkTaskContext#pause} at {@code committable()} time
-   * (not immediately in {@code write()}).
+   * source-topic partitions via {@link SinkTaskContext#pause} immediately at the end of
+   * {@code write()} — at the batch boundary — not deferred until {@code committable()} time.
+   * This ensures Kafka Connect stops delivering new records right away, rather than only
+   * after the next START_COMMIT arrives.
    */
   @Test
   public void testWorkerPausesWhenFlagDetected() {
@@ -124,14 +126,14 @@ public class WorkerTest {
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // pause() must NOT yet be called — the pause is deferred until committable() time
-    verify(context, never()).pause(tp);
-
-    // After committable() is called the pause must have been requested
-    worker.committable();
+    // pause() MUST be called immediately at the end of write() (batch boundary)
     verify(context, times(1)).pause(tp);
     // resume() must NOT have been called yet
     verify(context, never()).resume(tp);
+
+    // Calling committable() afterwards must NOT trigger a second pause() call
+    worker.committable();
+    verify(context, times(1)).pause(tp);
   }
 
   /**
@@ -334,6 +336,101 @@ public class WorkerTest {
     verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
     // The post-flag record's natural route is never used
     verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
+  }
+
+  /**
+   * Verifies that {@link Worker#isAwaitingFlagProcessing()} is {@code false} in the normal state
+   * (no flag seen), transitions to {@code true} once the flag result has been committed to the
+   * Coordinator ({@link Worker#committable()} called), and transitions back to {@code false}
+   * after {@link Worker#onFlagProcessed(TableIdentifier)}.
+   */
+  @Test
+  public void testIsAwaitingFlagProcessingLifecycle() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Before any flag: not awaiting
+    assertThat(worker.isAwaitingFlagProcessing()).isFalse();
+
+    // Write a flag — reroute set, flagWriterResults non-empty → still not "awaiting" (flag not yet committed)
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    assertThat(worker.isAwaitingFlagProcessing()).isFalse();
+
+    // committable() sends the flag to the Coordinator and clears flagWriterResults
+    // → now reroute is set but flagWriterResults is empty → "awaiting"
+    worker.committable();
+    assertThat(worker.isAwaitingFlagProcessing()).isTrue();
+
+    // FLAG_PROCESSED_SENTINEL: onFlagProcessed clears reroute → back to normal
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+    assertThat(worker.isAwaitingFlagProcessing()).isFalse();
+  }
+
+  /**
+   * Verifies that {@link Worker#isAwaitingFlagProcessing()} correctly gates {@code write()} in
+   * {@link TaskImpl}: records arriving while awaiting the Coordinator sentinel are NOT written
+   * to any table (they will be re-delivered from Kafka after partitions are resumed).
+   */
+  @Test
+  public void testRecordsSkippedWhileAwaitingFlagProcessing() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Write the flag to enter awaiting state (via committable() to simulate the START_COMMIT cycle)
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    worker.committable(); // flag sent to Coordinator; reroute set, flagWriterResults cleared
+
+    assertThat(worker.isAwaitingFlagProcessing()).isTrue();
+
+    // Simulate records arriving despite partition being paused (edge case).
+    // They must NOT be written to any table.
+    String otherTable = "db.other";
+    SinkRecord dataRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
+            ImmutableMap.of(FIELD_NAME, otherTable), 2L);
+    worker.write(ImmutableList.of(dataRec));
+
+    // No writer should have been created for the data record
+    verify(writerFactory, never()).createWriter(eq(otherTable), any(), anyBoolean());
+    // Still awaiting (onFlagProcessed not called yet)
+    assertThat(worker.isAwaitingFlagProcessing()).isTrue();
+
+    // After flag is processed, write works normally again
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+    assertThat(worker.isAwaitingFlagProcessing()).isFalse();
+
+    worker.write(ImmutableList.of(dataRec));
+    verify(writerFactory, times(1)).createWriter(eq(otherTable), any(), anyBoolean());
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
