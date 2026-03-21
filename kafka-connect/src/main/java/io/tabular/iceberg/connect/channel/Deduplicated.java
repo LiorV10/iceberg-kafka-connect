@@ -19,9 +19,17 @@
 package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.function.BiFunction;
@@ -69,6 +77,7 @@ import org.slf4j.LoggerFactory;
  */
 class Deduplicated {
   private static final Logger LOG = LoggerFactory.getLogger(Deduplicated.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
 
   private Deduplicated() {}
 
@@ -100,6 +109,95 @@ class Deduplicated {
         "delete",
         DataWritten::deleteFiles,
         deleteFile -> deleteFile.path().toString());
+  }
+
+  /**
+   * Returns all flag messages from the batch of envelopes, deduplicated by flag type.
+   * Flag messages are identified by containing sentinel data files with paths starting with
+   * {@link FlagWriterResult#FLAG_PREFIX}.
+   * The full flag record is deserialized from the JSON embedded in the DataFile path.
+   * The map key is the flag type (extracted from the record using {@code flagTypeField}),
+   * and the map value is a pair of the {@link TableContext} and the full flag record as a map.
+   *
+   * <p>In a multi-task deployment the producer broadcasts the same flag to every Kafka
+   * partition so that every task sees it, sets its own reroute, and reports a
+   * {@link FlagWriterResult} to the Coordinator. The Coordinator therefore receives one
+   * flag per partition for the same logical flag event. This method deduplicates those
+   * copies by flag type, keeping the first occurrence, so the Coordinator processes each
+   * logical flag exactly once.
+   */
+  public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
+      UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
+      String flagTypeField) {
+    return envelopes.stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+          List<DataFile> dataFiles = dataWritten.dataFiles();
+
+          if (dataFiles == null || dataFiles.isEmpty()) {
+            return false;
+          }
+
+          return dataFiles.stream()
+                  .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+        })
+        .collect(toMap(
+                dataWritten -> extractFlagType(dataWritten, flagTypeField),
+                dataWritten -> {
+                  String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+                      .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+                  Map<String, Object> record = parseRecordJson(recordJson);
+                  TableContext tableContext = TableContext.parse(
+                      dataWritten.tableReference().identifier(), regex);
+                  return Pair.of(tableContext, record);
+                },
+                // Deduplicate: when the same flag type is reported by multiple tasks (one per
+                // partition in a broadcast scenario) keep the first occurrence and discard the rest.
+                (existing, duplicate) -> {
+                  LOG.debug("Deduplicating flag: type already seen, discarding copy from additional partition");
+                  return existing;
+                }));
+  }
+
+  /**
+   * Returns the number of flag-containing DataWritten events per flag type in this batch
+   * of envelopes. Each DataWritten event corresponds to exactly one FlagWriterResult,
+   * which in turn corresponds to exactly one source partition's broadcast copy of the flag.
+   *
+   * <p>A task that owns K source partitions will send K DataWritten events carrying flag data
+   * (one per partition). Summing these across tasks and across commit cycles gives the total
+   * number of source-partition-level votes. A flag is safe to process once this total reaches
+   * {@code totalPartitionCount} — meaning every source partition has broadcast the flag and
+   * every task has activated its reroute.
+   */
+  static Map<String, Integer> flagMessageVoteCounts(List<Envelope> envelopes, String flagTypeField) {
+    return envelopes.stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+          List<DataFile> dataFiles = dataWritten.dataFiles();
+          return dataFiles != null && !dataFiles.isEmpty()
+              && dataFiles.stream()
+                  .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+        })
+        .collect(Collectors.groupingBy(
+            dw -> extractFlagType(dw, flagTypeField),
+            Collectors.summingInt(dw -> 1)));
+  }
+
+  private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
+    String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+        .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+    Map<String, Object> record = parseRecordJson(recordJson);
+    Object type = record.get(flagTypeField);
+    return type != null ? type.toString() : "";
+  }
+
+  private static Map<String, Object> parseRecordJson(String recordJson) {
+    try {
+      return MAPPER.readValue(recordJson, new TypeReference<Map<String, Object>>() {});
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private static <F> List<F> deduplicatedFiles(
