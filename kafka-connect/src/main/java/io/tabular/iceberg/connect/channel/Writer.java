@@ -23,4 +23,18 @@ import org.apache.kafka.connect.sink.SinkRecord;
 
 interface Writer extends CommittableSupplier {
   void write(Collection<SinkRecord> sinkRecords);
+
+  /**
+   * Returns {@code true} when this writer has detected a flag record and has sent the flag result
+   * to the Coordinator (i.e. {@link #committable()} has been called), but has not yet received the
+   * per-table {@code FLAG_PROCESSED_SENTINEL} from the Coordinator.  While in this state the
+   * source-topic partitions are paused via {@link org.apache.kafka.connect.sink.SinkTaskContext}
+   * and no new source records should be written.
+   *
+   * <p>The default implementation always returns {@code false}, so anonymous / lambda suppliers
+   * that do not implement flag processing are unaffected.
+   */
+  default boolean isAwaitingFlagProcessing() {
+    return false;
+  }
 }

@@ -124,6 +124,17 @@ class Worker implements Writer, AutoCloseable {
    * other tables, or workers that never detected a flag, are unaffected.
    */
   @Override
+  public boolean isAwaitingFlagProcessing() {
+    // reroute is set from when the flag is detected until onFlagProcessed() clears it.
+    // flagWriterResults is non-empty only during the batch where the flag was first detected;
+    // committable() clears it when the flag result is sent to the Coordinator.
+    // Therefore: reroute != null AND flagWriterResults empty means we have sent the flag to the
+    // Coordinator and are waiting for the FLAG_PROCESSED_SENTINEL — new source records must not
+    // be written until the sentinel arrives and onFlagProcessed() resumes the partitions.
+    return this.reroute != null && this.flagWriterResults.isEmpty();
+  }
+
+  @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
     LOG.debug(
         "onFlagProcessed called for table {}, current reroute: {}", tableIdentifier, this.reroute);

@@ -43,7 +43,14 @@ public class TaskImpl implements Task, AutoCloseable {
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    writer.write(sinkRecords);
+    // Skip writing source records while we are waiting for the Coordinator to acknowledge the
+    // flag (FLAG_PROCESSED_SENTINEL).  Source-topic partitions are paused via context.pause()
+    // during this window, so records should not normally arrive; this guard ensures correctness
+    // even in edge cases where Kafka Connect delivers a batch before the pause fully takes effect.
+    // The committer loop must still run so it can poll the control topic for the sentinel.
+    if (!writer.isAwaitingFlagProcessing()) {
+      writer.write(sinkRecords);
+    }
     committer.commit(writer);
   }
 
