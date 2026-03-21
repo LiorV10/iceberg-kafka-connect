@@ -36,14 +36,17 @@ import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
+import org.apache.iceberg.ManageSnapshots;
 import org.apache.iceberg.RowDelta;
 import org.apache.iceberg.Snapshot;
+import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
@@ -190,7 +193,96 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
 
-    Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
+    // Partition envelopes into full-refresh and normal sets
+    List<Envelope> frEnvelopes =
+        envelopeList.stream().filter(this::isFullRefreshEnvelope).collect(toList());
+    List<Envelope> normalEnvelopes =
+        envelopeList.stream().filter(e -> !isFullRefreshEnvelope(e)).collect(toList());
+    boolean hasFREnd = envelopeList.stream().anyMatch(this::isFullRefreshEndEnvelope);
+
+    // Commit normal data to the configured branch (existing behavior)
+    if (!normalEnvelopes.isEmpty()) {
+      commitEnvelopesToBranch(
+          table, tableIdentifier, normalEnvelopes, branch.orElse(null), offsetsJson, vtts);
+    }
+
+    // Commit full-refresh data to the staging branch
+    String stagingBranch = config.tablesFullRefreshStagingBranch();
+    if (!frEnvelopes.isEmpty()) {
+      commitEnvelopesToBranch(
+          table, tableIdentifier, frEnvelopes, stagingBranch, offsetsJson, vtts);
+    }
+
+    // On END-LOAD: atomically replace the main branch with the staging branch
+    if (hasFREnd) {
+      // Refresh if we didn't already do so inside commitEnvelopesToBranch
+      if (frEnvelopes.isEmpty()) {
+        table.refresh();
+      }
+      String targetBranch = branch.orElse(SnapshotRef.MAIN_BRANCH);
+      Snapshot stagingSnapshot = table.snapshot(stagingBranch);
+      if (stagingSnapshot != null) {
+        LOG.info(
+            "Full-refresh complete for table {}: replacing branch '{}' with staging branch '{}'",
+            tableIdentifier,
+            targetBranch,
+            stagingBranch);
+        ManageSnapshots manage = table.manageSnapshots();
+        if (table.refs().containsKey(targetBranch)) {
+          manage.replaceBranch(targetBranch, stagingSnapshot.snapshotId());
+        } else {
+          manage.createBranch(targetBranch, stagingSnapshot.snapshotId());
+        }
+        manage.commit();
+        table.manageSnapshots().removeBranch(stagingBranch).commit();
+        table.refresh();
+
+        Long snapshotId = latestSnapshot(table, targetBranch).snapshotId();
+        Event event =
+            new Event(
+                config.controlGroupId(),
+                new CommitToTable(
+                    commitState.currentCommitId(),
+                    TableReference.of(config.catalogName(), tableIdentifier),
+                    snapshotId,
+                    vtts));
+        send(event);
+
+        LOG.info(
+            "Full-refresh commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
+            tableIdentifier,
+            snapshotId,
+            commitState.currentCommitId(),
+            vtts);
+      } else {
+        LOG.warn(
+            "Full-refresh END-LOAD received for table {} but staging branch '{}' has no snapshot; nothing to swap",
+            tableIdentifier,
+            stagingBranch);
+      }
+    }
+  }
+
+  private boolean isFullRefreshEnvelope(Envelope envelope) {
+    String catalogName = ((DataWritten) envelope.event().payload()).tableReference().catalog();
+    return catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX)
+        || catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX);
+  }
+
+  private boolean isFullRefreshEndEnvelope(Envelope envelope) {
+    String catalogName = ((DataWritten) envelope.event().payload()).tableReference().catalog();
+    return catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX);
+  }
+
+  private void commitEnvelopesToBranch(
+      Table table,
+      TableIdentifier tableIdentifier,
+      List<Envelope> envelopeList,
+      String branchName,
+      String offsetsJson,
+      OffsetDateTime vtts) {
+
+    Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branchName);
 
     List<Envelope> filteredEnvelopeList =
         envelopeList.stream()
@@ -215,65 +307,73 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
-      LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
-    } else {
-      if (deleteFiles.isEmpty()) {
-        Transaction transaction = table.newTransaction();
+      LOG.info(
+          "Nothing to commit to table {} on branch {}, skipping",
+          tableIdentifier,
+          branchName == null ? "main" : branchName);
+      return;
+    }
 
-        Map<Integer, List<DataFile>> filesBySpec =
-            dataFiles.stream()
-                .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
+    Optional<String> branch = Optional.ofNullable(branchName);
 
-        List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
-        int lastIdx = list.size() - 1;
-        for (int i = 0; i <= lastIdx; i++) {
-          AppendFiles appendOp = transaction.newAppend();
-          branch.ifPresent(appendOp::toBranch);
+    if (deleteFiles.isEmpty()) {
+      Transaction transaction = table.newTransaction();
 
-          list.get(i).forEach(appendOp::appendFile);
-          appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-          if (i == lastIdx) {
-            appendOp.set(snapshotOffsetsProp, offsetsJson);
-            if (vtts != null) {
-              appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-            }
+      Map<Integer, List<DataFile>> filesBySpec =
+          dataFiles.stream()
+              .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
+
+      List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
+      int lastIdx = list.size() - 1;
+      for (int i = 0; i <= lastIdx; i++) {
+        AppendFiles appendOp = transaction.newAppend();
+        branch.ifPresent(appendOp::toBranch);
+
+        list.get(i).forEach(appendOp::appendFile);
+        appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        if (i == lastIdx) {
+          appendOp.set(snapshotOffsetsProp, offsetsJson);
+          if (vtts != null) {
+            appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
           }
-
-          appendOp.commit();
         }
 
-        transaction.commitTransaction();
-      } else {
-        RowDelta deltaOp = table.newRowDelta();
-        branch.ifPresent(deltaOp::toBranch);
-        deltaOp.set(snapshotOffsetsProp, offsetsJson);
-        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
-        if (vtts != null) {
-          deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-        }
-        dataFiles.forEach(deltaOp::addRows);
-        deleteFiles.forEach(deltaOp::addDeletes);
-        deltaOp.commit();
+        appendOp.commit();
       }
 
-      Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
-      Event event =
-          new Event(
-              config.controlGroupId(),
-              new CommitToTable(
-                  commitState.currentCommitId(),
-                  TableReference.of(config.catalogName(), tableIdentifier),
-                  snapshotId,
-                  vtts));
-      send(event);
-
-      LOG.info(
-          "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
-          tableIdentifier,
-          snapshotId,
-          commitState.currentCommitId(),
-          vtts);
+      transaction.commitTransaction();
+    } else {
+      RowDelta deltaOp = table.newRowDelta();
+      branch.ifPresent(deltaOp::toBranch);
+      deltaOp.set(snapshotOffsetsProp, offsetsJson);
+      deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+      if (vtts != null) {
+        deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+      }
+      dataFiles.forEach(deltaOp::addRows);
+      deleteFiles.forEach(deltaOp::addDeletes);
+      deltaOp.commit();
     }
+
+    table.refresh();
+    Long snapshotId = latestSnapshot(table, branchName).snapshotId();
+    Event event =
+        new Event(
+            config.controlGroupId(),
+            new CommitToTable(
+                commitState.currentCommitId(),
+                TableReference.of(config.catalogName(), tableIdentifier),
+                snapshotId,
+                vtts));
+    send(event);
+
+    LOG.info(
+        "Commit complete to table {} on branch {}, snapshot {}, commit ID {}, vtts {}",
+        tableIdentifier,
+        branchName == null ? "main" : branchName,
+        snapshotId,
+        commitState.currentCommitId(),
+        vtts);
   }
 
   private Snapshot latestSnapshot(Table table, String branch) {

@@ -30,16 +30,30 @@ public class WriterResult {
   private final List<DataFile> dataFiles;
   private final List<DeleteFile> deleteFiles;
   private final StructType partitionStruct;
+  private final boolean fullRefreshData;
+  private final boolean fullRefreshComplete;
 
   public WriterResult(
       TableIdentifier tableIdentifier,
       List<DataFile> dataFiles,
       List<DeleteFile> deleteFiles,
       StructType partitionStruct) {
+    this(tableIdentifier, dataFiles, deleteFiles, partitionStruct, false, false);
+  }
+
+  public WriterResult(
+      TableIdentifier tableIdentifier,
+      List<DataFile> dataFiles,
+      List<DeleteFile> deleteFiles,
+      StructType partitionStruct,
+      boolean fullRefreshData,
+      boolean fullRefreshComplete) {
     this.tableIdentifier = tableIdentifier;
     this.dataFiles = dataFiles;
     this.deleteFiles = deleteFiles;
     this.partitionStruct = partitionStruct;
+    this.fullRefreshData = fullRefreshData;
+    this.fullRefreshComplete = fullRefreshComplete;
   }
 
   public TableIdentifier tableIdentifier() {
@@ -56,5 +70,13 @@ public class WriterResult {
 
   public StructType partitionStruct() {
     return partitionStruct;
+  }
+
+  public boolean isFullRefreshData() {
+    return fullRefreshData;
+  }
+
+  public boolean isFullRefreshComplete() {
+    return fullRefreshComplete;
   }
 }

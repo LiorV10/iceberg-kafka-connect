@@ -73,6 +73,19 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
   private static final String TABLES_CDC_FIELD_PROP = "iceberg.tables.cdc-field";
+  private static final String TABLES_FULL_REFRESH_CDC_OP_VALUE_PROP =
+      "iceberg.tables.full-refresh-cdc-op-value";
+  private static final String TABLES_FULL_REFRESH_END_OP_VALUE_PROP =
+      "iceberg.tables.full-refresh-end-op-value";
+  private static final String TABLES_FULL_REFRESH_STAGING_BRANCH_PROP =
+      "iceberg.tables.full-refresh-staging-branch";
+  private static final String TABLES_FULL_REFRESH_ENABLED_PROP =
+      "iceberg.tables.full-refresh-enabled";
+  private static final String FULL_REFRESH_CDC_OP_VALUE_DEFAULT = "N";
+  private static final String FULL_REFRESH_END_OP_VALUE_DEFAULT = "END-LOAD";
+  private static final String FULL_REFRESH_STAGING_BRANCH_DEFAULT = "full-refresh-staging";
+  public static final String FULL_REFRESH_CATALOG_SUFFIX = "__FR";
+  public static final String FULL_REFRESH_END_CATALOG_SUFFIX = "__FREND";
   private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
       "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_AUTO_CREATE_ENABLED_PROP =
@@ -159,6 +172,30 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Source record field that identifies the type of operation (insert, update, or delete)");
+    configDef.define(
+        TABLES_FULL_REFRESH_CDC_OP_VALUE_PROP,
+        Type.STRING,
+        FULL_REFRESH_CDC_OP_VALUE_DEFAULT,
+        Importance.MEDIUM,
+        "CDC op field value indicating a full-refresh (new) record; defaults to 'N'");
+    configDef.define(
+        TABLES_FULL_REFRESH_END_OP_VALUE_PROP,
+        Type.STRING,
+        FULL_REFRESH_END_OP_VALUE_DEFAULT,
+        Importance.MEDIUM,
+        "CDC op field value indicating end of a full-refresh load; defaults to 'END-LOAD'");
+    configDef.define(
+        TABLES_FULL_REFRESH_STAGING_BRANCH_PROP,
+        Type.STRING,
+        FULL_REFRESH_STAGING_BRANCH_DEFAULT,
+        Importance.MEDIUM,
+        "Iceberg branch name used as staging area during full-refresh; defaults to 'full-refresh-staging'");
+    configDef.define(
+        TABLES_FULL_REFRESH_ENABLED_PROP,
+        Type.BOOLEAN,
+        false,
+        Importance.MEDIUM,
+        "Set to true to enable full-refresh mode, which routes CDC op=N records to a staging branch and swaps it with the main branch on END-LOAD; defaults to false");
     configDef.define(
         TABLES_UPSERT_MODE_ENABLED_PROP,
         Type.BOOLEAN,
@@ -384,6 +421,22 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String tablesCdcField() {
     return getString(TABLES_CDC_FIELD_PROP);
+  }
+
+  public String tablesFullRefreshCdcOpValue() {
+    return getString(TABLES_FULL_REFRESH_CDC_OP_VALUE_PROP);
+  }
+
+  public String tablesFullRefreshEndOpValue() {
+    return getString(TABLES_FULL_REFRESH_END_OP_VALUE_PROP);
+  }
+
+  public String tablesFullRefreshStagingBranch() {
+    return getString(TABLES_FULL_REFRESH_STAGING_BRANCH_PROP);
+  }
+
+  public boolean fullRefreshEnabled() {
+    return getBoolean(TABLES_FULL_REFRESH_ENABLED_PROP);
   }
 
   public String controlTopic() {

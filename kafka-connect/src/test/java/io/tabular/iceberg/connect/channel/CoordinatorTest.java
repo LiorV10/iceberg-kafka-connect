@@ -21,6 +21,7 @@ package io.tabular.iceberg.connect.channel;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.when;
 
+import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.fixtures.EventTestUtil;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -405,6 +406,120 @@ public class CoordinatorTest extends ChannelTestBase {
         "100",
         secondSnapshot.summary().get(VTTS_SNAPSHOT_PROP),
         "Only the most recent snapshot should include vtts in it's summary");
+  }
+
+  @Test
+  public void testFullRefreshDataCommittedToStagingBranch() {
+    // Given: a data file tagged as full-refresh data (__FR suffix)
+    DataFile dataFile = EventTestUtil.createDataFile();
+
+    coordinatorTest(
+        currentCommitId -> {
+          Event frDataResponse =
+              new Event(
+                  config.controlGroupId(),
+                  new DataWritten(
+                      StructType.of(),
+                      currentCommitId,
+                      new TableReference(
+                          "catalog" + IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX,
+                          ImmutableList.of("db"),
+                          "tbl"),
+                      ImmutableList.of(dataFile),
+                      ImmutableList.of()));
+
+          Event commitReady =
+              new Event(
+                  config.controlGroupId(),
+                  new DataComplete(
+                      currentCommitId,
+                      ImmutableList.of(
+                          new TopicPartitionOffset(
+                              "topic",
+                              1,
+                              1L,
+                              OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC)))));
+
+          return ImmutableList.of(frDataResponse, commitReady);
+        });
+
+    table.refresh();
+
+    // The staging branch should have a snapshot with the data file
+    Snapshot stagingSnapshot = table.snapshot("full-refresh-staging");
+    Assertions.assertNotNull(stagingSnapshot, "Staging branch should have been created");
+    Assertions.assertEquals(
+        1,
+        ImmutableList.copyOf(stagingSnapshot.addedDataFiles(table.io())).size(),
+        "Staging branch should have exactly one data file");
+
+    // The main branch should remain unchanged (no snapshot committed to main)
+    Assertions.assertNull(table.currentSnapshot(), "Main branch should not have been modified");
+  }
+
+  @Test
+  public void testFullRefreshEndLoadSwapsMainBranchWithStaging() {
+    // Given: a full-refresh data file AND an END-LOAD signal in the same commit cycle
+    DataFile dataFile = EventTestUtil.createDataFile();
+
+    coordinatorTest(
+        currentCommitId -> {
+          // Worker 1: sends full-refresh data
+          Event frDataResponse =
+              new Event(
+                  config.controlGroupId(),
+                  new DataWritten(
+                      StructType.of(),
+                      currentCommitId,
+                      new TableReference(
+                          "catalog" + IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX,
+                          ImmutableList.of("db"),
+                          "tbl"),
+                      ImmutableList.of(dataFile),
+                      ImmutableList.of()));
+
+          // Worker 2: received the END-LOAD flag, sends empty DataWritten with __FREND suffix
+          Event frEndResponse =
+              new Event(
+                  config.controlGroupId(),
+                  new DataWritten(
+                      StructType.of(),
+                      currentCommitId,
+                      new TableReference(
+                          "catalog" + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX,
+                          ImmutableList.of("db"),
+                          "tbl"),
+                      ImmutableList.of(),
+                      ImmutableList.of()));
+
+          Event commitReady =
+              new Event(
+                  config.controlGroupId(),
+                  new DataComplete(
+                      currentCommitId,
+                      ImmutableList.of(
+                          new TopicPartitionOffset(
+                              "topic",
+                              1,
+                              1L,
+                              OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC)))));
+
+          return ImmutableList.of(frDataResponse, frEndResponse, commitReady);
+        });
+
+    table.refresh();
+
+    // The staging branch should have been removed after the swap
+    Snapshot stagingSnapshot = table.snapshot("full-refresh-staging");
+    Assertions.assertNull(stagingSnapshot, "Staging branch should have been removed after swap");
+
+    // The main branch should now contain the full-refresh data
+    Snapshot mainSnapshot = table.currentSnapshot();
+    Assertions.assertNotNull(mainSnapshot, "Main branch should have a snapshot after full-refresh");
+    Assertions.assertEquals(
+        1,
+        ImmutableList.copyOf(mainSnapshot.addedDataFiles(table.io())).size(),
+        "Main branch should have exactly one data file from the full-refresh");
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {

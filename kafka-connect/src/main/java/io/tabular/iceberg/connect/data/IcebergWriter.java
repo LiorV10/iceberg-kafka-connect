@@ -46,6 +46,8 @@ public class IcebergWriter implements RecordWriter {
 
   private RecordConverter recordConverter;
   private TaskWriter<Record> writer;
+  private boolean inFullRefresh = false;
+  private boolean fullRefreshComplete = false;
 
   public IcebergWriter(Table table, String tableName, IcebergSinkConfig config) {
     this.table = table;
@@ -65,11 +67,27 @@ public class IcebergWriter implements RecordWriter {
     try {
       // TODO: config to handle tombstones instead of always ignoring?
       if (record.value() != null) {
-        Record row = convertToRow(record);
         String cdcField = config.tablesCdcField();
         if (cdcField == null) {
+          Record row = convertToRow(record);
           writer.write(row);
+        } else if (config.fullRefreshEnabled()) {
+          String opStr = extractCdcOpString(record.value(), cdcField);
+          if (isFullRefreshEndOp(opStr)) {
+            // END-LOAD marker: signal full-refresh completion, do not write the record
+            fullRefreshComplete = true;
+          } else if (isFullRefreshOp(opStr)) {
+            // Full-refresh insert: write as a plain append
+            inFullRefresh = true;
+            Record row = convertToRow(record);
+            writer.write(row);
+          } else {
+            Record row = convertToRow(record);
+            Operation op = opFromString(opStr);
+            writer.write(new RecordWrapper(row, op));
+          }
         } else {
+          Record row = convertToRow(record);
           Operation op = extractCdcOperation(record.value(), cdcField);
           writer.write(new RecordWrapper(row, op));
         }
@@ -106,20 +124,33 @@ public class IcebergWriter implements RecordWriter {
     return row;
   }
 
-  private Operation extractCdcOperation(Object recordValue, String cdcField) {
+  private String extractCdcOpString(Object recordValue, String cdcField) {
     Object opValue = Utilities.extractFromRecordValue(recordValue, cdcField);
-
     if (opValue == null) {
-      return Operation.INSERT;
+      return null;
     }
-
     String opStr = opValue.toString().trim().toUpperCase();
-    if (opStr.isEmpty()) {
+    return opStr.isEmpty() ? null : opStr;
+  }
+
+  private boolean isFullRefreshOp(String opStr) {
+    if (opStr == null) {
+      return false;
+    }
+    return opStr.equals(config.tablesFullRefreshCdcOpValue().trim().toUpperCase());
+  }
+
+  private boolean isFullRefreshEndOp(String opStr) {
+    if (opStr == null) {
+      return false;
+    }
+    return opStr.equals(config.tablesFullRefreshEndOpValue().trim().toUpperCase());
+  }
+
+  private Operation opFromString(String opStr) {
+    if (opStr == null) {
       return Operation.INSERT;
     }
-
-    // TODO: define value mapping in config?
-
     switch (opStr.charAt(0)) {
       case 'U':
         return Operation.UPDATE;
@@ -128,6 +159,11 @@ public class IcebergWriter implements RecordWriter {
       default:
         return Operation.INSERT;
     }
+  }
+
+  private Operation extractCdcOperation(Object recordValue, String cdcField) {
+    String opStr = extractCdcOpString(recordValue, cdcField);
+    return opFromString(opStr);
   }
 
   private void flush() {
@@ -143,7 +179,12 @@ public class IcebergWriter implements RecordWriter {
             TableIdentifier.parse(tableName),
             Arrays.asList(writeResult.dataFiles()),
             Arrays.asList(writeResult.deleteFiles()),
-            table.spec().partitionType()));
+            table.spec().partitionType(),
+            inFullRefresh,
+            fullRefreshComplete));
+
+    inFullRefresh = false;
+    fullRefreshComplete = false;
   }
 
   @Override
