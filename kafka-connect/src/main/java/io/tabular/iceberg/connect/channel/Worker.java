@@ -73,12 +73,8 @@ class Worker implements Writer, AutoCloseable {
    */
   private final SinkTaskContext context;
 
-  Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
-    this(config, new IcebergWriterFactory(catalog, config), context);
-  }
-
   Worker(IcebergSinkConfig config, Catalog catalog) {
-    this(config, catalog, null);
+    this(config, new IcebergWriterFactory(catalog, config));
   }
 
   @VisibleForTesting
@@ -107,15 +103,20 @@ class Worker implements Writer, AutoCloseable {
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
+    // If this cycle contains flag results, pause source-topic partitions now (at the batch
+    // boundary) so Kafka Connect won't deliver new records until onFlagProcessed() resumes them.
+    // We pause here rather than mid-batch (in save()) to avoid interrupting the current write.
+    if (!flagWriterResults.isEmpty()) {
+      pauseAssignment();
+    }
+
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear reroute here.  The partition is paused while reroute is active,
-    // so no new records will arrive until onFlagProcessed() resumes it.  But reroute must
-    // remain set across commit cycles because the flag result is sent in this cycle's
-    // sendCommitResponse(), and onFlagProcessed() is only triggered later when the Coordinator
-    // broadcasts the sentinel CommitComplete after all partitions have reported — which may
-    // happen in a subsequent commit cycle.
+    // NOTE: do NOT clear reroute here.  Reroute must remain set across commit cycles because the
+    // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
+    // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
+    // have reported — which may happen in a subsequent commit cycle.
 
     return new Committable(offsets, writeResults);
   }
@@ -183,15 +184,13 @@ class Worker implements Writer, AutoCloseable {
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
 
-      // Reroute any remaining same-batch records to the flag branch, and pause so that
-      // Kafka stops delivering new records until onFlagProcessed() resumes the partition.
+      // Reroute any remaining same-batch records to the flag branch.  The partition will be
+      // paused at committable() time, preventing new records from arriving after this batch.
       this.reroute = tableName;
       LOG.info(
-          "Flag detected — pausing source partitions and rerouting same-batch records to {} "
-              + "(branch: {})",
+          "Flag detected — rerouting same-batch records to {} (branch: {})",
           tableContext.tableIdentifier(),
           tableContext.branch());
-      pauseAssignment();
     } else {
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);

@@ -37,17 +37,14 @@ public class TaskImpl implements Task, AutoCloseable {
 
   public TaskImpl(SinkTaskContext context, IcebergSinkConfig config) {
     this.catalog = Utilities.loadCatalog(config);
-    this.writer = new Worker(config, catalog, context);
+    this.writer = new Worker(config, catalog);
     this.committer = new CommitterImpl(context, config, catalog);
   }
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    // Poll the control topic BEFORE writing records so that any pending state changes
-    // (e.g. START_COMMIT that calls sendCommitResponse() → triggers onFlagProcessed() →
-    // resumes partitions and processes buffered post-flag records) are applied first.
-    committer.commit(writer);
     writer.write(sinkRecords);
+    committer.commit(writer);
   }
 
   @Override
