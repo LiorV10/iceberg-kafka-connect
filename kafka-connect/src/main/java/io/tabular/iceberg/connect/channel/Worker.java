@@ -280,10 +280,13 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void pauseAssignment() {
+    LOG.debug("About to pause task, context is {}", context);
     if (context != null) {
       // Always call context.assignment() fresh: the partition set can change on rebalance,
       // so caching it would risk pausing stale or missing newly assigned partitions.
+      LOG.debug("Context is about to pause for partition {}", context.assignment().stream().map(TopicPartition::partition));
       context.pause(context.assignment().toArray(new TopicPartition[0]));
+      LOG.debug("Context has paused!");
     }
   }
 
