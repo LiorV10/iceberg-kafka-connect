@@ -32,13 +32,15 @@ public class WriterResult {
   private final StructType partitionStruct;
   private final boolean fullRefreshData;
   private final boolean fullRefreshComplete;
+  /** Cycle sequence number; only meaningful when {@code fullRefreshComplete} is true, else -1. */
+  private final int fullRefreshCycleSeq;
 
   public WriterResult(
       TableIdentifier tableIdentifier,
       List<DataFile> dataFiles,
       List<DeleteFile> deleteFiles,
       StructType partitionStruct) {
-    this(tableIdentifier, dataFiles, deleteFiles, partitionStruct, false, false);
+    this(tableIdentifier, dataFiles, deleteFiles, partitionStruct, false, false, -1);
   }
 
   public WriterResult(
@@ -48,12 +50,25 @@ public class WriterResult {
       StructType partitionStruct,
       boolean fullRefreshData,
       boolean fullRefreshComplete) {
+    this(tableIdentifier, dataFiles, deleteFiles, partitionStruct, fullRefreshData,
+        fullRefreshComplete, -1);
+  }
+
+  public WriterResult(
+      TableIdentifier tableIdentifier,
+      List<DataFile> dataFiles,
+      List<DeleteFile> deleteFiles,
+      StructType partitionStruct,
+      boolean fullRefreshData,
+      boolean fullRefreshComplete,
+      int fullRefreshCycleSeq) {
     this.tableIdentifier = tableIdentifier;
     this.dataFiles = dataFiles;
     this.deleteFiles = deleteFiles;
     this.partitionStruct = partitionStruct;
     this.fullRefreshData = fullRefreshData;
     this.fullRefreshComplete = fullRefreshComplete;
+    this.fullRefreshCycleSeq = fullRefreshCycleSeq;
   }
 
   public TableIdentifier tableIdentifier() {
@@ -78,5 +93,9 @@ public class WriterResult {
 
   public boolean isFullRefreshComplete() {
     return fullRefreshComplete;
+  }
+
+  public int fullRefreshCycleSeq() {
+    return fullRefreshCycleSeq;
   }
 }

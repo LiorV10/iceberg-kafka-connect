@@ -148,7 +148,9 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
             writerResult -> {
               String catalogName = config.catalogName();
               if (writerResult.isFullRefreshComplete()) {
-                catalogName = catalogName + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX;
+                catalogName = catalogName
+                    + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX
+                    + writerResult.fullRefreshCycleSeq();
               } else if (writerResult.isFullRefreshData()) {
                 catalogName = catalogName + IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX;
               }

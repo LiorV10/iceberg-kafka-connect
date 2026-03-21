@@ -192,13 +192,27 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+    String stagingBranch = config.tablesFullRefreshStagingBranch();
+    String targetBranch = branch.orElse(SnapshotRef.MAIN_BRANCH);
 
-    // Partition envelopes into full-refresh and normal sets
-    List<Envelope> frEnvelopes =
-        envelopeList.stream().filter(this::isFullRefreshEnvelope).collect(toList());
+    // Partition envelopes into normal, partial-FR (__FR without cycle seq), and
+    // cycle-end-FR (__FREND_N with cycle seq).
     List<Envelope> normalEnvelopes =
         envelopeList.stream().filter(e -> !isFullRefreshEnvelope(e)).collect(toList());
-    boolean hasFREnd = envelopeList.stream().anyMatch(this::isFullRefreshEndEnvelope);
+    List<Envelope> frOnlyEnvelopes =
+        envelopeList.stream()
+            .filter(e -> isFullRefreshEnvelope(e) && !isFullRefreshEndEnvelope(e))
+            .collect(toList());
+    List<Envelope> frEndEnvelopes =
+        envelopeList.stream().filter(this::isFullRefreshEndEnvelope).collect(toList());
+
+    // Sorted unique cycle sequence numbers present in this commit
+    List<Integer> cycleSeqs =
+        frEndEnvelopes.stream()
+            .map(this::extractFullRefreshCycleSeq)
+            .distinct()
+            .sorted()
+            .collect(toList());
 
     // Commit normal data to the configured branch (existing behavior)
     if (!normalEnvelopes.isEmpty()) {
@@ -206,72 +220,120 @@ public class Coordinator extends Channel implements AutoCloseable {
           table, tableIdentifier, normalEnvelopes, branch.orElse(null), offsetsJson, vtts);
     }
 
-    // Commit full-refresh data to the staging branch
-    String stagingBranch = config.tablesFullRefreshStagingBranch();
-    if (!frEnvelopes.isEmpty()) {
-      commitEnvelopesToBranch(
-          table, tableIdentifier, frEnvelopes, stagingBranch, offsetsJson, vtts);
+    // Partial full-refresh data (no END-LOAD in this commit): accumulate to staging for
+    // the ongoing cycle.  These always belong to the current (lowest) cycle.
+    if (!frOnlyEnvelopes.isEmpty()) {
+      commitEnvelopesToBranch(table, tableIdentifier, frOnlyEnvelopes, stagingBranch, offsetsJson,
+          vtts);
     }
 
-    // On END-LOAD: atomically replace the main branch with the staging branch
-    if (hasFREnd) {
-      // Refresh if we didn't already do so inside commitEnvelopesToBranch
-      if (frEnvelopes.isEmpty()) {
+    // Process each full-refresh cycle in ascending order.  Each cycle commits its data files to
+    // the staging branch and then atomically promotes staging → target branch.  Because each
+    // cycle's swap removes the staging branch, subsequent cycles naturally start with a clean
+    // staging branch — so the last cycle's data is what ultimately reaches the target branch.
+    for (int cycleSeq : cycleSeqs) {
+      List<Envelope> cycleEndEnvelopes =
+          frEndEnvelopes.stream()
+              .filter(e -> extractFullRefreshCycleSeq(e) == cycleSeq)
+              .collect(toList());
+
+      if (!cycleEndEnvelopes.isEmpty()) {
+        commitEnvelopesToBranch(
+            table, tableIdentifier, cycleEndEnvelopes, stagingBranch, offsetsJson, vtts);
+      }
+
+      // Refresh before checking the staging snapshot (may have been updated above)
+      if (cycleEndEnvelopes.isEmpty()) {
         table.refresh();
       }
-      String targetBranch = branch.orElse(SnapshotRef.MAIN_BRANCH);
-      Snapshot stagingSnapshot = table.snapshot(stagingBranch);
-      if (stagingSnapshot != null) {
-        LOG.info(
-            "Full-refresh complete for table {}: replacing branch '{}' with staging branch '{}'",
-            tableIdentifier,
-            targetBranch,
-            stagingBranch);
-        ManageSnapshots manage = table.manageSnapshots();
-        if (table.refs().containsKey(targetBranch)) {
-          manage.replaceBranch(targetBranch, stagingSnapshot.snapshotId());
-        } else {
-          manage.createBranch(targetBranch, stagingSnapshot.snapshotId());
-        }
-        manage.commit();
-        table.manageSnapshots().removeBranch(stagingBranch).commit();
-        table.refresh();
+      swapStagingToMain(table, tableIdentifier, stagingBranch, targetBranch, vtts);
+    }
+  }
 
-        Long snapshotId = latestSnapshot(table, targetBranch).snapshotId();
-        Event event =
-            new Event(
-                config.controlGroupId(),
-                new CommitToTable(
-                    commitState.currentCommitId(),
-                    TableReference.of(config.catalogName(), tableIdentifier),
-                    snapshotId,
-                    vtts));
-        send(event);
-
-        LOG.info(
-            "Full-refresh commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
-            tableIdentifier,
-            snapshotId,
-            commitState.currentCommitId(),
-            vtts);
+  /**
+   * Atomically replaces {@code targetBranch} with the current tip of {@code stagingBranch} and
+   * then removes the staging branch, leaving a clean state for subsequent cycles.
+   */
+  private void swapStagingToMain(
+      Table table,
+      TableIdentifier tableIdentifier,
+      String stagingBranch,
+      String targetBranch,
+      OffsetDateTime vtts) {
+    Snapshot stagingSnapshot = table.snapshot(stagingBranch);
+    if (stagingSnapshot != null) {
+      LOG.info(
+          "Full-refresh complete for table {}: replacing branch '{}' with staging branch '{}'",
+          tableIdentifier,
+          targetBranch,
+          stagingBranch);
+      ManageSnapshots manage = table.manageSnapshots();
+      if (table.refs().containsKey(targetBranch)) {
+        manage.replaceBranch(targetBranch, stagingSnapshot.snapshotId());
       } else {
-        LOG.warn(
-            "Full-refresh END-LOAD received for table {} but staging branch '{}' has no snapshot; nothing to swap",
-            tableIdentifier,
-            stagingBranch);
+        manage.createBranch(targetBranch, stagingSnapshot.snapshotId());
       }
+      manage.commit();
+      table.manageSnapshots().removeBranch(stagingBranch).commit();
+      table.refresh();
+
+      Long snapshotId = latestSnapshot(table, targetBranch).snapshotId();
+      Event event =
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  commitState.currentCommitId(),
+                  TableReference.of(config.catalogName(), tableIdentifier),
+                  snapshotId,
+                  vtts));
+      send(event);
+
+      LOG.info(
+          "Full-refresh commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
+          tableIdentifier,
+          snapshotId,
+          commitState.currentCommitId(),
+          vtts);
+    } else {
+      LOG.warn(
+          "Full-refresh END-LOAD received for table {} but staging branch '{}' has no snapshot;"
+              + " nothing to swap",
+          tableIdentifier,
+          stagingBranch);
     }
   }
 
   private boolean isFullRefreshEnvelope(Envelope envelope) {
     String catalogName = ((DataWritten) envelope.event().payload()).tableReference().catalog();
     return catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_CATALOG_SUFFIX)
-        || catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX);
+        || catalogName.contains(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX);
   }
 
   private boolean isFullRefreshEndEnvelope(Envelope envelope) {
     String catalogName = ((DataWritten) envelope.event().payload()).tableReference().catalog();
-    return catalogName.endsWith(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX);
+    return catalogName.contains(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX);
+  }
+
+  /**
+   * Extracts the cycle sequence number from a {@code __FREND_N} catalog name suffix.
+   *
+   * @return the sequence number, or -1 if the envelope is not a full-refresh end envelope
+   */
+  private int extractFullRefreshCycleSeq(Envelope envelope) {
+    String catalogName = ((DataWritten) envelope.event().payload()).tableReference().catalog();
+    int prefixIdx =
+        catalogName.indexOf(IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX);
+    if (prefixIdx < 0) {
+      return -1;
+    }
+    String seqStr =
+        catalogName.substring(
+            prefixIdx + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX.length());
+    try {
+      return Integer.parseInt(seqStr);
+    } catch (NumberFormatException e) {
+      return -1;
+    }
   }
 
   private void commitEnvelopesToBranch(

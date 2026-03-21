@@ -85,7 +85,8 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String FULL_REFRESH_END_OP_VALUE_DEFAULT = "END-LOAD";
   private static final String FULL_REFRESH_STAGING_BRANCH_DEFAULT = "full-refresh-staging";
   public static final String FULL_REFRESH_CATALOG_SUFFIX = "__FR";
-  public static final String FULL_REFRESH_END_CATALOG_SUFFIX = "__FREND";
+  /** Prefix used to build per-cycle end-of-load markers: {@code __FREND_0}, {@code __FREND_1}, … */
+  public static final String FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX = "__FREND_";
   private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
       "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_AUTO_CREATE_ENABLED_PROP =

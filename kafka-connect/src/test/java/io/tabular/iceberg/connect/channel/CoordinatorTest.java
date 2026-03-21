@@ -478,7 +478,7 @@ public class CoordinatorTest extends ChannelTestBase {
                       ImmutableList.of(dataFile),
                       ImmutableList.of()));
 
-          // Worker 2: received the END-LOAD flag, sends empty DataWritten with __FREND suffix
+          // Worker 2: received the END-LOAD flag, sends empty DataWritten with __FREND_0 suffix
           Event frEndResponse =
               new Event(
                   config.controlGroupId(),
@@ -486,7 +486,7 @@ public class CoordinatorTest extends ChannelTestBase {
                       StructType.of(),
                       currentCommitId,
                       new TableReference(
-                          "catalog" + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX,
+                          "catalog" + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX + "0",
                           ImmutableList.of("db"),
                           "tbl"),
                       ImmutableList.of(),
@@ -520,6 +520,83 @@ public class CoordinatorTest extends ChannelTestBase {
         1,
         ImmutableList.copyOf(mainSnapshot.addedDataFiles(table.io())).size(),
         "Main branch should have exactly one data file from the full-refresh");
+  }
+
+  @Test
+  public void testMultipleCyclesInSingleCommitOnlyKeepsLastCycle() {
+    // Simulates: single commit contains [data_cycle0, END-LOAD0, data_cycle1, END-LOAD1].
+    // With flush-on-END-LOAD in IcebergWriter each cycle produces a separate __FREND_N event.
+    // The coordinator must process them in cycle-seq order; the last cycle wins.
+    DataFile dataFileCycle0 = EventTestUtil.createDataFile();
+    DataFile dataFileCycle1 = EventTestUtil.createDataFile();
+
+    coordinatorTest(
+        currentCommitId -> {
+          // Cycle 0: data + END-LOAD (flushed as __FREND_0 by IcebergWriter)
+          Event cycle0Response =
+              new Event(
+                  config.controlGroupId(),
+                  new DataWritten(
+                      StructType.of(),
+                      currentCommitId,
+                      new TableReference(
+                          "catalog"
+                              + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX
+                              + "0",
+                          ImmutableList.of("db"),
+                          "tbl"),
+                      ImmutableList.of(dataFileCycle0),
+                      ImmutableList.of()));
+
+          // Cycle 1: data + END-LOAD (flushed as __FREND_1 by IcebergWriter)
+          Event cycle1Response =
+              new Event(
+                  config.controlGroupId(),
+                  new DataWritten(
+                      StructType.of(),
+                      currentCommitId,
+                      new TableReference(
+                          "catalog"
+                              + IcebergSinkConfig.FULL_REFRESH_END_CATALOG_SUFFIX_PREFIX
+                              + "1",
+                          ImmutableList.of("db"),
+                          "tbl"),
+                      ImmutableList.of(dataFileCycle1),
+                      ImmutableList.of()));
+
+          Event commitReady =
+              new Event(
+                  config.controlGroupId(),
+                  new DataComplete(
+                      currentCommitId,
+                      ImmutableList.of(
+                          new TopicPartitionOffset(
+                              "topic",
+                              1,
+                              1L,
+                              OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC)))));
+
+          return ImmutableList.of(cycle0Response, cycle1Response, commitReady);
+        });
+
+    table.refresh();
+
+    // Staging branch should have been cleaned up after the final swap
+    Snapshot stagingSnapshot = table.snapshot("full-refresh-staging");
+    Assertions.assertNull(stagingSnapshot,
+        "Staging branch should have been removed after full-refresh swap");
+
+    // Main branch must contain ONLY the data from the LAST cycle (cycle 1), not cycle 0
+    Snapshot mainSnapshot = table.currentSnapshot();
+    Assertions.assertNotNull(mainSnapshot,
+        "Main branch should have a snapshot after full-refresh");
+    List<DataFile> mainFiles = ImmutableList.copyOf(mainSnapshot.addedDataFiles(table.io()));
+    Assertions.assertEquals(1, mainFiles.size(),
+        "Main branch should contain exactly one data file (from cycle 1 only)");
+    Assertions.assertEquals(
+        dataFileCycle1.path().toString(),
+        mainFiles.get(0).path().toString(),
+        "Main branch data file should be the one from cycle 1, not cycle 0");
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {

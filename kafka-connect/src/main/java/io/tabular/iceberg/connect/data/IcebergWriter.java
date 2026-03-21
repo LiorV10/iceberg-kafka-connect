@@ -48,6 +48,8 @@ public class IcebergWriter implements RecordWriter {
   private TaskWriter<Record> writer;
   private boolean inFullRefresh = false;
   private boolean fullRefreshComplete = false;
+  /** Monotonically increasing counter; incremented each time an END-LOAD marker is seen. */
+  private int fullRefreshCycleSeq = 0;
 
   public IcebergWriter(Table table, String tableName, IcebergSinkConfig config) {
     this.table = table;
@@ -74,8 +76,13 @@ public class IcebergWriter implements RecordWriter {
         } else if (config.fullRefreshEnabled()) {
           String opStr = extractCdcOpString(record.value(), cdcField);
           if (isFullRefreshEndOp(opStr)) {
-            // END-LOAD marker: signal full-refresh completion, do not write the record
+            // END-LOAD marker: flush this cycle's data immediately, then start a fresh writer
+            // for any subsequent cycle.  Each cycle gets a distinct cycleSeq so the coordinator
+            // can process them in order and ensure the newest cycle overwrites the older one.
             fullRefreshComplete = true;
+            flush();              // captures inFullRefresh, fullRefreshComplete, fullRefreshCycleSeq
+            fullRefreshCycleSeq++; // next cycle gets a higher sequence number
+            initNewWriter();
           } else if (isFullRefreshOp(opStr)) {
             // Full-refresh insert: write as a plain append
             inFullRefresh = true;
@@ -181,7 +188,8 @@ public class IcebergWriter implements RecordWriter {
             Arrays.asList(writeResult.deleteFiles()),
             table.spec().partitionType(),
             inFullRefresh,
-            fullRefreshComplete));
+            fullRefreshComplete,
+            fullRefreshComplete ? fullRefreshCycleSeq : -1));
 
     inFullRefresh = false;
     fullRefreshComplete = false;
