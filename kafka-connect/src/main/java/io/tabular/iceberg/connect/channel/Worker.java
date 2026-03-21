@@ -73,8 +73,8 @@ class Worker implements Writer, AutoCloseable {
    */
   private final SinkTaskContext context;
 
-  Worker(IcebergSinkConfig config, Catalog catalog) {
-    this(config, new IcebergWriterFactory(catalog, config));
+  Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
+    this(config, new IcebergWriterFactory(catalog, config), context);
   }
 
   @VisibleForTesting
@@ -132,6 +132,8 @@ class Worker implements Writer, AutoCloseable {
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
+    LOG.debug(
+        "onFlagProcessed called for table {}, current reroute: {}", tableIdentifier, this.reroute);
     if (this.reroute == null) {
       // This worker did not detect a flag — it was never paused, nothing to do.
       return;
