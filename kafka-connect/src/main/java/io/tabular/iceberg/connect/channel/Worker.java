@@ -46,6 +46,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -59,38 +60,91 @@ class Worker implements Writer, AutoCloseable {
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
+  /**
+   * When a flag record is encountered, subsequent records in the same polled batch are rerouted
+   * to this table name. Once {@link CommitterImpl} has sent the flag result to the Coordinator,
+   * it calls {@link #onFlagProcessed()} which clears this field so that newly delivered records
+   * (after partition resume) are routed normally.
+   */
   private String reroute;
+  /**
+   * The {@link SinkTaskContext} used to pause/resume source-topic partitions around a flag.
+   * May be {@code null} in unit tests that use the package-private test constructor.
+   */
+  private final SinkTaskContext context;
 
-  Worker(IcebergSinkConfig config, Catalog catalog) {
-    this(config, new IcebergWriterFactory(catalog, config));
+  Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
+    this(config, new IcebergWriterFactory(catalog, config), context);
   }
 
   @VisibleForTesting
   Worker(IcebergSinkConfig config, IcebergWriterFactory writerFactory) {
+    this(config, writerFactory, null);
+  }
+
+  @VisibleForTesting
+  Worker(IcebergSinkConfig config, IcebergWriterFactory writerFactory, SinkTaskContext context) {
     this.config = config;
     this.writerFactory = writerFactory;
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
     this.reroute = null;
+    this.context = context;
   }
 
   @Override
   public Committable committable() {
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
-    
+
     // Add flag writer results to the list
     writeResults.addAll(flagWriterResults);
-    
+
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
+
+    // If this cycle contains flag results, pause source-topic partitions now (at the batch
+    // boundary) so Kafka Connect won't deliver new records until onFlagProcessed() resumes them.
+    // We pause here rather than mid-batch (in save()) to avoid interrupting the current write.
+    if (!flagWriterResults.isEmpty()) {
+      pauseAssignment();
+    }
 
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    this.reroute = null;
+    // NOTE: do NOT clear reroute here.  Reroute must remain set across commit cycles because the
+    // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
+    // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
+    // have reported — which may happen in a subsequent commit cycle.
 
     return new Committable(offsets, writeResults);
+  }
+
+  /**
+   * Called by {@link CommitterImpl} when it receives the per-table sentinel
+   * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
+   * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
+   * partitions for a specific table and executed the flag action (e.g. branch switch).
+   * <p>
+   * Only acts when this worker is currently rerouting to {@code tableIdentifier}.  Workers for
+   * other tables, or workers that never detected a flag, are unaffected.
+   */
+  @Override
+  public void onFlagProcessed(TableIdentifier tableIdentifier) {
+    LOG.debug(
+        "onFlagProcessed called for table {}, current reroute: {}", tableIdentifier, this.reroute);
+    if (this.reroute == null) {
+      // This worker did not detect a flag — it was never paused, nothing to do.
+      return;
+    }
+    if (!TableIdentifier.parse(this.reroute).equals(tableIdentifier)) {
+      // The flag was processed for a different table; this worker's reroute is still needed.
+      return;
+    }
+    LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+    this.reroute = null;
+    resumeAssignment();
   }
 
   @Override
@@ -117,22 +171,28 @@ class Worker implements Writer, AutoCloseable {
         new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
-       // Flag records are tracked in offsets but not written to data files
-       // They will be sent to coordinator during commit to trigger branch switching
-       LOG.info("Flag record detected at topic: {}, partition: {}, offset: {}", 
-                record.topic(), record.kafkaPartition(), record.kafkaOffset());
-       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
-       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
-       TableContext context = TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
+      LOG.info(
+          "Flag record detected at topic: {}, partition: {}, offset: {}",
+          record.topic(),
+          record.kafkaPartition(),
+          record.kafkaOffset());
+      String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
+      TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
+      TableContext tableContext =
+          TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
-       String recordJson = serializeRecordToJson(record.value());
-       FlagWriterResult flagResult = new FlagWriterResult(tableIdentifier, context.branch(), recordJson);
-       flagWriterResults.add(flagResult);
+      String recordJson = serializeRecordToJson(record.value());
+      FlagWriterResult flagResult =
+          new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
+      flagWriterResults.add(flagResult);
 
-       // All records after flag should be re-routed to flag's branch
-       this.reroute = tableName;
-       
-       LOG.debug("Flag message queued for table: {}, branch: {}", context.tableIdentifier(), context.branch());
+      // Reroute any remaining same-batch records to the flag branch.  The partition will be
+      // paused at committable() time, preventing new records from arriving after this batch.
+      this.reroute = tableName;
+      LOG.info(
+          "Flag detected — rerouting same-batch records to {} (branch: {})",
+          tableContext.tableIdentifier(),
+          tableContext.branch());
     } else {
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
@@ -178,16 +238,15 @@ class Worker implements Writer, AutoCloseable {
     String routeField = config.tablesRouteField();
     Preconditions.checkNotNull(routeField, String.format("Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d", record.topic(), record.kafkaPartition(), record.kafkaOffset()));
 
+    if (this.reroute != null) {
+      LOG.debug("Rerouting record to {}", this.reroute);
+      writerForTable(this.reroute, record, true).write(record);
+      return;
+    }
+
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
-      String tableName = routeValue.toLowerCase();
-
-      if (this.reroute != null) {
-        tableName = this.reroute;
-        LOG.debug("Rerouting records from {} to {}", routeValue, tableName);
-      }
-
-      writerForTable(tableName, record, true).write(record);
+      writerForTable(routeValue.toLowerCase(), record, true).write(record);
     }
   }
 
@@ -217,6 +276,21 @@ class Worker implements Writer, AutoCloseable {
       return MAPPER.writeValueAsString(recordValue);
     } catch (JsonProcessingException e) {
       throw new UncheckedIOException(e);
+    }
+  }
+
+  private void pauseAssignment() {
+    if (context != null) {
+      // Always call context.assignment() fresh: the partition set can change on rebalance,
+      // so caching it would risk pausing stale or missing newly assigned partitions.
+      context.pause(context.assignment().toArray(new TopicPartition[0]));
+    }
+  }
+
+  private void resumeAssignment() {
+    if (context != null) {
+      // Always call context.assignment() fresh for the same reason as pauseAssignment().
+      context.resume(context.assignment().toArray(new TopicPartition[0]));
     }
   }
 

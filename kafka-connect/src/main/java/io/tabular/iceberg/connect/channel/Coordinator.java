@@ -58,6 +58,18 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final Logger LOG = LoggerFactory.getLogger(Coordinator.class);
   private static final ObjectMapper MAPPER = new ObjectMapper();
   private static final String OFFSETS_SNAPSHOT_PROP_FMT = "kafka.connect.offsets.%s.%s";
+
+  /**
+   * Sentinel commit-ID used in a per-table {@link CommitToTable} event that the Coordinator sends
+   * immediately after processing all pending flag messages (branch switches) for a specific table.
+   * {@link CommitterImpl} watches for this specific ID and calls
+   * {@link CommittableSupplier#onFlagProcessed(org.apache.iceberg.catalog.TableIdentifier)} for
+   * the matching table so that only the {@link Worker} routing to that table resumes.
+   *
+   * <p>The all-zeros UUID is safe to use as a sentinel because real commit IDs are generated with
+   * {@link UUID#randomUUID()}, making a collision statistically impossible.
+   */
+  static final UUID FLAG_PROCESSED_SENTINEL_ID = new UUID(0L, 0L);
   private static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
   private static final String VTTS_SNAPSHOT_PROP = "kafka.connect.vtts";
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
@@ -165,10 +177,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
         .stopOnFailure()
-        .run(
-            entry -> {
-              commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts);
-            });
+        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts));
 
     // we should only get here if all tables committed successfully...
     commitConsumerOffsets();
@@ -193,6 +202,11 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
+  /**
+   * Commits data and flag messages for a single table.  If flag messages were processed, sends
+   * a per-table sentinel {@link CommitToTable} event so that only workers routing to this table
+   * clear their reroute state and resume their partitions.
+   */
   private void commitToTable(
       TableIdentifier paramTableIdentifier,
       List<Envelope> envelopeList,
@@ -319,6 +333,22 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
     if (!readyFlags.isEmpty()) {
       processFlagMessages(table, readyFlags);
+      // Send a per-table sentinel CommitToTable so that only workers routing to this table's
+      // original identifier (before any branch-stripping) clear their reroute state and resume.
+      // Using FLAG_PROCESSED_SENTINEL_ID as the commitId lets CommitterImpl distinguish this
+      // sentinel from a real CommitToTable event.
+      LOG.info(
+          "Flags processed for table {} in commit {}, sending per-table resume signal",
+          paramTableIdentifier, commitState.currentCommitId());
+      Event flagSentinel =
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  FLAG_PROCESSED_SENTINEL_ID,
+                  TableReference.of(config.catalogName(), paramTableIdentifier),
+                  0L,
+                  null));
+      send(flagSentinel);
     }
   }
 
