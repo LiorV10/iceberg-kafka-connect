@@ -50,10 +50,27 @@ public class IcebergSinkTask extends SinkTask {
 
   @Override
   public void open(Collection<TopicPartition> partitions) {
+    // Clear any partition-level pause state that may have been left over from a previous task
+    // lifecycle.  The SinkTaskContext is provided by Kafka Connect and persists across
+    // open()/close() cycles (it is NOT reset when the task restarts).  If partitions were
+    // paused via context.pause() during flag processing and the connector is then resumed via
+    // the Kafka Connect REST API (PUT /connectors/{name}/resume), Kafka Connect calls stop()
+    // followed by open() on this task — but the SinkTaskContext still carries the stale pause.
+    // Without this resume call the newly created Worker (which starts with reroute=null) would
+    // never receive any records for those partitions, leaving the connector permanently stuck.
+    if (!partitions.isEmpty()) {
+      context.resume(partitions.toArray(new TopicPartition[0]));
+    }
+
     // destroy any state if KC re-uses object
     clearObjectState();
 
-    task = new TaskImpl(context, config);
+    task = createTask();
+  }
+
+  // Package-private so tests can override to avoid real Kafka/catalog connections.
+  Task createTask() {
+    return new TaskImpl(context, config);
   }
 
   @Override
