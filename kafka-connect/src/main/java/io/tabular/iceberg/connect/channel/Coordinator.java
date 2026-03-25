@@ -419,7 +419,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
     flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
-      Map<String, Object> flagRecord = flagEntry.second();
+      Map<String, Object> flagEnvelope = flagEntry.second();
+      @SuppressWarnings("unchecked")
+      Map<String, Object> flagRecord = flagEnvelope.get("value") instanceof Map
+          ? (Map<String, Object>) flagEnvelope.get("value")
+          : flagEnvelope;
       LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecordToString(flagRecord));
 
       switch (type) {

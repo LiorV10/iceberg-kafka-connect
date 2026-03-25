@@ -430,7 +430,7 @@ class DeduplicatedTest {
   }
 
   @Test
-  public void testFlagMessages_returnsValueFieldOnly() {
+  public void testFlagMessages_returnsFullEnvelope() {
     Map<String, Object> innerValue = ImmutableMap.of(FLAG_TYPE_FIELD, "END-LOAD", "extra", "data");
     DataFile flagFile = createFlagDataFile(0, "END-LOAD", innerValue);
     Envelope envelope = new Envelope(flagEvent(flagFile), 0, 100);
@@ -440,12 +440,18 @@ class DeduplicatedTest {
             ImmutableList.of(envelope), null, FLAG_TYPE_FIELD);
 
     assertThat(result).containsOnlyKeys("END-LOAD");
-    // The returned map must be the inner "value" map, not the full envelope
-    Map<String, Object> returnedValue = result.get("END-LOAD").second();
-    assertThat(returnedValue).containsEntry(FLAG_TYPE_FIELD, "END-LOAD")
-        .containsEntry("extra", "data")
-        .doesNotContainKey("topic")
-        .doesNotContainKey("partition")
-        .doesNotContainKey("offset");
+    // The returned map must be the full envelope (with topic, partition, offset, value, etc.)
+    Map<String, Object> returnedEnvelope = result.get("END-LOAD").second();
+    assertThat(returnedEnvelope)
+        .containsKey("topic")
+        .containsKey("partition")
+        .containsKey("offset")
+        .containsKey("value");
+    // The "value" sub-map holds the actual flag record
+    @SuppressWarnings("unchecked")
+    Map<String, Object> returnedValue = (Map<String, Object>) returnedEnvelope.get("value");
+    assertThat(returnedValue)
+        .containsEntry(FLAG_TYPE_FIELD, "END-LOAD")
+        .containsEntry("extra", "data");
   }
 }

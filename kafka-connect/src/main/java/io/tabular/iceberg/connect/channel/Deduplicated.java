@@ -28,7 +28,6 @@ import io.tabular.iceberg.connect.data.FlagWriterResult;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -117,10 +116,10 @@ class Deduplicated {
    * Returns all flag messages from the batch of envelopes, deduplicated by flag type.
    * Flag messages are identified by containing sentinel data files with paths starting with
    * {@link FlagWriterResult#FLAG_PREFIX}.
-   * The record value is deserialized from the JSON embedded in the DataFile path.
+   * The full flag envelope is deserialized from the JSON embedded in the DataFile path.
    * The map key is the flag type (extracted from the record using {@code flagTypeField}),
-   * and the map value is a pair of the {@link TableContext} and the record <em>value</em> only
-   * (the {@code "value"} field of the serialized envelope — not the full envelope).
+   * and the map value is a pair of the {@link TableContext} and the full flag envelope as a map
+   * (callers are responsible for extracting the {@code "value"} field when processing the flag).
    *
    * <p>In a multi-task deployment the producer broadcasts the same flag to every Kafka
    * partition so that every task sees it, sets its own reroute, and reports a
@@ -129,7 +128,6 @@ class Deduplicated {
    * copies by flag type, keeping the first occurrence, so the Coordinator processes each
    * logical flag exactly once.
    */
-  @SuppressWarnings("unchecked")
   public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
       UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
       String flagTypeField) {
@@ -151,14 +149,9 @@ class Deduplicated {
                   String recordJson = dataWritten.dataFiles().stream().findFirst().get()
                       .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
                   Map<String, Object> envelope = parseRecordJson(recordJson);
-                  Object valueObj = envelope.get("value");
-                  Map<String, Object> recordValue =
-                      valueObj instanceof Map
-                          ? (Map<String, Object>) valueObj
-                          : Collections.emptyMap();
                   TableContext tableContext = TableContext.parse(
                       dataWritten.tableReference().identifier(), regex);
-                  return Pair.of(tableContext, recordValue);
+                  return Pair.of(tableContext, envelope);
                 },
                 // Deduplicate: when the same flag type is reported by multiple tasks (one per
                 // partition in a broadcast scenario) keep the first occurrence and discard the rest.
