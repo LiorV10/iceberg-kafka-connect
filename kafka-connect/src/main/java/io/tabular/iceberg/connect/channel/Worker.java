@@ -181,7 +181,7 @@ class Worker implements Writer, AutoCloseable {
       TableContext tableContext =
           TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
 
-      String recordJson = serializeRecordToJson(record.value());
+      String recordJson = serializeRecordToJson(record);
       FlagWriterResult flagResult =
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
@@ -263,20 +263,32 @@ class Worker implements Writer, AutoCloseable {
     return value == null ? null : value.toString();
   }
 
-  private String serializeRecordToJson(Object recordValue) {
+  private String serializeRecordToJson(SinkRecord record) {
     try {
-      if (recordValue instanceof Map) {
-        return MAPPER.writeValueAsString(recordValue);
-      } else if (recordValue instanceof Struct) {
-        Struct struct = (Struct) recordValue;
-        Map<String, Object> map = new LinkedHashMap<>();
-        struct.schema().fields().forEach(field -> map.put(field.name(), struct.get(field)));
-        return MAPPER.writeValueAsString(map);
-      }
-      return MAPPER.writeValueAsString(recordValue);
+      Map<String, Object> envelope = new LinkedHashMap<>();
+      envelope.put("topic", record.topic());
+      envelope.put("partition", record.kafkaPartition());
+      envelope.put("offset", record.kafkaOffset());
+      envelope.put("timestamp", record.timestamp());
+      envelope.put("key", record.key() != null ? record.key().toString() : null);
+      envelope.put("value", flattenValue(record.value()));
+      return MAPPER.writeValueAsString(envelope);
     } catch (JsonProcessingException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  @SuppressWarnings("unchecked")
+  private Object flattenValue(Object recordValue) {
+    if (recordValue instanceof Struct) {
+      Struct struct = (Struct) recordValue;
+      Map<String, Object> map = new LinkedHashMap<>();
+      struct.schema().fields().forEach(field -> map.put(field.name(), struct.get(field)));
+      return map;
+    } else if (recordValue instanceof Map) {
+      return new LinkedHashMap<>((Map<String, Object>) recordValue);
+    }
+    return recordValue;
   }
 
   private void pauseAssignment() {

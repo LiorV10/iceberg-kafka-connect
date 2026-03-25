@@ -28,6 +28,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.data.IcebergWriter;
@@ -100,10 +102,45 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that when a flag record is encountered, the worker pauses all assigned
-   * source-topic partitions via {@link SinkTaskContext#pause} at {@code committable()} time
-   * (not immediately in {@code write()}).
+   * Verifies that the serialized flag JSON includes key, topic, partition, offset,
+   * timestamp, and value — not just the record value — when the value is a Map.
    */
+  @Test
+  public void testFlagJsonIncludesRecordMetadata() throws Exception {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    String flagKey = FLAG_PREFIX + "end";
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 3, null, flagKey, null, flagValue, 42L);
+    worker.write(ImmutableList.of(flagRec));
+
+    WriterResult result = worker.committable().writerResults().get(0);
+    assertThat(result).isInstanceOf(FlagWriterResult.class);
+
+    // The data file path is "__flag__" + recordJson
+    String path = result.dataFiles().get(0).path().toString();
+    assertThat(path).startsWith(FlagWriterResult.FLAG_PREFIX);
+
+    String json = path.substring(FlagWriterResult.FLAG_PREFIX.length());
+    JsonNode node = new ObjectMapper().readTree(json);
+
+    assertThat(node.get("topic").asText()).isEqualTo(SRC_TOPIC_NAME);
+    assertThat(node.get("partition").asInt()).isEqualTo(3);
+    assertThat(node.get("offset").asLong()).isEqualTo(42L);
+    assertThat(node.get("key").asText()).isEqualTo(flagKey);
+    assertThat(node.has("timestamp")).isTrue();
+    // value is a Map — its fields should be present under "value"
+    assertThat(node.get("value").get(FIELD_NAME).asText()).isEqualTo(TABLE_NAME);
+  }
+
+
   @Test
   public void testWorkerPausesWhenFlagDetected() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
