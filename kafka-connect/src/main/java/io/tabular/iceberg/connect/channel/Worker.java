@@ -32,10 +32,8 @@ import io.tabular.iceberg.connect.data.Utilities;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.Collection;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -60,17 +58,7 @@ class Worker implements Writer, AutoCloseable {
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
-  /**
-   * When a flag record is encountered, subsequent records in the same polled batch are rerouted
-   * to this table name. Once {@link CommitterImpl} has sent the flag result to the Coordinator,
-   * it calls {@link #onFlagProcessed()} which clears this field so that newly delivered records
-   * (after partition resume) are routed normally.
-   */
-  private String reroute;
-  /**
-   * The {@link SinkTaskContext} used to pause/resume source-topic partitions around a flag.
-   * May be {@code null} in unit tests that use the package-private test constructor.
-   */
+  private boolean isPaused;
   private final SinkTaskContext context;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
@@ -89,12 +77,14 @@ class Worker implements Writer, AutoCloseable {
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
-    this.reroute = null;
+    this.isPaused = false;
     this.context = context;
   }
 
   @Override
   public Committable committable() {
+    LOG.debug("About to commit latest records");
+
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
 
@@ -103,13 +93,6 @@ class Worker implements Writer, AutoCloseable {
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
-    // If this cycle contains flag results, pause source-topic partitions now (at the batch
-    // boundary) so Kafka Connect won't deliver new records until onFlagProcessed() resumes them.
-    // We pause here rather than mid-batch (in save()) to avoid interrupting the current write.
-    if (!flagWriterResults.isEmpty()) {
-      pauseAssignment();
-    }
-
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
@@ -117,6 +100,8 @@ class Worker implements Writer, AutoCloseable {
     // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
     // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
     // have reported — which may happen in a subsequent commit cycle.
+
+    LOG.debug("Committing {} records", writeResults.size());
 
     return new Committable(offsets, writeResults);
   }
@@ -132,18 +117,12 @@ class Worker implements Writer, AutoCloseable {
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
-    LOG.debug(
-        "onFlagProcessed called for table {}, current reroute: {}", tableIdentifier, this.reroute);
-    if (this.reroute == null) {
+    if (!this.isPaused) {
       // This worker did not detect a flag — it was never paused, nothing to do.
       return;
     }
-    if (!TableIdentifier.parse(this.reroute).equals(tableIdentifier)) {
-      // The flag was processed for a different table; this worker's reroute is still needed.
-      return;
-    }
+
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
-    this.reroute = null;
     resumeAssignment();
   }
 
@@ -153,7 +132,7 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    this.reroute = null;
+    this.isPaused = false;
   }
 
   @Override
@@ -164,11 +143,12 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void save(SinkRecord record) {
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-        new TopicPartition(record.topic(), record.kafkaPartition()),
-        new Offset(record.kafkaOffset() + 1, record.timestamp()));
+    if (this.isPaused) {
+      LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
+              record.kafkaOffset(), record.topic(), record.kafkaPartition());
+
+      return;
+    }
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
@@ -186,14 +166,19 @@ class Worker implements Writer, AutoCloseable {
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
 
-      // Reroute any remaining same-batch records to the flag branch.  The partition will be
-      // paused at committable() time, preventing new records from arriving after this batch.
-      this.reroute = tableName;
+      // The partition will be paused at committable() time, preventing new records from arriving after this batch.
+      pauseAssignment(record.kafkaPartition());
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
+      // the consumer stores the offsets that corresponds to the next record to consume,
+      // so increment the record offset by one
+      sourceOffsets.put(
+              new TopicPartition(record.topic(), record.kafkaPartition()),
+              new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
@@ -238,15 +223,10 @@ class Worker implements Writer, AutoCloseable {
     String routeField = config.tablesRouteField();
     Preconditions.checkNotNull(routeField, String.format("Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d", record.topic(), record.kafkaPartition(), record.kafkaOffset()));
 
-    if (this.reroute != null) {
-      LOG.debug("Rerouting record to {}", this.reroute);
-      writerForTable(this.reroute, record, true).write(record);
-      return;
-    }
-
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {
-      writerForTable(routeValue.toLowerCase(), record, true).write(record);
+      String tableName = routeValue.toLowerCase();
+      writerForTable(tableName, record, true).write(record);
     }
   }
 
@@ -291,14 +271,16 @@ class Worker implements Writer, AutoCloseable {
     return recordValue;
   }
 
-  private void pauseAssignment() {
+  private void pauseAssignment(Integer flagPartition) {
     LOG.debug("About to pause task, context is {}", context);
     if (context != null) {
-      // Always call context.assignment() fresh: the partition set can change on rebalance,
-      // so caching it would risk pausing stale or missing newly assigned partitions.
-      LOG.debug("Context is about to pause for partition {}", context.assignment().stream().map(TopicPartition::partition));
-      context.pause(context.assignment().toArray(new TopicPartition[0]));
-      LOG.debug("Context has paused!");
+      TopicPartition[] partitions = context.assignment().stream()
+              .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
+              .toArray(TopicPartition[]::new);
+
+      context.pause(partitions);
+      this.isPaused = true;
+      LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
     }
   }
 
@@ -306,6 +288,7 @@ class Worker implements Writer, AutoCloseable {
     if (context != null) {
       // Always call context.assignment() fresh for the same reason as pauseAssignment().
       context.resume(context.assignment().toArray(new TopicPartition[0]));
+      this.isPaused = false;
     }
   }
 

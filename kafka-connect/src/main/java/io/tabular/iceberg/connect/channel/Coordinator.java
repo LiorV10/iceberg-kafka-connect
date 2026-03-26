@@ -362,6 +362,8 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
     Map<String, Set<Integer>> partitionsThisCycle =
         Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
+    LOG.debug("Accumulating {} flags", partitionsThisCycle.size());
+
     if (partitionsThisCycle.isEmpty()) {
       return;
     }
