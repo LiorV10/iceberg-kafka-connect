@@ -95,10 +95,10 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final ExecutorService exec;
   private final CommitState commitState;
 
-  // Accumulated vote counts per table per flag type across commit cycles.
-  // Keyed by table identifier → (flag type → number of flag DataWritten events seen so far).
-  // One DataWritten event = one source partition's flag record (broadcast copy).
-  private final Map<TableIdentifier, Map<String, Integer>> pendingFlagVotes = Maps.newHashMap();
+  // Accumulated voted source partitions per table per flag type across commit cycles.
+  // Keyed by table identifier → (flag type → set of source partition numbers that have reported).
+  // Using a Set ensures a given partition can only be counted once, even across retries.
+  private final Map<TableIdentifier, Map<String, Set<Integer>>> pendingFlagVotes = Maps.newHashMap();
   // First-seen flag payload per table per flag type, held until the vote count is complete.
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
@@ -360,42 +360,45 @@ public class Coordinator extends Channel implements AutoCloseable {
    * {@link #pendingFlagData}.
    */
   private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
-    Map<String, Integer> votesThisCycle =
-        Deduplicated.flagMessageVoteCounts(envelopes, this.config.flagTypeField());
-    if (votesThisCycle.isEmpty()) {
+    Map<String, Set<Integer>> partitionsThisCycle =
+        Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
+    if (partitionsThisCycle.isEmpty()) {
       return;
     }
     Map<String, Pair<TableContext, Map<String, Object>>> dataThisCycle =
         Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
             envelopes, this.config.branchesRegexDelimiter(), this.config.flagTypeField());
 
-    Map<String, Integer> votes =
+    Map<String, Set<Integer>> votes =
         pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
     Map<String, Pair<TableContext, Map<String, Object>>> data =
         pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
 
-    votesThisCycle.forEach((type, count) -> {
-      int newTotal = votes.merge(type, count, Integer::sum);
+    partitionsThisCycle.forEach((type, newPartitions) -> {
+      Set<Integer> accumulated =
+          votes.computeIfAbsent(type, k -> new HashSet<>());
+      accumulated.addAll(newPartitions);
       data.putIfAbsent(type, dataThisCycle.get(type));
-      LOG.info("Flag '{}' for table {}: accumulated {}/{} partition votes",
-          type, tableIdentifier, newTotal, totalPartitionCount);
+      LOG.info("Flag '{}' for table {}: accumulated {}/{} unique partition votes (partitions: {})",
+          type, tableIdentifier, accumulated.size(), totalPartitionCount, accumulated);
     });
   }
 
   /**
    * Returns and removes all flag types for {@code tableIdentifier} that have accumulated
-   * a vote from every source partition (vote count {@code >= totalPartitionCount}).
-   * Because the flag is broadcast to all N source partitions, N DataWritten events
-   * (one per partition) must arrive before the flag is safe to process.
+   * a vote from every source partition (unique partition count {@code >= totalPartitionCount}).
+   * Because the flag is broadcast to all N source partitions, N distinct source partitions
+   * must report before the flag is safe to process.
    */
   private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
       TableIdentifier tableIdentifier) {
-    Map<String, Integer> votes = pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
+    Map<String, Set<Integer>> votes =
+        pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
     Map<String, Pair<TableContext, Map<String, Object>>> data =
         pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
     List<String> readyTypes = votes.entrySet().stream()
-        .filter(e -> e.getValue() >= totalPartitionCount)
+        .filter(e -> e.getValue().size() >= totalPartitionCount)
         .map(Map.Entry::getKey)
         .collect(toList());
 
@@ -416,7 +419,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
     flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
-      Map<String, Object> flagRecord = flagEntry.second();
+      Map<String, Object> flagEnvelope = flagEntry.second();
+      @SuppressWarnings("unchecked")
+      Map<String, Object> flagRecord = flagEnvelope.get("value") instanceof Map
+          ? (Map<String, Object>) flagEnvelope.get("value")
+          : flagEnvelope;
       LOG.debug("About to process flag of type {} for: {}, record: {}", type, flagMessage.tableIdentifier().toString(), flagRecordToString(flagRecord));
 
       switch (type) {

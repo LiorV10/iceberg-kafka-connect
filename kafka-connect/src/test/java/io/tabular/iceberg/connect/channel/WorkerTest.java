@@ -28,6 +28,8 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.data.IcebergWriter;
@@ -100,10 +102,45 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that when a flag record is encountered, the worker pauses all assigned
-   * source-topic partitions via {@link SinkTaskContext#pause} at {@code committable()} time
-   * (not immediately in {@code write()}).
+   * Verifies that the serialized flag JSON includes key, topic, partition, offset,
+   * timestamp, and value — not just the record value — when the value is a Map.
    */
+  @Test
+  public void testFlagJsonIncludesRecordMetadata() throws Exception {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    String flagKey = FLAG_PREFIX + "end";
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 3, null, flagKey, null, flagValue, 42L);
+    worker.write(ImmutableList.of(flagRec));
+
+    WriterResult result = worker.committable().writerResults().get(0);
+    assertThat(result).isInstanceOf(FlagWriterResult.class);
+
+    // The data file path is "__flag__" + recordJson
+    String path = result.dataFiles().get(0).path().toString();
+    assertThat(path).startsWith(FlagWriterResult.FLAG_PREFIX);
+
+    String json = path.substring(FlagWriterResult.FLAG_PREFIX.length());
+    JsonNode node = new ObjectMapper().readTree(json);
+
+    assertThat(node.get("topic").asText()).isEqualTo(SRC_TOPIC_NAME);
+    assertThat(node.get("partition").asInt()).isEqualTo(3);
+    assertThat(node.get("offset").asLong()).isEqualTo(42L);
+    assertThat(node.get("key").asText()).isEqualTo(flagKey);
+    assertThat(node.has("timestamp")).isTrue();
+    // value is a Map — its fields should be present under "value"
+    assertThat(node.get("value").get(FIELD_NAME).asText()).isEqualTo(TABLE_NAME);
+  }
+
+
   @Test
   public void testWorkerPausesWhenFlagDetected() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
@@ -172,6 +209,186 @@ public class WorkerTest {
     // Post-flag record must be written immediately, but to the rerouted (flag) table, not "db.other"
     verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
     verify(writerFactory, never()).createWriter(eq(otherTable), any(), anyBoolean());
+  }
+
+  /**
+   * Verifies that the flag record's offset is NOT included in the committable before the flag
+   * has been processed.  The offset should remain pending until {@link Worker#onFlagProcessed}
+   * is called so that a pod crash before processing causes the flag to be re-read on restart.
+   */
+  @Test
+  public void testFlagOffsetNotCommittedBeforeOnFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 5L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // The committable must NOT contain an offset for the flag partition —
+    // the flag offset must be deferred until onFlagProcessed().
+    Committable committable = worker.committable();
+    assertThat(committable.offsetsByTopicPartition())
+        .as("Flag offset must not appear in committable before the flag is processed")
+        .isEmpty();
+  }
+
+  /**
+   * Verifies that post-flag records (in the same batch as the flag) do NOT advance
+   * {@code sourceOffsets} past the flag position.  Their offsets must be deferred to
+   * {@code pendingFlagOffsets} so that a pod crash (before {@link Worker#onFlagProcessed}
+   * is called) rewinds the consumer to <em>before</em> the flag, not past it.
+   *
+   * <p>This is the core crash-recovery guarantee: even if the flag plus post-flag records
+   * arrive together, the committed offset must stay at the last pre-flag record so the flag
+   * is always re-read on restart.
+   */
+  @Test
+  public void testPostFlagRecordsOffsetsDeferredWhenRerouteActive() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    Worker worker = new Worker(config, writerFactory);
+
+    // Pre-flag record at offset 99 → sourceOffsets[P0] = 100
+    SinkRecord preRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key-pre", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 99L);
+    // Flag record at offset 100
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 100L);
+    // Post-flag records at offsets 101 and 102 — these must NOT advance sourceOffsets past 100
+    SinkRecord postRec1 =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key-post1", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 101L);
+    SinkRecord postRec2 =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key-post2", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 102L);
+
+    worker.write(ImmutableList.of(preRec, flagRec, postRec1, postRec2));
+
+    // The committable's sourceOffsets must reflect ONLY the pre-flag record (offset 100),
+    // not the post-flag records (101 or 102).  This means on crash the consumer is rewound
+    // to offset 100 (the flag itself), so the flag is re-read.
+    Committable committable = worker.committable();
+    assertThat(committable.offsetsByTopicPartition())
+        .as("Committable offsets must only contain the pre-flag offset")
+        .containsKey(tp);
+    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
+        .as("Offset must be 100 (one past pre-flag record at 99), not past the flag")
+        .isEqualTo(100L);
+  }
+
+  /**
+   * Simulates crash recovery when a flag was in a batch together with post-flag records.
+   * After the simulated crash (fresh Worker), the flag is re-read and a subsequent
+   * {@link Worker#committable()} call must include the flag result — verifying that
+   * "committable is never called (with flag data)" is fixed.
+   */
+  @Test
+  public void testCrashRecoveryFlagRereadWithPostFlagRecords() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    // --- Run 1: flag + post-flag records arrive, pod crashes before onFlagProcessed ---
+    Worker worker1 = new Worker(config, writerFactory);
+
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 100L);
+    SinkRecord postRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key-post", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 101L);
+
+    worker1.write(ImmutableList.of(flagRec, postRec));
+
+    // The committed offset after committable() is the PRE-flag sourceOffsets value (empty here
+    // since no pre-flag records), so on crash the consumer rewinds to before offset 100.
+    Committable run1Committable = worker1.committable();
+    // sourceOffsets is empty (no pre-flag records in this run), so committed offset for P0 is null.
+    // This means the consumer group will stay at its previous committed value (before offset 100),
+    // and the flag at 100 will be re-read on restart.
+    assertThat(run1Committable.offsetsByTopicPartition())
+        .as("No pre-flag sourceOffset: committed map must be empty (flag offset deferred)")
+        .isEmpty();
+
+    // --- Run 2 (after crash): flag is re-read from offset 100 ---
+    Worker worker2 = new Worker(config, writerFactory);
+
+    // Re-read the same flag record (as crash recovery would deliver it again)
+    worker2.write(ImmutableList.of(flagRec));
+
+    // committable() MUST now include the flag result — this is what was broken before the fix
+    Committable run2Committable = worker2.committable();
+    assertThat(run2Committable.writerResults())
+        .as("Flag result must be present in committable after crash recovery re-read")
+        .hasSize(1)
+        .allMatch(r -> r instanceof io.tabular.iceberg.connect.data.FlagWriterResult);
+  }
+
+  /**
+   * Verifies that after {@link Worker#onFlagProcessed} is called for the matching table,
+   * the flag record's offset is moved to sourceOffsets and appears in the next committable.
+   * This ensures the offset is committed to the control group only after the Coordinator
+   * has executed the flag action.
+   */
+  @Test
+  public void testFlagOffsetAppearsInCommittableAfterOnFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 5L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // First committable: flag offset must be absent
+    worker.committable();
+
+    // Coordinator signals flag processed — pending offset moves to sourceOffsets
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    // Next committable must contain the flag partition's offset
+    Committable nextCommittable = worker.committable();
+    assertThat(nextCommittable.offsetsByTopicPartition())
+        .as("Flag offset must appear in committable after onFlagProcessed()")
+        .containsKey(tp);
+    assertThat(nextCommittable.offsetsByTopicPartition().get(tp).offset())
+        .as("Offset must be one past the flag record offset")
+        .isEqualTo(6L);
   }
 
   /**
