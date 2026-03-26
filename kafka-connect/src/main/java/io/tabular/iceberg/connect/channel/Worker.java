@@ -61,6 +61,14 @@ class Worker implements Writer, AutoCloseable {
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
   /**
+   * Offsets for flag records that have been seen but not yet processed by the Coordinator.
+   * These are NOT added to {@link #sourceOffsets} until {@link #onFlagProcessed(TableIdentifier)}
+   * is called, so that the offsets are only committed to the control group <em>after</em> the
+   * Coordinator has executed the flag action (e.g. branch switch).  This ensures that if the pod
+   * crashes before the flag is fully processed, the flag record will be re-read on restart.
+   */
+  private final Map<TopicPartition, Offset> pendingFlagOffsets;
+  /**
    * When a flag record is encountered, subsequent records in the same polled batch are rerouted
    * to this table name. Once {@link CommitterImpl} has sent the flag result to the Coordinator,
    * it calls {@link #onFlagProcessed()} which clears this field so that newly delivered records
@@ -89,6 +97,7 @@ class Worker implements Writer, AutoCloseable {
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
+    this.pendingFlagOffsets = Maps.newHashMap();
     this.reroute = null;
     this.context = context;
   }
@@ -113,10 +122,10 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear reroute here.  Reroute must remain set across commit cycles because the
-    // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
-    // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
-    // have reported — which may happen in a subsequent commit cycle.
+    // NOTE: do NOT clear reroute or pendingFlagOffsets here.  Both must survive across commit
+    // cycles: reroute stays active until onFlagProcessed() clears it, and pendingFlagOffsets
+    // entries are moved to sourceOffsets in onFlagProcessed() so that the flag partition offset
+    // is committed only after the Coordinator has executed the flag action.
 
     return new Committable(offsets, writeResults);
   }
@@ -143,6 +152,12 @@ class Worker implements Writer, AutoCloseable {
       return;
     }
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+    // Move the pending flag offsets into sourceOffsets so they are included in the next
+    // committable() and committed to the control group.  This defers the flag partition's
+    // offset commitment until after the Coordinator has executed the flag action, ensuring
+    // that a pod crash before this point will cause the flag to be re-read on restart.
+    sourceOffsets.putAll(pendingFlagOffsets);
+    pendingFlagOffsets.clear();
     this.reroute = null;
     resumeAssignment();
   }
@@ -153,6 +168,7 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
+    pendingFlagOffsets.clear();
     this.reroute = null;
   }
 
@@ -164,18 +180,19 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void save(SinkRecord record) {
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-        new TopicPartition(record.topic(), record.kafkaPartition()),
-        new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
           "Flag record detected at topic: {}, partition: {}, offset: {}",
           record.topic(),
           record.kafkaPartition(),
           record.kafkaOffset());
+      // Store the flag partition offset in pendingFlagOffsets instead of sourceOffsets so that
+      // it is committed to the control group only after onFlagProcessed() confirms the Coordinator
+      // has executed the flag action.  This guarantees crash recovery re-reads the flag record.
+      pendingFlagOffsets.put(
+          new TopicPartition(record.topic(), record.kafkaPartition()),
+          new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
       TableContext tableContext =
@@ -194,6 +211,12 @@ class Worker implements Writer, AutoCloseable {
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
+      // the consumer stores the offsets that correspond to the next record to consume,
+      // so increment the record offset by one
+      sourceOffsets.put(
+          new TopicPartition(record.topic(), record.kafkaPartition()),
+          new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
@@ -296,7 +319,7 @@ class Worker implements Writer, AutoCloseable {
     if (context != null) {
       // Always call context.assignment() fresh: the partition set can change on rebalance,
       // so caching it would risk pausing stale or missing newly assigned partitions.
-      LOG.debug("Context is about to pause for partition {}", context.assignment().stream().map(TopicPartition::partition));
+      LOG.debug("Context is about to pause for partition {}", context.assignment().stream().map(TopicPartition::partition).collect(java.util.stream.Collectors.toList()));
       context.pause(context.assignment().toArray(new TopicPartition[0]));
       LOG.debug("Context has paused!");
     }

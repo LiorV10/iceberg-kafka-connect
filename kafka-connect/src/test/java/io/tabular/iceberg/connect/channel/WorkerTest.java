@@ -212,6 +212,75 @@ public class WorkerTest {
   }
 
   /**
+   * Verifies that the flag record's offset is NOT included in the committable before the flag
+   * has been processed.  The offset should remain pending until {@link Worker#onFlagProcessed}
+   * is called so that a pod crash before processing causes the flag to be re-read on restart.
+   */
+  @Test
+  public void testFlagOffsetNotCommittedBeforeOnFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 5L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // The committable must NOT contain an offset for the flag partition —
+    // the flag offset must be deferred until onFlagProcessed().
+    Committable committable = worker.committable();
+    assertThat(committable.offsetsByTopicPartition())
+        .as("Flag offset must not appear in committable before the flag is processed")
+        .isEmpty();
+  }
+
+  /**
+   * Verifies that after {@link Worker#onFlagProcessed} is called for the matching table,
+   * the flag record's offset is moved to sourceOffsets and appears in the next committable.
+   * This ensures the offset is committed to the control group only after the Coordinator
+   * has executed the flag action.
+   */
+  @Test
+  public void testFlagOffsetAppearsInCommittableAfterOnFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec = new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 5L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // First committable: flag offset must be absent
+    worker.committable();
+
+    // Coordinator signals flag processed — pending offset moves to sourceOffsets
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    // Next committable must contain the flag partition's offset
+    Committable nextCommittable = worker.committable();
+    assertThat(nextCommittable.offsetsByTopicPartition())
+        .as("Flag offset must appear in committable after onFlagProcessed()")
+        .containsKey(tp);
+    assertThat(nextCommittable.offsetsByTopicPartition().get(tp).offset())
+        .as("Offset must be one past the flag record offset")
+        .isEqualTo(6L);
+  }
+
+  /**
    * Verifies that {@link Worker#onFlagProcessed} is a no-op for a worker that never detected
    * a flag, regardless of which table is passed.
    */
