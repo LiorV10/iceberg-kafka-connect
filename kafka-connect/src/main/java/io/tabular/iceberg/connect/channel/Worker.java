@@ -212,10 +212,20 @@ class Worker implements Writer, AutoCloseable {
           tableContext.branch());
     } else {
       // the consumer stores the offsets that correspond to the next record to consume,
-      // so increment the record offset by one
-      sourceOffsets.put(
-          new TopicPartition(record.topic(), record.kafkaPartition()),
-          new Offset(record.kafkaOffset() + 1, record.timestamp()));
+      // so increment the record offset by one.
+      // If we are currently in a rerouted (post-flag) window, the offset goes to
+      // pendingFlagOffsets so the flag partition's control-group offset is NOT advanced
+      // past the flag record.  This guarantees that a pod crash before onFlagProcessed()
+      // always rewinds the consumer to the flag (or before it), so the flag is re-read.
+      if (this.reroute != null) {
+        pendingFlagOffsets.put(
+            new TopicPartition(record.topic(), record.kafkaPartition()),
+            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+      } else {
+        sourceOffsets.put(
+            new TopicPartition(record.topic(), record.kafkaPartition()),
+            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+      }
 
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
