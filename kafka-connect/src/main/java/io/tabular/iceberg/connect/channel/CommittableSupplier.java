@@ -27,8 +27,8 @@ interface CommittableSupplier {
    * Called by {@link CommitterImpl} when it receives the per-table sentinel
    * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
    * after collecting flag votes from <em>all</em> source partitions for a specific table and
-   * executing the flag action (e.g. branch switch).  Only workers whose {@code reroute} table
-   * matches {@code tableIdentifier} need to act; others are unaffected.
+   * executing the flag action (e.g. branch switch).  Only workers that have a pending flag for
+   * {@code tableIdentifier} need to act; others are unaffected.
    *
    * <p>The default implementation is a no-op so that anonymous/lambda suppliers used in tests and
    * the CommitterImpl constructor do not need to implement it.

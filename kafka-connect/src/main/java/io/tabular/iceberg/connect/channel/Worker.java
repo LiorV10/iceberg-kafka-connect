@@ -66,15 +66,20 @@ class Worker implements Writer, AutoCloseable {
    * is called, so that the offsets are only committed to the control group <em>after</em> the
    * Coordinator has executed the flag action (e.g. branch switch).  This ensures that if the pod
    * crashes before the flag is fully processed, the flag record will be re-read on restart.
+   *
+   * <p>Any same-batch records that arrive <em>after</em> the flag on the same partition also have
+   * their offsets deferred here (checked via {@link #pendingFlagOffsets} key-presence), so the
+   * committed control-group offset never advances past the flag until the coordinator confirms.
    */
   private final Map<TopicPartition, Offset> pendingFlagOffsets;
   /**
-   * When a flag record is encountered, subsequent records in the same polled batch are rerouted
-   * to this table name. Once {@link CommitterImpl} has sent the flag result to the Coordinator,
-   * it calls {@link #onFlagProcessed()} which clears this field so that newly delivered records
-   * (after partition resume) are routed normally.
+   * The table identifier of the flag that is currently pending coordinator confirmation.
+   * Set when a flag record is detected in {@link #save} and cleared in
+   * {@link #onFlagProcessed(TableIdentifier)}.  Used only for per-table filtering in
+   * {@code onFlagProcessed} — unlike the old {@code reroute} field, it does NOT alter the
+   * routing of subsequent data records; those always go to their natural destination.
    */
-  private String reroute;
+  private TableIdentifier pendingFlagTable;
   /**
    * The {@link SinkTaskContext} used to pause/resume source-topic partitions around a flag.
    * May be {@code null} in unit tests that use the package-private test constructor.
@@ -98,7 +103,7 @@ class Worker implements Writer, AutoCloseable {
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
     this.pendingFlagOffsets = Maps.newHashMap();
-    this.reroute = null;
+    this.pendingFlagTable = null;
     this.context = context;
   }
 
@@ -112,20 +117,14 @@ class Worker implements Writer, AutoCloseable {
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
-    // If this cycle contains flag results, pause source-topic partitions now (at the batch
-    // boundary) so Kafka Connect won't deliver new records until onFlagProcessed() resumes them.
-    // We pause here rather than mid-batch (in save()) to avoid interrupting the current write.
-    if (!flagWriterResults.isEmpty()) {
-      pauseAssignment();
-    }
+    // NOTE: do NOT clear pendingFlagTable or pendingFlagOffsets here.  Both must survive across
+    // commit cycles: pendingFlagTable stays set until onFlagProcessed() confirms the coordinator
+    // has acted on the flag, and pendingFlagOffsets entries are moved to sourceOffsets in
+    // onFlagProcessed() so that the flag partition offset is committed only after that point.
 
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear reroute or pendingFlagOffsets here.  Both must survive across commit
-    // cycles: reroute stays active until onFlagProcessed() clears it, and pendingFlagOffsets
-    // entries are moved to sourceOffsets in onFlagProcessed() so that the flag partition offset
-    // is committed only after the Coordinator has executed the flag action.
 
     return new Committable(offsets, writeResults);
   }
@@ -136,29 +135,32 @@ class Worker implements Writer, AutoCloseable {
    * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
    * partitions for a specific table and executed the flag action (e.g. branch switch).
    * <p>
-   * Only acts when this worker is currently rerouting to {@code tableIdentifier}.  Workers for
+   * Only acts when this worker has a pending flag for {@code tableIdentifier}.  Workers for
    * other tables, or workers that never detected a flag, are unaffected.
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
     LOG.debug(
-        "onFlagProcessed called for table {}, current reroute: {}", tableIdentifier, this.reroute);
-    if (this.reroute == null) {
+        "onFlagProcessed called for table {}, pending flag table: {}",
+        tableIdentifier,
+        this.pendingFlagTable);
+    if (this.pendingFlagTable == null) {
       // This worker did not detect a flag — it was never paused, nothing to do.
       return;
     }
-    if (!TableIdentifier.parse(this.reroute).equals(tableIdentifier)) {
-      // The flag was processed for a different table; this worker's reroute is still needed.
+    if (!this.pendingFlagTable.equals(tableIdentifier)) {
+      // The flag was processed for a different table; this worker is still waiting for its own.
       return;
     }
-    LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+    LOG.debug(
+        "Flag-processed signal received for table {}, clearing pending flag", tableIdentifier);
     // Move the pending flag offsets into sourceOffsets so they are included in the next
     // committable() and committed to the control group.  This defers the flag partition's
     // offset commitment until after the Coordinator has executed the flag action, ensuring
     // that a pod crash before this point will cause the flag to be re-read on restart.
     sourceOffsets.putAll(pendingFlagOffsets);
     pendingFlagOffsets.clear();
-    this.reroute = null;
+    this.pendingFlagTable = null;
     resumeAssignment();
   }
 
@@ -169,7 +171,7 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.clear();
     flagWriterResults.clear();
     pendingFlagOffsets.clear();
-    this.reroute = null;
+    this.pendingFlagTable = null;
   }
 
   @Override
@@ -203,28 +205,31 @@ class Worker implements Writer, AutoCloseable {
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
 
-      // Reroute any remaining same-batch records to the flag branch.  The partition will be
-      // paused at committable() time, preventing new records from arriving after this batch.
-      this.reroute = tableName;
+      // Track the pending table so onFlagProcessed() can match the coordinator's sentinel.
+      this.pendingFlagTable = tableIdentifier;
+
+      // Pause the assignment IMMEDIATELY so no more source records are delivered after this
+      // batch.  This also means that if all source partitions belong to this task, Kafka Connect
+      // will stop calling put() — the control topic must be polled via preCommit() instead
+      // (see IcebergSinkTask.preCommit()).
+      pauseAssignment();
       LOG.info(
-          "Flag detected — rerouting same-batch records to {} (branch: {})",
-          tableContext.tableIdentifier(),
-          tableContext.branch());
+          "Flag detected at partition {} offset {} — pausing assignment, pending coordinator confirmation for {}",
+          record.kafkaPartition(),
+          record.kafkaOffset(),
+          tableIdentifier);
     } else {
-      // the consumer stores the offsets that correspond to the next record to consume,
+      // The consumer stores the offsets that correspond to the next record to consume,
       // so increment the record offset by one.
-      // If we are currently in a rerouted (post-flag) window, the offset goes to
-      // pendingFlagOffsets so the flag partition's control-group offset is NOT advanced
-      // past the flag record.  This guarantees that a pod crash before onFlagProcessed()
-      // always rewinds the consumer to the flag (or before it), so the flag is re-read.
-      if (this.reroute != null) {
-        pendingFlagOffsets.put(
-            new TopicPartition(record.topic(), record.kafkaPartition()),
-            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+      // If this partition already has a pending flag (i.e. the flag and these records arrived
+      // in the same polled batch), defer the offset to pendingFlagOffsets so the committed
+      // control-group offset never advances past the flag.  This keeps the crash-recovery
+      // guarantee: on restart the consumer rewinds to at most the flag position.
+      TopicPartition tp = new TopicPartition(record.topic(), record.kafkaPartition());
+      if (pendingFlagOffsets.containsKey(tp)) {
+        pendingFlagOffsets.put(tp, new Offset(record.kafkaOffset() + 1, record.timestamp()));
       } else {
-        sourceOffsets.put(
-            new TopicPartition(record.topic(), record.kafkaPartition()),
-            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+        sourceOffsets.put(tp, new Offset(record.kafkaOffset() + 1, record.timestamp()));
       }
 
       if (config.dynamicTablesEnabled()) {
@@ -270,12 +275,6 @@ class Worker implements Writer, AutoCloseable {
   private void routeRecordDynamically(SinkRecord record) {
     String routeField = config.tablesRouteField();
     Preconditions.checkNotNull(routeField, String.format("Route field cannot be null with dynamic routing at topic: %s, partition: %d, offset: %d", record.topic(), record.kafkaPartition(), record.kafkaOffset()));
-
-    if (this.reroute != null) {
-      LOG.debug("Rerouting record to {}", this.reroute);
-      writerForTable(this.reroute, record, true).write(record);
-      return;
-    }
 
     String routeValue = extractRouteValue(record.value(), routeField);
     if (routeValue != null) {

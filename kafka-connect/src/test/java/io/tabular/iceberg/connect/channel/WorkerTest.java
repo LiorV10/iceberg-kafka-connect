@@ -161,23 +161,22 @@ public class WorkerTest {
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // pause() must NOT yet be called — the pause is deferred until committable() time
-    verify(context, never()).pause(tp);
-
-    // After committable() is called the pause must have been requested
-    worker.committable();
+    // pause() must be called IMMEDIATELY upon detecting the flag in write() — not deferred to
+    // committable().  This is necessary because if all source partitions are paused, Kafka
+    // Connect stops calling put(), and the flag must already be in flagWriterResults before
+    // the control topic is polled via preCommit().
     verify(context, times(1)).pause(tp);
     // resume() must NOT have been called yet
     verify(context, never()).resume(tp);
   }
 
   /**
-   * Verifies that records arriving after the flag in the same batch are immediately written but
-   * rerouted to the flag's branch table, and that {@link Worker#onFlagProcessed()} resumes the
-   * partitions and clears the reroute so that new records go to their natural destination.
+   * Verifies that records arriving after the flag in the same batch are written to their natural
+   * destination (no rerouting).  The partition is paused immediately on flag detection so no
+   * further batches arrive, but same-batch records go where their route field directs them.
    */
   @Test
-  public void testPostFlagRecordsInSameBatchAreReroutedToFlagBranch() {
+  public void testPostFlagRecordsInSameBatchGoToNaturalTable() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -195,7 +194,7 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // A data record whose natural route is "db.other", but arrives after the flag in the batch
+    // A data record that naturally routes to "db.other", arriving after the flag in the same batch
     String otherTable = "db.other";
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
@@ -206,9 +205,9 @@ public class WorkerTest {
 
     worker.write(ImmutableList.of(flagRec, dataRec));
 
-    // Post-flag record must be written immediately, but to the rerouted (flag) table, not "db.other"
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
-    verify(writerFactory, never()).createWriter(eq(otherTable), any(), anyBoolean());
+    // Post-flag record must be written to its NATURAL table — no rerouting to the flag table
+    verify(writerFactory, times(1)).createWriter(eq(otherTable), any(), anyBoolean());
+    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
   }
 
   /**
@@ -250,7 +249,7 @@ public class WorkerTest {
    * is always re-read on restart.
    */
   @Test
-  public void testPostFlagRecordsOffsetsDeferredWhenRerouteActive() {
+  public void testPostFlagRecordsOffsetsDeferred() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -420,10 +419,10 @@ public class WorkerTest {
 
   /**
    * Verifies that {@link Worker#onFlagProcessed} resumes the paused partitions and clears the
-   * reroute when called with the matching table identifier.
+   * pending flag state when called with the matching table identifier.
    */
   @Test
-  public void testRerouteIsClearedAndPartitionsResumedOnFlagProcessed() {
+  public void testPendingFlagClearedAndPartitionsResumedOnFlagProcessed() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -441,7 +440,7 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // Activate reroute by writing a flag record for TABLE_NAME
+    // Write a flag record for TABLE_NAME — partition must be paused immediately
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
@@ -453,7 +452,7 @@ public class WorkerTest {
     // Partitions must be resumed
     verify(context, times(1)).resume(tp);
 
-    // After resume, records must go to their natural destination (not the flag branch)
+    // After resume, records route to their natural destination (pendingFlagTable cleared)
     String naturalTable = "db.natural";
     SinkRecord dataRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
@@ -466,7 +465,7 @@ public class WorkerTest {
 
   /**
    * Verifies that {@link Worker#onFlagProcessed} is a no-op when called with a different table
-   * identifier than the one the worker is currently rerouting to.  This ensures a per-table sentinel
+   * identifier than the one the worker has a pending flag for.  This ensures a per-table sentinel
    * for another table does not accidentally resume a worker that is waiting for its own table.
    */
   @Test
@@ -488,32 +487,39 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // Activate reroute by writing a flag for TABLE_NAME
+    // Write a flag for TABLE_NAME — this puts the worker in "pending flag" state
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // Signal flag processed for a DIFFERENT table — this worker's reroute must not be cleared
+    // Signal flag processed for a DIFFERENT table — this worker must stay paused
     worker.onFlagProcessed(TableIdentifier.parse("db.other_table"));
 
-    // Resume must NOT have been called — this worker is still paused for its own table's flag
+    // Resume must NOT have been called — this worker is still waiting for its own table's flag
     verify(context, never()).resume(tp);
 
-    // The reroute should still be active (a new record gets rerouted)
+    // The pending flag state is still active: a subsequent record on the same partition
+    // still has its offset deferred to pendingFlagOffsets (crash safety still applies)
     SinkRecord postRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
-            ImmutableMap.of(FIELD_NAME, "db.should_not_be_used"), 2L);
+            ImmutableMap.of(FIELD_NAME, "db.natural"), 2L);
     worker.write(ImmutableList.of(postRec));
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // Record is written to its natural table (no rerouting)
+    verify(writerFactory, times(1)).createWriter(eq("db.natural"), any(), anyBoolean());
+    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // And the offset for this partition is still deferred — committable() must NOT include it
+    assertThat(worker.committable().offsetsByTopicPartition())
+        .as("Offset must remain deferred until onFlagProcessed() fires for the correct table")
+        .doesNotContainKey(tp);
   }
 
   /**
    * Verifies that pre-flag records in the same batch are written immediately to their natural
-   * destination, while post-flag records are immediately written but rerouted to the flag branch.
+   * destination, and that post-flag records also go to their natural destination (no rerouting).
    */
   @Test
-  public void testPreFlagRecordsWrittenNormallyPostFlagRecordsRerouted() {
+  public void testPreFlagAndPostFlagRecordsWrittenToNaturalDestination() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -547,10 +553,10 @@ public class WorkerTest {
 
     // Pre-flag record is written to its natural table
     verify(writerFactory, times(1)).createWriter(eq(preTable), any(), anyBoolean());
-    // Post-flag record is written immediately, but rerouted to the flag branch table
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
-    // The post-flag record's natural route is never used
-    verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
+    // Post-flag record is also written to its natural table — no rerouting
+    verify(writerFactory, times(1)).createWriter(eq(postTable), any(), anyBoolean());
+    // The flag's table (TABLE_NAME) is never used as a writer destination for data records
+    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {

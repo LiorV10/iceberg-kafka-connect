@@ -48,6 +48,11 @@ public class TaskImpl implements Task, AutoCloseable {
   }
 
   @Override
+  public void commit() {
+    committer.commit(writer);
+  }
+
+  @Override
   public void close() throws Exception {
     Utilities.close(writer);
     Utilities.close(committer);
