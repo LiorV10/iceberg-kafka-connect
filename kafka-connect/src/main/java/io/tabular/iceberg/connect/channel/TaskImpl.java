@@ -20,10 +20,14 @@ package io.tabular.iceberg.connect.channel;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.Utilities;
+
 import java.util.Collection;
+
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTaskContext;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class TaskImpl implements Task, AutoCloseable {
 
@@ -33,7 +37,7 @@ public class TaskImpl implements Task, AutoCloseable {
 
   public TaskImpl(SinkTaskContext context, IcebergSinkConfig config) {
     this.catalog = Utilities.loadCatalog(config);
-    this.writer = new Worker(config, catalog);
+    this.writer = new Worker(config, catalog, context);
     this.committer = new CommitterImpl(context, config, catalog);
   }
 
