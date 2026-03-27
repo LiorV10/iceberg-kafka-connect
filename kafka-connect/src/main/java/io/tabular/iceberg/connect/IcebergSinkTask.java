@@ -80,6 +80,14 @@ public class IcebergSinkTask extends SinkTask {
   @Override
   public Map<TopicPartition, OffsetAndMetadata> preCommit(
       Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
+    // Poll the control topic for coordinator messages (e.g. StartCommit) even when all source
+    // partitions are paused.  When a flag record is detected, the Worker pauses the source
+    // partition and calls context.requestCommit(), which causes Kafka Connect to invoke this
+    // method.  Without this call, CommitterImpl would never receive the StartCommit while
+    // partitions are paused (Kafka Connect skips put() when there are no source records).
+    if (task != null) {
+      task.commit();
+    }
     return ImmutableMap.of();
   }
 
