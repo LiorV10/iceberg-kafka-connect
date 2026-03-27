@@ -343,6 +343,52 @@ public class WorkerTest {
   }
 
 
+  /**
+   * Regression test: {@code flagWriterResults} must survive multiple {@code committable()} calls
+   * until the coordinator confirms flag processing via {@link Worker#onFlagProcessed}.
+   *
+   * <p>Without this fix, the first {@code committable()} call cleared {@code flagWriterResults}.
+   * If the coordinator failed to process the flag in that commit cycle (e.g. timed out before
+   * receiving all worker responses), all subsequent {@code committable()} calls returned empty
+   * flag data.  The worker stayed paused forever with no way to retry the flag commit.
+   */
+  @Test
+  public void testFlagWriterResultPersistsAcrossCommittableCallsUntilSentinelReceived() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // First committable() — simulates the worker responding to the first StartCommit.
+    assertThat(worker.committable().writerResults())
+        .as("First committable() must include the FlagWriterResult")
+        .hasSize(1)
+        .allMatch(r -> r instanceof FlagWriterResult);
+
+    // Second committable() before sentinel — simulates a retry on the next StartCommit.
+    assertThat(worker.committable().writerResults())
+        .as("Second committable() must STILL include the FlagWriterResult (sentinel not yet received)")
+        .hasSize(1)
+        .allMatch(r -> r instanceof FlagWriterResult);
+
+    // Coordinator sends the sentinel → onFlagProcessed clears the flag data.
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    // Third committable() after sentinel — flag data must now be gone.
+    assertThat(worker.committable().writerResults())
+        .as("Third committable() after sentinel must be empty (flag already committed)")
+        .isEmpty();
+  }
+
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
     WriterResult writeResult =
         new WriterResult(

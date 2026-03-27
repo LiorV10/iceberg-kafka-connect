@@ -93,14 +93,20 @@ class Worker implements Writer, AutoCloseable {
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
 
-    // Add flag writer results to the list
+    // Include pending flag results in every committable until the coordinator confirms flag
+    // processing by calling onFlagProcessed().  Do NOT clear flagWriterResults here: if the
+    // coordinator fails to process the flag in this commit cycle (e.g. the commit times out
+    // before receiving all worker responses, or an exception prevents the sentinel from being
+    // sent), the FlagWriterResult must survive to the next committable() call so that the flag
+    // is retried on the following StartCommit.  flagWriterResults is cleared in
+    // onFlagProcessed() (sentinel received) and in close() (task shutdown).
     writeResults.addAll(flagWriterResults);
 
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
     writers.clear();
     sourceOffsets.clear();
-    flagWriterResults.clear();
+    // NOTE: flagWriterResults intentionally not cleared here — see above.
 
     LOG.debug("Committing {} records", writeResults.size());
 
@@ -129,6 +135,7 @@ class Worker implements Writer, AutoCloseable {
 
     LOG.debug("Flag-processed signal received for table {}, resuming partitions", tableIdentifier);
 
+    flagWriterResults.clear();
     resumeAssignment();
     pendingFlagTable = null;
   }
