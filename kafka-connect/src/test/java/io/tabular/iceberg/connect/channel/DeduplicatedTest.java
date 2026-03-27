@@ -20,7 +20,10 @@ package io.tabular.iceberg.connect.channel;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import org.apache.iceberg.ContentFile;
@@ -35,6 +38,7 @@ import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
@@ -340,5 +344,114 @@ class DeduplicatedTest {
         batch,
         ImmutableSet.of(DATA_FILE_1, DATA_FILE_2),
         ImmutableSet.of(DELETE_FILE_1, DELETE_FILE_2));
+  }
+
+  // --- Flag-message helpers ---
+
+  private static final ObjectMapper TEST_MAPPER = new ObjectMapper();
+  private static final String FLAG_TYPE_FIELD = "type";
+
+  /**
+   * Creates a flag DataFile whose path encodes the flag JSON envelope, including
+   * the given {@code sourcePartition} and {@code flagType}.
+   */
+  private static DataFile createFlagDataFile(int sourcePartition, String flagType,
+      Map<String, Object> value) {
+    try {
+      Map<String, Object> envelope = new java.util.LinkedHashMap<>();
+      envelope.put("topic", "src-topic");
+      envelope.put("partition", sourcePartition);
+      envelope.put("offset", 1L);
+      envelope.put("timestamp", null);
+      envelope.put("key", "__flag__end");
+      envelope.put("value", value);
+      String json = TEST_MAPPER.writeValueAsString(envelope);
+      return DataFiles.builder(PartitionSpec.unpartitioned())
+          .withPath(FlagWriterResult.FLAG_PREFIX + json)
+          .withFormat(FileFormat.PARQUET)
+          .withFileSizeInBytes(0L)
+          .withRecordCount(0)
+          .build();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private Event flagEvent(DataFile flagFile) {
+    return new Event(
+        GROUP_ID,
+        new DataWritten(Types.StructType.of(), PAYLOAD_COMMIT_ID, TABLE_NAME,
+            ImmutableList.of(flagFile), ImmutableList.of()));
+  }
+
+  // --- Flag source-partition deduplication tests ---
+
+  @Test
+  public void testFlagMessageSourcePartitions_singlePartition() {
+    Map<String, Object> value = ImmutableMap.of(FLAG_TYPE_FIELD, "END-LOAD");
+    DataFile flagFile = createFlagDataFile(0, "END-LOAD", value);
+    Envelope envelope = new Envelope(flagEvent(flagFile), 0, 100);
+
+    Map<String, Set<Integer>> result =
+        Deduplicated.flagMessageSourcePartitions(ImmutableList.of(envelope), FLAG_TYPE_FIELD);
+
+    assertThat(result).containsOnlyKeys("END-LOAD");
+    assertThat(result.get("END-LOAD")).containsExactly(0);
+  }
+
+  @Test
+  public void testFlagMessageSourcePartitions_multipleDistinctPartitions() {
+    Map<String, Object> value = ImmutableMap.of(FLAG_TYPE_FIELD, "END-LOAD");
+    DataFile flagFile0 = createFlagDataFile(0, "END-LOAD", value);
+    DataFile flagFile1 = createFlagDataFile(1, "END-LOAD", value);
+    Envelope env0 = new Envelope(flagEvent(flagFile0), 0, 100);
+    Envelope env1 = new Envelope(flagEvent(flagFile1), 0, 101);
+
+    Map<String, Set<Integer>> result =
+        Deduplicated.flagMessageSourcePartitions(ImmutableList.of(env0, env1), FLAG_TYPE_FIELD);
+
+    assertThat(result).containsOnlyKeys("END-LOAD");
+    assertThat(result.get("END-LOAD")).containsExactlyInAnyOrder(0, 1);
+  }
+
+  @Test
+  public void testFlagMessageSourcePartitions_samePartitionDeduplicatedWithinCycle() {
+    // Same source partition reports the same flag twice in one cycle (e.g. retry) —
+    // the partition must only be counted once.
+    Map<String, Object> value = ImmutableMap.of(FLAG_TYPE_FIELD, "END-LOAD");
+    DataFile flagFile = createFlagDataFile(2, "END-LOAD", value);
+    Envelope env1 = new Envelope(flagEvent(flagFile), 0, 100);
+    Envelope env2 = new Envelope(flagEvent(flagFile), 0, 101);
+
+    Map<String, Set<Integer>> result =
+        Deduplicated.flagMessageSourcePartitions(ImmutableList.of(env1, env2), FLAG_TYPE_FIELD);
+
+    assertThat(result.get("END-LOAD")).hasSize(1).containsExactly(2);
+  }
+
+  @Test
+  public void testFlagMessages_returnsFullEnvelope() {
+    Map<String, Object> innerValue = ImmutableMap.of(FLAG_TYPE_FIELD, "END-LOAD", "extra", "data");
+    DataFile flagFile = createFlagDataFile(0, "END-LOAD", innerValue);
+    Envelope envelope = new Envelope(flagEvent(flagFile), 0, 100);
+
+    Map<String, org.apache.iceberg.util.Pair<io.tabular.iceberg.connect.TableContext, Map<String, Object>>> result =
+        Deduplicated.flagMessages(CURRENT_COMMIT_ID, TABLE_IDENTIFIER,
+            ImmutableList.of(envelope), null, FLAG_TYPE_FIELD);
+
+    assertThat(result).containsOnlyKeys("END-LOAD");
+    // The returned map must be the full envelope (with topic, partition, offset, value, etc.)
+    Map<String, Object> returnedEnvelope = result.get("END-LOAD").second();
+    assertThat(returnedEnvelope)
+        .containsKey("topic")
+        .containsKey("partition")
+        .containsKey("offset")
+        .containsKey("value");
+    // The "value" sub-map holds the actual flag record
+    @SuppressWarnings("unchecked")
+    Map<String, Object> returnedValue = (Map<String, Object>) returnedEnvelope.get("value");
+    assertThat(returnedValue)
+        .containsEntry(FLAG_TYPE_FIELD, "END-LOAD")
+        .containsEntry("extra", "data");
   }
 }
