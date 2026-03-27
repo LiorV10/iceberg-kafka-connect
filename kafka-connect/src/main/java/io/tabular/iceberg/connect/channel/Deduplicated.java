@@ -19,19 +19,10 @@
 package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
-import static java.util.stream.Collectors.toMap;
 
-import com.fasterxml.jackson.core.type.TypeReference;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import io.tabular.iceberg.connect.TableContext;
-import io.tabular.iceberg.connect.data.FlagWriterResult;
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
-import java.util.Set;
 import java.util.UUID;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -78,7 +69,6 @@ import org.slf4j.LoggerFactory;
  */
 class Deduplicated {
   private static final Logger LOG = LoggerFactory.getLogger(Deduplicated.class);
-  private static final ObjectMapper MAPPER = new ObjectMapper();
 
   private Deduplicated() {}
 
@@ -110,119 +100,6 @@ class Deduplicated {
         "delete",
         DataWritten::deleteFiles,
         deleteFile -> deleteFile.path().toString());
-  }
-
-  /**
-   * Returns all flag messages from the batch of envelopes, deduplicated by flag type.
-   * Flag messages are identified by containing sentinel data files with paths starting with
-   * {@link FlagWriterResult#FLAG_PREFIX}.
-   * The full flag envelope is deserialized from the JSON embedded in the DataFile path.
-   * The map key is the flag type (extracted from the record using {@code flagTypeField}),
-   * and the map value is a pair of the {@link TableContext} and the full flag envelope as a map
-   * (callers are responsible for extracting the {@code "value"} field when processing the flag).
-   *
-   * <p>In a multi-task deployment the producer broadcasts the same flag to every Kafka
-   * partition so that every task sees it, sets its own reroute, and reports a
-   * {@link FlagWriterResult} to the Coordinator. The Coordinator therefore receives one
-   * flag per partition for the same logical flag event. This method deduplicates those
-   * copies by flag type, keeping the first occurrence, so the Coordinator processes each
-   * logical flag exactly once.
-   */
-  public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
-      UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
-      String flagTypeField) {
-    return envelopes.stream()
-        .map(envelope -> (DataWritten) envelope.event().payload())
-        .filter(dataWritten -> {
-          List<DataFile> dataFiles = dataWritten.dataFiles();
-
-          if (dataFiles == null || dataFiles.isEmpty()) {
-            return false;
-          }
-
-          return dataFiles.stream()
-                  .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
-        })
-        .collect(toMap(
-                dataWritten -> extractFlagType(dataWritten, flagTypeField),
-                dataWritten -> {
-                  String recordJson = dataWritten.dataFiles().stream().findFirst().get()
-                      .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
-                  Map<String, Object> envelope = parseRecordJson(recordJson);
-                  TableContext tableContext = TableContext.parse(
-                      dataWritten.tableReference().identifier(), regex);
-                  return Pair.of(tableContext, envelope);
-                },
-                // Deduplicate: when the same flag type is reported by multiple tasks (one per
-                // partition in a broadcast scenario) keep the first occurrence and discard the rest.
-                (existing, duplicate) -> {
-                  LOG.debug("Deduplicating flag: type already seen, discarding copy from additional partition");
-                  return existing;
-                }));
-  }
-
-  /**
-   * Returns the set of source partition numbers per flag type that are present in this batch
-   * of envelopes. Each DataWritten event carrying flag files contributes the source partition
-   * number embedded in the flag JSON. Using a Set ensures a single partition cannot be counted
-   * more than once within the same commit cycle (idempotency on retry/redelivery).
-   *
-   * <p>The Coordinator accumulates these sets across commit cycles so that a partition is only
-   * counted once even if its flag result arrives in different cycles.
-   */
-  static Map<String, Set<Integer>> flagMessageSourcePartitions(
-      List<Envelope> envelopes, String flagTypeField) {
-    return envelopes.stream()
-        .map(envelope -> (DataWritten) envelope.event().payload())
-        .filter(
-            dataWritten -> {
-              List<DataFile> dataFiles = dataWritten.dataFiles();
-              return dataFiles != null
-                  && !dataFiles.isEmpty()
-                  && dataFiles.stream()
-                      .allMatch(
-                          f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
-            })
-        .collect(
-            Collectors.groupingBy(
-                dw -> extractFlagType(dw, flagTypeField),
-                Collectors.mapping(
-                    Deduplicated::extractSourcePartition, Collectors.toSet())));
-  }
-
-  @SuppressWarnings("unchecked")
-  private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
-    String recordJson = dataWritten.dataFiles().stream().findFirst().get()
-        .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
-    Map<String, Object> envelope = parseRecordJson(recordJson);
-    // The type field lives inside the "value" sub-map of the envelope.
-    Object valueObj = envelope.get("value");
-    if (valueObj instanceof Map) {
-      Object type = ((Map<String, Object>) valueObj).get(flagTypeField);
-      return type != null ? type.toString() : "";
-    }
-    return "";
-  }
-
-  private static int extractSourcePartition(DataWritten dataWritten) {
-    String recordJson =
-        dataWritten
-            .dataFiles()
-            .get(0)
-            .path()
-            .toString()
-            .substring(FlagWriterResult.FLAG_PREFIX.length());
-    Map<String, Object> record = parseRecordJson(recordJson);
-    Object partition = record.get("partition");
-    return partition instanceof Number ? ((Number) partition).intValue() : -1;
-  }
-
-  private static Map<String, Object> parseRecordJson(String recordJson) {
-    try {
-      return MAPPER.readValue(recordJson, new TypeReference<Map<String, Object>>() {});
-    } catch (IOException e) {
-      throw new UncheckedIOException(e);
-    }
   }
 
   private static <F> List<F> deduplicatedFiles(

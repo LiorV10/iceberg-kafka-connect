@@ -49,13 +49,11 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.common.DynConstructors;
 import org.apache.iceberg.connect.events.AvroUtil;
 import org.apache.iceberg.connect.events.CommitComplete;
-import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.PayloadType;
 import org.apache.iceberg.connect.events.StartCommit;
-import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -592,121 +590,6 @@ class CommitterImplTest {
           .isEqualTo(ImmutableMap.of(CONFIG.controlGroupId(), expectedConsumerOffset));
       assertThat(producer.consumerGroupOffsetsHistory().get(1))
           .isEqualTo(ImmutableMap.of(CONFIG.connectGroupId(), expectedConsumerOffset));
-    }
-  }
-
-  /**
-   * Verifies that {@link CommitterImpl} calls {@link CommittableSupplier#onFlagProcessed} when
-   * it receives a per-table sentinel {@link org.apache.iceberg.connect.events.CommitToTable} event
-   * (commit-ID == all-zeros UUID) from the Coordinator.  The sentinel is sent by the Coordinator
-   * only after it has collected flag votes from every source partition for that specific table and
-   * executed the flag action.  Workers for other tables are unaffected because {@link Worker}
-   * checks the table identifier.
-   */
-  @Test
-  public void testOnFlagProcessedIsCalledOnSentinelCommitToTable() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    whenAdminListConsumerGroupOffsetsThenReturn(
-        ImmutableMap.of(
-            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
-
-    TableIdentifier[] receivedTableId = {null};
-    CommittableSupplier committableSupplier = new CommittableSupplier() {
-      @Override
-      public Committable committable() {
-        return new Committable(ImmutableMap.of(), ImmutableList.of());
-      }
-
-      @Override
-      public void onFlagProcessed(TableIdentifier tableIdentifier) {
-        receivedTableId[0] = tableIdentifier;
-      }
-    };
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-      Committer committer = committerImpl;
-
-      // Deliver the per-table sentinel CommitToTable (all-zeros UUID) as if broadcast by the
-      // Coordinator after processing TABLE_1's flag.
-      consumer.addRecord(
-          new ConsumerRecord<>(
-              CONTROL_TOPIC_PARTITION.topic(),
-              CONTROL_TOPIC_PARTITION.partition(),
-              0,
-              UUID.randomUUID().toString(),
-              AvroUtil.encode(
-                  new Event(
-                      CONFIG.controlGroupId(),
-                      new CommitToTable(
-                          Coordinator.FLAG_PROCESSED_SENTINEL_ID,
-                          TableReference.of(CATALOG_NAME, TABLE_1_IDENTIFIER),
-                          0L,
-                          null)))));
-
-      committer.commit(committableSupplier);
-
-      assertThat(receivedTableId[0])
-          .as("onFlagProcessed() must be called with TABLE_1_IDENTIFIER when per-table sentinel received")
-          .isEqualTo(TABLE_1_IDENTIFIER);
-    }
-  }
-
-  /**
-   * Verifies that a regular (non-sentinel) {@link org.apache.iceberg.connect.events.CommitToTable}
-   * does NOT trigger {@link CommittableSupplier#onFlagProcessed}.
-   */
-  @Test
-  public void testOnFlagProcessedIsNotCalledOnRegularCommitToTable() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    whenAdminListConsumerGroupOffsetsThenReturn(
-        ImmutableMap.of(
-            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
-
-    boolean[] onFlagProcessedCalled = {false};
-    CommittableSupplier committableSupplier = new CommittableSupplier() {
-      @Override
-      public Committable committable() {
-        return new Committable(ImmutableMap.of(), ImmutableList.of());
-      }
-
-      @Override
-      public void onFlagProcessed(TableIdentifier tableIdentifier) {
-        onFlagProcessedCalled[0] = true;
-      }
-    };
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-      Committer committer = committerImpl;
-
-      // Deliver a regular CommitToTable (non-sentinel UUID).
-      consumer.addRecord(
-          new ConsumerRecord<>(
-              CONTROL_TOPIC_PARTITION.topic(),
-              CONTROL_TOPIC_PARTITION.partition(),
-              0,
-              UUID.randomUUID().toString(),
-              AvroUtil.encode(
-                  new Event(
-                      CONFIG.controlGroupId(),
-                      new CommitToTable(
-                          UUID.randomUUID(),
-                          TableReference.of(CATALOG_NAME, TABLE_1_IDENTIFIER),
-                          12345L,
-                          null)))));
-
-      committer.commit(committableSupplier);
-
-      assertThat(onFlagProcessedCalled[0])
-          .as("onFlagProcessed() must NOT be called for a regular CommitToTable")
-          .isFalse();
     }
   }
 }

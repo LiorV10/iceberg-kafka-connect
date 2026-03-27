@@ -31,7 +31,6 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -133,17 +132,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     if (envelope.event().type() == PayloadType.START_COMMIT) {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
-      return true;
-    }
-    if (envelope.event().type() == PayloadType.COMMIT_TO_TABLE) {
-      CommitToTable commitToTable = (CommitToTable) envelope.event().payload();
-      // The Coordinator sends a per-table sentinel CommitToTable (with the all-zeros UUID) after
-      // processing all pending flag messages for a specific table.  Only workers routing to that
-      // table clear their reroute state and resume; others are unaffected (the Worker checks the
-      // table identifier).
-      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(commitToTable.commitId())) {
-        committableSupplier.onFlagProcessed(commitToTable.tableReference().identifier());
-      }
       return true;
     }
     return false;
