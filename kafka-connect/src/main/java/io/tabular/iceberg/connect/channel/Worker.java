@@ -32,7 +32,10 @@ import io.tabular.iceberg.connect.data.Utilities;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
 import java.io.UncheckedIOException;
-import java.util.*;
+import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import org.apache.iceberg.catalog.Catalog;
@@ -60,6 +63,19 @@ class Worker implements Writer, AutoCloseable {
   private final List<WriterResult> flagWriterResults;
   private boolean isPaused;
   private final SinkTaskContext context;
+
+  // Non-null while a flag has been detected but not yet processed by the Coordinator.
+  // Used to route post-flag records in the same batch to the flag's target table,
+  // and to identify the sentinel when onFlagProcessed() is called.
+  private TableIdentifier reroute;
+
+  // The TopicPartition and offset of the detected flag record.  The offset is committed AT the
+  // flag (not past it) so that if the worker crashes before the Coordinator sends the
+  // FLAG_PROCESSED_SENTINEL, the next restart will re-read and re-process the flag record,
+  // naturally re-establishing the paused state.
+  private TopicPartition flagTopicPartition;
+  private long flagOffset;
+  private Long flagTimestamp;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
     this(config, new IcebergWriterFactory(catalog, config), context);
@@ -96,10 +112,16 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear reroute here.  Reroute must remain set across commit cycles because the
-    // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
-    // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
+    // NOTE: do NOT clear reroute/flagTopicPartition here.  They must survive across commit cycles
+    // because the flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed()
+    // is triggered only when the Coordinator broadcasts the per-table sentinel after all partitions
     // have reported — which may happen in a subsequent commit cycle.
+
+    // Deferred pause: now that the flag batch is committed, pause the flag partition so that
+    // no new records arrive from it until the Coordinator signals flag-processed.
+    if (reroute != null && !isPaused) {
+      pauseAssignment(flagTopicPartition.partition());
+    }
 
     LOG.debug("Committing {} records", writeResults.size());
 
@@ -111,18 +133,37 @@ class Worker implements Writer, AutoCloseable {
    * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
    * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
    * partitions for a specific table and executed the flag action (e.g. branch switch).
-   * <p>
-   * Only acts when this worker is currently rerouting to {@code tableIdentifier}.  Workers for
-   * other tables, or workers that never detected a flag, are unaffected.
+   *
+   * <p>Only acts when this worker has a pending flag for exactly {@code tableIdentifier}. Workers
+   * for other tables, or workers that never detected a flag, are unaffected.
+   *
+   * <p>On success, advances the committed source offset one past the flag record so that a
+   * subsequent restart does not re-read the flag.
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
-    if (!this.isPaused) {
-      // This worker did not detect a flag — it was never paused, nothing to do.
+    if (reroute == null) {
+      // This worker did not detect a flag — nothing to do.
+      return;
+    }
+    if (!reroute.equals(tableIdentifier)) {
+      // Sentinel is for a different table — this worker is still waiting for its own.
       return;
     }
 
-    LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+    LOG.debug("Flag-processed signal received for table {}, advancing offset and resuming", tableIdentifier);
+
+    // Advance the committed source offset one past the flag record.  Storing it in sourceOffsets
+    // here means it will be included in the next sendCommitResponse(), committing F+1 to the
+    // control-group consumer-group.  After that, a restart will begin at F+1 and the flag will
+    // not be re-read again.
+    if (flagTopicPartition != null) {
+      sourceOffsets.put(flagTopicPartition, new Offset(flagOffset + 1L, flagTimestamp));
+    }
+
+    // Clear flag state
+    reroute = null;
+    flagTopicPartition = null;
 
     resumeAssignment();
   }
@@ -134,6 +175,8 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.clear();
     flagWriterResults.clear();
     this.isPaused = false;
+    this.reroute = null;
+    this.flagTopicPartition = null;
   }
 
   @Override
@@ -147,15 +190,10 @@ class Worker implements Writer, AutoCloseable {
     if (this.isPaused) {
       LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
               record.kafkaOffset(), record.topic(), record.kafkaPartition());
-
       return;
     }
 
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-            new TopicPartition(record.topic(), record.kafkaPartition()),
-            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+    TopicPartition tp = new TopicPartition(record.topic(), record.kafkaPartition());
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
@@ -163,6 +201,14 @@ class Worker implements Writer, AutoCloseable {
           record.topic(),
           record.kafkaPartition(),
           record.kafkaOffset());
+
+      // Commit AT the flag offset (not offset+1) so that if the worker crashes before the
+      // Coordinator sends the FLAG_PROCESSED_SENTINEL, the consumer restarts from F and
+      // re-reads the flag, naturally re-establishing the paused state.
+      sourceOffsets.put(tp, new Offset(record.kafkaOffset(), record.timestamp()));
+      this.flagTopicPartition = tp;
+      this.flagOffset = record.kafkaOffset();
+      this.flagTimestamp = record.timestamp();
 
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
@@ -173,16 +219,30 @@ class Worker implements Writer, AutoCloseable {
       FlagWriterResult flagResult =
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
-      this.context.requestCommit();
 
-      // The partition will be paused at committable() time, preventing new records from arriving after this batch.
-      pauseAssignment(record.kafkaPartition());
+      this.reroute = tableIdentifier;
+
+      // Request a commit so the FlagWriterResult is sent to the Coordinator promptly.
+      if (context != null) {
+        context.requestCommit();
+      }
+
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
-      if (config.dynamicTablesEnabled()) {
+      // For records on the flag partition that arrive after the flag in the same batch: do NOT
+      // advance the committed offset past the flag.  This keeps the committed offset at F so that
+      // a restart will re-read the flag and re-establish the paused state correctly.
+      if (reroute == null || !tp.equals(flagTopicPartition)) {
+        sourceOffsets.put(tp, new Offset(record.kafkaOffset() + 1, record.timestamp()));
+      }
+
+      if (reroute != null) {
+        // Post-flag record in the same batch: route to the flag's target table.
+        writerForTable(reroute.toString(), record, true).write(record);
+      } else if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
         routeRecordStatically(record);
@@ -275,24 +335,21 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void pauseAssignment(Integer flagPartition) {
-    LOG.debug("About to pause task, context is {}", context);
     if (context != null) {
       TopicPartition[] partitions = context.assignment().stream()
               .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
               .toArray(TopicPartition[]::new);
-
       context.pause(partitions);
-      this.isPaused = true;
-      LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
+      LOG.debug("Paused partition {}", flagPartition);
     }
+    this.isPaused = true;
   }
 
   private void resumeAssignment() {
     if (context != null) {
-      // Always call context.assignment() fresh for the same reason as pauseAssignment().
       context.resume(context.assignment().toArray(new TopicPartition[0]));
-      this.isPaused = false;
     }
+    this.isPaused = false;
   }
 
   private RecordWriter writerForTable(

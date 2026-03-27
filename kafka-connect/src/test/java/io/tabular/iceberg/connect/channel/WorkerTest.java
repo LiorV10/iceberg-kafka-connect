@@ -373,6 +373,84 @@ public class WorkerTest {
     verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
   }
 
+  /**
+   * Verifies that the source offset committed for the flag partition is AT the flag record
+   * (offset F, not F+1).  This is the key invariant for crash-recovery: if the worker restarts
+   * before receiving the FLAG_PROCESSED_SENTINEL the consumer will begin at F, re-read the flag,
+   * and naturally re-establish the paused state.
+   */
+  @Test
+  public void testFlagOffsetIsCommittedAtFlagRecordForRestartPersistence() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    long flagKafkaOffset = 5L;
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, flagKafkaOffset);
+    worker.write(ImmutableList.of(flagRec));
+
+    Committable committable = worker.committable();
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    assertThat(committable.offsetsByTopicPartition())
+        .containsKey(tp);
+    // Offset must be AT the flag (F = 5), NOT past it (F+1 = 6).
+    // This ensures a restarted consumer starts at F and re-reads the flag.
+    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
+        .as("Committed offset must be AT the flag record (not past it) for restart persistence")
+        .isEqualTo(flagKafkaOffset);
+  }
+
+  /**
+   * Verifies that after {@link Worker#onFlagProcessed} is called, the next {@link
+   * Worker#committable()} includes offset F+1 for the flag partition, advancing the consumer
+   * past the flag so it is not re-read after the flag has been successfully processed.
+   */
+  @Test
+  public void testOnFlagProcessedAdvancesOffsetPastFlagRecord() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    long flagKafkaOffset = 7L;
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, flagKafkaOffset);
+
+    // Write the flag and flush it in a committable cycle.
+    worker.write(ImmutableList.of(flagRec));
+    worker.committable(); // flushes sourceOffsets (committed at F=7), sets isPaused
+
+    // Simulate the Coordinator signalling that the flag has been fully processed.
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    // The next committable must carry offset F+1 = 8 for the flag partition.
+    // This tells the control-group to start the consumer at 8 on the next restart,
+    // so the flag is not re-read.
+    Committable afterResume = worker.committable();
+    assertThat(afterResume.offsetsByTopicPartition())
+        .containsKey(tp);
+    assertThat(afterResume.offsetsByTopicPartition().get(tp).offset())
+        .as("After flag processed, offset must advance to F+1 so the flag is not re-read on restart")
+        .isEqualTo(flagKafkaOffset + 1);
+  }
+
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
     WriterResult writeResult =
         new WriterResult(
