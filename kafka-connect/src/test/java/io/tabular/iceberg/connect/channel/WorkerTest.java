@@ -274,6 +274,75 @@ public class WorkerTest {
     verify(context, never()).resume(tp);
   }
 
+  // ── isPendingFlagCommit ──────────────────────────────────────────────────
+
+  /** Before any flag is written, {@code isPendingFlagCommit()} must return {@code false}. */
+  @Test
+  public void testIsPendingFlagCommitFalseInitially() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+
+    Worker worker = new Worker(config, mock(IcebergWriterFactory.class));
+
+    assertThat(worker.isPendingFlagCommit()).isFalse();
+  }
+
+  /** After a flag record is detected, {@code isPendingFlagCommit()} must return {@code true}. */
+  @Test
+  public void testIsPendingFlagCommitTrueAfterFlagDetected() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    Worker worker = new Worker(config, mock(IcebergWriterFactory.class), context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    assertThat(worker.isPendingFlagCommit()).isTrue();
+  }
+
+  /**
+   * After {@link Worker#onFlagProcessed} is called for the matching table,
+   * {@code isPendingFlagCommit()} must return {@code false} again.
+   */
+  @Test
+  public void testIsPendingFlagCommitFalseAfterFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    Worker worker = new Worker(config, mock(IcebergWriterFactory.class), context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // Confirm paused
+    assertThat(worker.isPendingFlagCommit()).isTrue();
+
+    // Coordinator sends sentinel for the matching table → worker should resume
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    assertThat(worker.isPendingFlagCommit()).isFalse();
+  }
+
+
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
     WriterResult writeResult =
         new WriterResult(

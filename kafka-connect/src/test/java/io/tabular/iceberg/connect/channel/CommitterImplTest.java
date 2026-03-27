@@ -709,4 +709,81 @@ class CommitterImplTest {
           .isFalse();
     }
   }
+
+  /**
+   * Verifies that {@link CommitterImpl#commit} processes a {@link StartCommit} event and
+   * responds correctly even when {@link CommittableSupplier#isPendingFlagCommit()} returns
+   * {@code true} (the code path that uses {@code PENDING_FLAG_POLL_DURATION}).
+   *
+   * <p>This test ensures that switching from {@code Duration.ZERO} to a positive duration in the
+   * paused/pending state does not break event processing.  It mirrors
+   * {@code testCommitShouldRespondToCommitRequest} but uses a {@link CommittableSupplier} that
+   * reports {@code isPendingFlagCommit() = true}, simulating the post-restart scenario where a
+   * worker has detected a flag record, paused the partition, and is now actively waiting for a
+   * StartCommit so it can send the flag data to the Coordinator.
+   */
+  @Test
+  public void testCommitUsesPositivePollDurationWhenPendingFlagCommit() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+    UUID commitId = UUID.randomUUID();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    List<DataFile> dataFiles = ImmutableList.of(createDataFile());
+    List<DeleteFile> deleteFiles = ImmutableList.of();
+    Types.StructType partitionStruct = Types.StructType.of();
+    Map<TopicPartition, Offset> sourceOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(111L, 200L));
+
+    // CommittableSupplier that simulates a Worker which detected a flag and is paused.
+    CommittableSupplier pendingFlagSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(
+            sourceOffsets,
+            ImmutableList.of(
+                new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)));
+      }
+
+      @Override
+      public boolean isPendingFlagCommit() {
+        return true;
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+
+      committer.commit(pendingFlagSupplier);
+
+      // Events must be sent exactly as in the normal (non-paused) case.
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(2);
+      assertDataWritten(
+          producer.history().get(0),
+          producerId,
+          commitId,
+          TABLE_1_IDENTIFIER,
+          dataFiles,
+          deleteFiles);
+      assertDataComplete(
+          producer.history().get(1),
+          producerId,
+          commitId,
+          ImmutableMap.of(SOURCE_TP0, Pair.of(111L, offsetDateTime(200L))));
+    }
+  }
 }

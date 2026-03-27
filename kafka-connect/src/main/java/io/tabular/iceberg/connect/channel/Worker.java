@@ -108,14 +108,18 @@ class Worker implements Writer, AutoCloseable {
   }
 
   /**
-   * Called by {@link CommitterImpl} when it receives the per-table sentinel
-   * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
-   * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
-   * partitions for a specific table and executed the flag action (e.g. branch switch).
-   * <p>
-   * Only acts when this worker is paused waiting for the sentinel for {@code tableIdentifier}.
-   * Sentinels for other tables are silently ignored.
+   * Returns {@code true} while this worker is paused waiting for the Coordinator's
+   * per-table sentinel {@link org.apache.iceberg.connect.events.CommitToTable} event after
+   * detecting a flag record.  {@link CommitterImpl} uses this to switch to a positive
+   * {@code poll} duration so the control-topic consumer actively waits for the
+   * {@link org.apache.iceberg.connect.events.StartCommit} rather than returning immediately
+   * with zero records.
    */
+  @Override
+  public boolean isPendingFlagCommit() {
+    return isPaused;
+  }
+
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
     if (pendingFlagTable == null || !pendingFlagTable.equals(tableIdentifier)) {

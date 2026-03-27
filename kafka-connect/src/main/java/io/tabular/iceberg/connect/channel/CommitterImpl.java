@@ -205,10 +205,30 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
   }
 
+  /**
+   * Poll duration used in {@link #commit} when the worker is paused waiting for the
+   * flag-processed sentinel.  A positive duration is required so the Kafka consumer actually
+   * waits for the {@link org.apache.iceberg.connect.events.StartCommit} (or sentinel) fetch
+   * response instead of returning immediately with zero records.
+   *
+   * <p>With {@link Duration#ZERO}, {@code consumer.poll()} sends a fetch request to the broker
+   * but returns immediately without waiting for the response; the result arrives only on the
+   * <em>next</em> call.  When all source-topic partitions are paused Kafka Connect may call
+   * {@code put()} very infrequently, so relying on the next call is unreliable.  Using 100 ms
+   * here is negligible in the paused state (no source records are being processed) but ensures
+   * the consumer receives events in a single {@code commit()} call.
+   */
+  private static final Duration PENDING_FLAG_POLL_DURATION = Duration.ofMillis(100);
+
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-    consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
+    // Use a positive duration while waiting for the flag sentinel so the consumer doesn't
+    // return immediately with 0 records.  In normal operation (not paused) Duration.ZERO
+    // keeps overhead negligible.
+    Duration pollDuration =
+        committableSupplier.isPendingFlagCommit() ? PENDING_FLAG_POLL_DURATION : Duration.ZERO;
+    consumeAvailable(pollDuration, envelope -> receive(envelope, committableSupplier));
   }
 
   @Override
