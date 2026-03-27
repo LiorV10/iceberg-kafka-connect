@@ -45,6 +45,17 @@ public class CommitState {
   private UUID currentCommitId;
   private final IcebergSinkConfig config;
 
+  /**
+   * When set to {@code true} by {@link #requestImmediateCommit()}, causes
+   * {@link #isCommitIntervalReached()} to return {@code true} on its very next call (as long as
+   * no commit is already in progress), bypassing the {@link IcebergSinkConfig#commitIntervalMs()}
+   * wait.
+   *
+   * <p>Written by the Kafka Connect thread (via {@link CommitterImpl}) and read by the
+   * Coordinator background thread, so this field is {@code volatile}.
+   */
+  private volatile boolean immediateCommitRequested = false;
+
   private final Comparator<OffsetDateTime> dateTimeComparator =
           OffsetDateTime::compareTo;
 
@@ -81,10 +92,44 @@ public class CommitState {
   public boolean isCommitIntervalReached() {
     if (startTime == 0) {
       startTime = System.currentTimeMillis();
+      // Fire the very first StartCommit immediately on startup.  Workers subscribe to the
+      // control topic from 'latest' (a fresh transient consumer group), so they will miss any
+      // StartCommit sent before they joined.  By firing immediately the coordinator gives
+      // all CommitterImpls — which finish their own 1-second initialization poll before the
+      // coordinator is even started — a chance to receive and respond to the first StartCommit
+      // within a second rather than waiting a full commitIntervalMs after restart.
+      return !isCommitInProgress();
     }
 
-    return (!isCommitInProgress()
-        && System.currentTimeMillis() - startTime >= config.commitIntervalMs());
+    if (isCommitInProgress()) {
+      return false;
+    }
+
+    // A worker has signalled that it has a pending flag commit and needs a new StartCommit
+    // immediately (e.g. after a pod crash where the fast-start StartCommit was consumed before
+    // the rewound flag record arrived).  Clear the flag and fire right away.
+    if (immediateCommitRequested) {
+      immediateCommitRequested = false;
+      return true;
+    }
+
+    return System.currentTimeMillis() - startTime >= config.commitIntervalMs();
+  }
+
+  /**
+   * Asks the coordinator to fire the next {@link org.apache.iceberg.connect.events.StartCommit}
+   * immediately, without waiting for {@link IcebergSinkConfig#commitIntervalMs()} to elapse.
+   *
+   * <p>Called by {@link CommitterImpl} when a worker transitions into
+   * "pending flag commit" state ({@link CommittableSupplier#isPendingFlagCommit()} flips from
+   * {@code false} to {@code true}).  After a pod crash + restart, the fast-start StartCommit is
+   * consumed and responded to with empty data before the rewound flag record arrives (due to Kafka
+   * fetch pipelining in the Connect framework).  Without this signal the Worker would be stuck
+   * waiting for the coordinator's timer to fire the next StartCommit — up to
+   * {@code commitIntervalMs} (e.g. 5 minutes) — before the flag commit can complete.
+   */
+  public void requestImmediateCommit() {
+    immediateCommitRequested = true;
   }
 
   public void startNewCommit() {

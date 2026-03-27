@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -449,6 +450,9 @@ class CommitterImplTest {
                       CONFIG.controlGroupId(),
                       new StartCommit(commitId)))));
 
+      // First call defers the StartCommit (no flag pending yet).
+      // Second call responds using the deferred commitId.
+      committer.commit(committableSupplier);
       committer.commit(committableSupplier);
 
       assertThat(producer.transactionCommitted()).isTrue();
@@ -508,6 +512,9 @@ class CommitterImplTest {
                       new StartCommit(commitId)))));
 
 
+      // First call defers the StartCommit (no flag pending yet).
+      // Second call responds using the deferred commitId.
+      committer.commit(committableSupplier);
       committer.commit(committableSupplier);
 
       assertThat(producer.transactionCommitted()).isTrue();
@@ -566,6 +573,9 @@ class CommitterImplTest {
                       CONFIG.controlGroupId(),
                       new StartCommit(commitId)))));
 
+      // First call defers the StartCommit (no flag pending yet).
+      // Second call responds using the deferred commitId.
+      committer.commit(committableSupplier);
       committer.commit(committableSupplier);
 
       assertThat(producer.transactionCommitted()).isTrue();
@@ -709,4 +719,266 @@ class CommitterImplTest {
           .isFalse();
     }
   }
+
+  /**
+   * Verifies that {@link CommitterImpl#commit} processes a {@link StartCommit} event and
+   * responds correctly even when {@link CommittableSupplier#isPendingFlagCommit()} returns
+   * {@code true} (the code path that uses {@code PENDING_FLAG_POLL_DURATION}).
+   *
+   * <p>This test ensures that switching from {@code Duration.ZERO} to a positive duration in the
+   * paused/pending state does not break event processing.  It mirrors
+   * {@code testCommitShouldRespondToCommitRequest} but uses a {@link CommittableSupplier} that
+   * reports {@code isPendingFlagCommit() = true}, simulating the post-restart scenario where a
+   * worker has detected a flag record, paused the partition, and is now actively waiting for a
+   * StartCommit so it can send the flag data to the Coordinator.
+   */
+  @Test
+  public void testCommitUsesPositivePollDurationWhenPendingFlagCommit() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+    UUID commitId = UUID.randomUUID();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    List<DataFile> dataFiles = ImmutableList.of(createDataFile());
+    List<DeleteFile> deleteFiles = ImmutableList.of();
+    Types.StructType partitionStruct = Types.StructType.of();
+    Map<TopicPartition, Offset> sourceOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(111L, 200L));
+
+    // CommittableSupplier that simulates a Worker which detected a flag and is paused.
+    CommittableSupplier pendingFlagSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(
+            sourceOffsets,
+            ImmutableList.of(
+                new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)));
+      }
+
+      @Override
+      public boolean isPendingFlagCommit() {
+        return true;
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+
+      committer.commit(pendingFlagSupplier);
+
+      // Events must be sent exactly as in the normal (non-paused) case.
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(2);
+      assertDataWritten(
+          producer.history().get(0),
+          producerId,
+          commitId,
+          TABLE_1_IDENTIFIER,
+          dataFiles,
+          deleteFiles);
+      assertDataComplete(
+          producer.history().get(1),
+          producerId,
+          commitId,
+          ImmutableMap.of(SOURCE_TP0, Pair.of(111L, offsetDateTime(200L))));
+    }
+  }
+
+  /**
+   * Verifies the restart race condition fix: when the very first StartCommit arrives while
+   * {@code isPendingFlagCommit()} is {@code false} (e.g. the flag record has not been replayed
+   * yet because Kafka Connect's offset rewind hasn't taken effect for the first {@code put()}
+   * batch), the StartCommit is <em>deferred</em> by one {@code put()} cycle.
+   *
+   * <p>On the second {@code commit()} call the flag is now pending (simulating that
+   * {@code write()} detected the flag in the second {@code put()} batch), so the deferred
+   * StartCommit is responded to with the {@link io.tabular.iceberg.connect.data.FlagWriterResult}
+   * included.
+   */
+  @Test
+  public void testStartCommitDeferredByOneCycleWhenFlagArrivesInSecondPutBatch()
+      throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+    UUID commitId = UUID.randomUUID();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    List<DataFile> flagDataFiles = ImmutableList.of(createDataFile());
+    List<DeleteFile> flagDeleteFiles = ImmutableList.of();
+    Types.StructType partitionStruct = Types.StructType.of();
+    Map<TopicPartition, Offset> flagOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(111L, 200L));
+
+    // Supplier for the first put() cycle: no flag detected yet.
+    CommittableSupplier noFlagSupplier = () -> new Committable(ImmutableMap.of(), ImmutableList.of());
+
+    // Supplier for the second put() cycle: flag has been detected in write().
+    CommittableSupplier flagSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(
+            flagOffsets,
+            ImmutableList.of(
+                new WriterResult(TABLE_1_IDENTIFIER, flagDataFiles, flagDeleteFiles, partitionStruct)));
+      }
+
+      @Override
+      public boolean isPendingFlagCommit() {
+        return true;
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      // The StartCommit is available in the consumer before the flag is detected.
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+
+      // First put() cycle: no flag yet — StartCommit must be DEFERRED, no response sent.
+      committer.commit(noFlagSupplier);
+      assertThat(producer.history())
+          .as("No response should be sent while StartCommit is deferred")
+          .isEmpty();
+
+      // Second put() cycle: flag now detected in write() — deferred StartCommit must be
+      // responded to with the FlagWriterResult.
+      committer.commit(flagSupplier);
+
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(2);
+      assertDataWritten(
+          producer.history().get(0),
+          producerId,
+          commitId,
+          TABLE_1_IDENTIFIER,
+          flagDataFiles,
+          flagDeleteFiles);
+      assertDataComplete(
+          producer.history().get(1),
+          producerId,
+          commitId,
+          ImmutableMap.of(SOURCE_TP0, Pair.of(111L, offsetDateTime(200L))));
+    }
+  }
+
+  /**
+   * Verifies that when {@link CommittableSupplier#isPendingFlagCommit()} first returns
+   * {@code true}, {@link CommitterImpl#commit} calls
+   * {@link CoordinatorThread#requestImmediateCommit()} exactly once.
+   *
+   * <p>After a pod crash + restart the fast-start {@link StartCommit} may be consumed before
+   * the rewound flag record arrives (Kafka fetch pipelining).  Without
+   * {@code requestImmediateCommit()} the coordinator would wait up to {@code commitIntervalMs}
+   * (e.g. 5 minutes) before sending the next StartCommit, keeping the Worker paused with a
+   * pending flag commit for far longer than necessary.
+   */
+  @Test
+  public void testRequestImmediateCommitCalledOnCoordinatorWhenFlagFirstPending()
+      throws IOException {
+    SinkTaskContext mockContext = mockContext();
+
+    CoordinatorThread mockCoordinatorThread = mock(CoordinatorThread.class);
+    Mockito.doNothing().when(mockCoordinatorThread).start();
+    Mockito.doNothing().when(mockCoordinatorThread).terminate();
+    CoordinatorThreadFactory coordinatorThreadFactory =
+        (ctx, cfg) -> Optional.of(mockCoordinatorThread);
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    CommittableSupplier pendingFlagSupplier =
+        new CommittableSupplier() {
+          @Override
+          public Committable committable() {
+            return new Committable(ImmutableMap.of(), ImmutableList.of());
+          }
+
+          @Override
+          public boolean isPendingFlagCommit() {
+            return true;
+          }
+        };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+
+      committerImpl.commit(pendingFlagSupplier);
+
+      verify(mockCoordinatorThread).requestImmediateCommit();
+    }
+  }
+
+  /**
+   * Verifies that repeated {@link CommitterImpl#commit} calls while
+   * {@link CommittableSupplier#isPendingFlagCommit()} is {@code true} do NOT call
+   * {@link CoordinatorThread#requestImmediateCommit()} more than once per flag cycle,
+   * preventing unnecessary coordinator wake-ups when partitions are paused and
+   * {@code commit()} is called frequently via {@code preCommit()}.
+   */
+  @Test
+  public void testRequestImmediateCommitCalledOnlyOncePerFlagCycle() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+
+    CoordinatorThread mockCoordinatorThread = mock(CoordinatorThread.class);
+    Mockito.doNothing().when(mockCoordinatorThread).start();
+    Mockito.doNothing().when(mockCoordinatorThread).terminate();
+    CoordinatorThreadFactory coordinatorThreadFactory =
+        (ctx, cfg) -> Optional.of(mockCoordinatorThread);
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    CommittableSupplier pendingFlagSupplier =
+        new CommittableSupplier() {
+          @Override
+          public Committable committable() {
+            return new Committable(ImmutableMap.of(), ImmutableList.of());
+          }
+
+          @Override
+          public boolean isPendingFlagCommit() {
+            return true;
+          }
+        };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+
+      // Simulate multiple commit() calls while the flag is still pending (e.g. repeated
+      // preCommit() invocations from Kafka Connect's periodic flush timer).
+      committerImpl.commit(pendingFlagSupplier);
+      committerImpl.commit(pendingFlagSupplier);
+      committerImpl.commit(pendingFlagSupplier);
+
+      // Must fire exactly once — not once per call.
+      verify(mockCoordinatorThread, times(1)).requestImmediateCommit();
+    }
+  }
 }
+

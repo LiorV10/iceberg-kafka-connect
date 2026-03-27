@@ -123,6 +123,17 @@ public class Coordinator extends Channel implements AutoCloseable {
     consumeAvailable(Duration.ofMillis(1000), this::receive);
   }
 
+  /**
+   * Asks this coordinator to fire the next {@link org.apache.iceberg.connect.events.StartCommit}
+   * without waiting for {@link io.tabular.iceberg.connect.IcebergSinkConfig#commitIntervalMs()}.
+   *
+   * <p>Thread-safe: called from the Kafka Connect thread (via {@link CommitterImpl}) while the
+   * coordinator loop runs in a background thread.
+   */
+  public void requestImmediateCommit() {
+    commitState.requestImmediateCommit();
+  }
+
   public void process() {
     if (commitState.isCommitIntervalReached()) {
       // send out begin commit
@@ -388,9 +399,23 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   /**
    * Returns and removes all flag types for {@code tableIdentifier} that have accumulated
-   * a vote from every source partition (unique partition count {@code >= totalPartitionCount}).
-   * Because the flag is broadcast to all N source partitions, N distinct source partitions
-   * must report before the flag is safe to process.
+   * at least one source-partition vote.
+   *
+   * <p>This method is only ever called from inside {@link #doCommit}, which itself is called
+   * only after either {@link CommitState#isCommitReady(int)} (full commit — all {@code N}
+   * tasks have responded) or {@link CommitState#isCommitTimedOut()} (partial commit).  In
+   * both cases every task that <em>has</em> the flag has already sent its
+   * {@link org.apache.iceberg.connect.events.DataWritten} response carrying the flag data,
+   * so {@link #accumulateFlagVotes} has received all the votes we will ever get for this
+   * commit cycle.
+   *
+   * <p>Requiring at least one vote (rather than {@code totalPartitionCount} votes) correctly
+   * handles the common deployment where the flag is placed on a <em>single</em> source
+   * partition rather than broadcast to all N partitions.  When the flag is broadcast to all
+   * partitions each task still votes individually, so the sentinel is sent as soon as the
+   * full commit completes — the ordering guarantee is preserved because
+   * {@link CommitState#isCommitReady(int)} already ensures every task has committed its
+   * pre-flag data before {@code doCommit} runs.
    */
   private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
       TableIdentifier tableIdentifier) {
@@ -400,7 +425,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
     List<String> readyTypes = votes.entrySet().stream()
-        .filter(e -> e.getValue().size() >= totalPartitionCount)
+        .filter(e -> !e.getValue().isEmpty())
         .map(Map.Entry::getKey)
         .collect(toList());
 
@@ -410,10 +435,11 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     Map<String, Pair<TableContext, Map<String, Object>>> ready = Maps.newHashMap();
     readyTypes.forEach(type -> {
+      int voteCount = votes.getOrDefault(type, Collections.emptySet()).size();
       ready.put(type, data.remove(type));
       votes.remove(type);
-      LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
-          type, tableIdentifier, totalPartitionCount);
+      LOG.info("Flag '{}' for table {} ready: received {} source partition vote(s), processing",
+          type, tableIdentifier, voteCount);
     });
     return ready;
   }

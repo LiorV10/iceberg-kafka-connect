@@ -21,6 +21,7 @@ package io.tabular.iceberg.connect.channel;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.when;
 
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.fixtures.EventTestUtil;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -405,6 +406,132 @@ public class CoordinatorTest extends ChannelTestBase {
         "100",
         secondSnapshot.summary().get(VTTS_SNAPSHOT_PROP),
         "Only the most recent snapshot should include vtts in it's summary");
+  }
+
+  /**
+   * Regression test for the "one task per partition" flag scenario:
+   *
+   * <p>When there are N tasks (each assigned exactly one source partition) and a flag record
+   * is placed on only ONE of those partitions, the coordinator must send the
+   * {@link Coordinator#FLAG_PROCESSED_SENTINEL_ID} sentinel after a single full commit —
+   * not only after receiving {@code totalPartitionCount} flag votes.
+   *
+   * <p>With the old code the threshold was {@code votes.size() >= totalPartitionCount}, so
+   * with N=3 and only 1 flag vote the sentinel was never sent and the worker stayed paused
+   * forever.  With the new threshold ({@code !votes.isEmpty()}) the flag is processed as
+   * soon as the coordinator has received at least one flag-bearing DataWritten event.
+   */
+  @Test
+  public void testFlagSentinelSentWhenFlagIsOnSinglePartitionInMultiTaskDeployment() {
+    // Three tasks, each assigned exactly one source partition → totalPartitionCount = 3.
+    // The flag is only in source partition 0 (task 0), so only 1 vote ever arrives.
+    final int numTasks = 3;
+    final List<MemberDescription> members = Lists.newArrayList();
+    for (int i = 0; i < numTasks; i++) {
+      members.add(
+          new MemberDescription(
+              "memberId" + i,
+              "clientId" + i,
+              "host" + i,
+              new MemberAssignment(ImmutableSet.of(new TopicPartition(SRC_TOPIC_NAME, i)))));
+    }
+
+    // "type" field inside the value map of the flag record JSON.
+    when(config.flagTypeField()).thenReturn("type");
+    // null regex → no branch stripping from table identifier → branch = null in TableContext.
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory);
+    initConsumer();
+
+    when(config.commitIntervalMs()).thenReturn(0);
+    when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
+    coordinator.process();
+
+    // Capture the StartCommit commitId from the first produced record.
+    assertThat(producer.history()).hasSize(1);
+    final UUID commitId =
+        ((StartCommit) AvroUtil.decode(producer.history().get(0).value()).payload()).commitId();
+
+    // Build the flag record JSON: top-level "partition" is used for vote counting,
+    // and "value.type" is the flag type used as the map key in pendingFlagVotes.
+    final String flagRecordJson =
+        "{\"topic\":\"" + SRC_TOPIC_NAME + "\",\"partition\":0,\"offset\":10,"
+            + "\"timestamp\":0,\"key\":null,\"value\":{\"type\":\"END-LOAD\"}}";
+
+    // Task 0 (source partition 0): flag-bearing DataWritten + DataComplete
+    final FlagWriterResult flagResult =
+        new FlagWriterResult(TABLE_IDENTIFIER, null, flagRecordJson);
+    final DataFile flagDataFile = flagResult.dataFiles().get(0);
+
+    int offset = 1;
+    consumer.addRecord(
+        new ConsumerRecord<>(
+            CTL_TOPIC_NAME, 0, offset++, "k",
+            AvroUtil.encode(
+                new Event(
+                    config.controlGroupId(),
+                    new DataWritten(
+                        flagResult.partitionStruct(),
+                        commitId,
+                        TableReference.of(config.catalogName(), TABLE_IDENTIFIER),
+                        ImmutableList.of(flagDataFile),
+                        ImmutableList.of())))));
+    consumer.addRecord(
+        new ConsumerRecord<>(
+            CTL_TOPIC_NAME, 0, offset++, "k",
+            AvroUtil.encode(
+                new Event(
+                    config.controlGroupId(),
+                    new DataComplete(
+                        commitId,
+                        ImmutableList.of(
+                            new TopicPartitionOffset(SRC_TOPIC_NAME, 0, 10L,
+                                OffsetDateTime.ofInstant(Instant.ofEpochMilli(0), ZoneOffset.UTC))))))));
+
+    // Tasks 1 and 2 (source partitions 1 and 2): empty DataWritten + DataComplete
+    for (int srcPartition = 1; srcPartition < numTasks; srcPartition++) {
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CTL_TOPIC_NAME, 0, offset++, "k",
+              AvroUtil.encode(
+                  new Event(
+                      config.controlGroupId(),
+                      new DataWritten(
+                          StructType.of(),
+                          commitId,
+                          TableReference.of(config.catalogName(), TABLE_IDENTIFIER),
+                          ImmutableList.of(),
+                          ImmutableList.of())))));
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CTL_TOPIC_NAME, 0, offset++, "k",
+              AvroUtil.encode(
+                  new Event(
+                      config.controlGroupId(),
+                      new DataComplete(
+                          commitId,
+                          ImmutableList.of(
+                              new TopicPartitionOffset(SRC_TOPIC_NAME, srcPartition, null, null)))))));
+    }
+
+    // All N tasks have now responded → isCommitReady(3) fires → doCommit runs.
+    coordinator.process();
+
+    // The coordinator must have sent the FLAG_PROCESSED_SENTINEL_ID CommitToTable event.
+    boolean sentinelSent =
+        producer.history().stream()
+            .skip(1) // skip the initial StartCommit
+            .map(r -> AvroUtil.decode(r.value()))
+            .filter(e -> e.type() == PayloadType.COMMIT_TO_TABLE)
+            .map(e -> (CommitToTable) e.payload())
+            .anyMatch(p -> Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(p.commitId()));
+
+    assertThat(sentinelSent)
+        .as(
+            "FLAG_PROCESSED_SENTINEL_ID CommitToTable must be sent after a flag arrives from a"
+                + " single source partition when totalPartitionCount > 1")
+        .isTrue();
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {
