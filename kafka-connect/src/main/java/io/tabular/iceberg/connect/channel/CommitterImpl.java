@@ -91,8 +91,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     this.context = context;
     this.config = config;
 
-    this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
-
     // The source-of-truth for source-topic offsets is the control-group-id
     Map<TopicPartition, Long> stableConsumerOffsets =
         fetchStableConsumerOffsets(config.controlGroupId());
@@ -107,6 +105,14 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                 envelope,
                 // CommittableSupplier that always returns empty committables
                 () -> new Committable(ImmutableMap.of(), ImmutableList.of())));
+
+    // Start the coordinator AFTER the initial poll completes.  CommitState now fires the
+    // very first StartCommit immediately (no commitIntervalMs wait), so starting the
+    // coordinator before the poll would risk having the constructor's empty-committable
+    // handler consume that fast-start StartCommit and respond with no flag data.
+    // Running the two 1-second initializations sequentially (total ~2 s) is an acceptable
+    // trade-off to eliminate this race.
+    this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
   }
 
   private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
