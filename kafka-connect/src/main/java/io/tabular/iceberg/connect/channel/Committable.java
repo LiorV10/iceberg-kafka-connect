@@ -22,6 +22,7 @@ import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.util.List;
 import java.util.Map;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.kafka.common.TopicPartition;
@@ -30,11 +31,25 @@ class Committable {
 
   private final ImmutableMap<TopicPartition, Offset> offsetsByTopicPartition;
   private final ImmutableList<WriterResult> writerResults;
+  /**
+   * Maps each currently-paused source {@link TopicPartition} to the {@link TableIdentifier} of the
+   * flag record that caused the pause.  CommitterImpl uses this to persist a {@code PAUSED:<table>}
+   * metadata string in the Kafka consumer-group offset so that the pause survives pod crashes.
+   */
+  private final ImmutableMap<TopicPartition, TableIdentifier> pausedPartitionTables;
 
   Committable(
       Map<TopicPartition, Offset> offsetsByTopicPartition, List<WriterResult> writerResults) {
+    this(offsetsByTopicPartition, writerResults, ImmutableMap.of());
+  }
+
+  Committable(
+      Map<TopicPartition, Offset> offsetsByTopicPartition,
+      List<WriterResult> writerResults,
+      Map<TopicPartition, TableIdentifier> pausedPartitionTables) {
     this.offsetsByTopicPartition = ImmutableMap.copyOf(offsetsByTopicPartition);
     this.writerResults = ImmutableList.copyOf(writerResults);
+    this.pausedPartitionTables = ImmutableMap.copyOf(pausedPartitionTables);
   }
 
   public Map<TopicPartition, Offset> offsetsByTopicPartition() {
@@ -43,5 +58,9 @@ class Committable {
 
   public List<WriterResult> writerResults() {
     return writerResults;
+  }
+
+  public Map<TopicPartition, TableIdentifier> pausedPartitionTables() {
+    return pausedPartitionTables;
   }
 }

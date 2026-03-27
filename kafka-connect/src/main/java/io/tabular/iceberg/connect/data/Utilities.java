@@ -56,6 +56,7 @@ import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -277,6 +278,12 @@ public class Utilities {
         }
       }
     }
+  }
+
+  public static boolean isFlagRecord(SinkRecord record, String flagKeyPrefix) {
+    return flagKeyPrefix != null
+        && record.key() != null
+        && record.key().toString().startsWith(flagKeyPrefix);
   }
 
   private Utilities() {}

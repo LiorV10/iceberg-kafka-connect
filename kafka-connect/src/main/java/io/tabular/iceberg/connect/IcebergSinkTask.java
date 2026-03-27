@@ -80,6 +80,13 @@ public class IcebergSinkTask extends SinkTask {
   @Override
   public Map<TopicPartition, OffsetAndMetadata> preCommit(
       Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
+    // Poll the control topic for coordinator events (START_COMMIT, flag-processed CommitToTable,
+    // etc.) even when all source partitions are paused.  Kafka Connect stops calling put() when
+    // there are no records to deliver, so without this call the control consumer would stall and
+    // committable() would never be invoked after a flag pause.
+    if (task != null) {
+      task.commit();
+    }
     return ImmutableMap.of();
   }
 

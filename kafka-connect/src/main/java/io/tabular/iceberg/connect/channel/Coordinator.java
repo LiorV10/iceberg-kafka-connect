@@ -44,6 +44,7 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
@@ -55,6 +56,8 @@ import org.apache.iceberg.util.ThreadPools;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
+import java.util.UUID;
 
 public class Coordinator extends Channel implements AutoCloseable {
 
@@ -64,6 +67,12 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
   private static final String VTTS_SNAPSHOT_PROP = "kafka.connect.vtts";
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
+
+  /**
+   * Special commit ID broadcast in a {@code CommitToTable} event to signal workers that the
+   * flag for a specific table has been fully processed and paused partitions can be resumed.
+   */
+  public static final UUID FLAG_PROCESSED_SENTINEL_ID = new UUID(0L, 0L);
 
   private final Catalog catalog;
   private final IcebergSinkConfig config;
@@ -201,10 +210,20 @@ public class Coordinator extends Channel implements AutoCloseable {
                 })
             .collect(toList());
 
+    // Separate flag-marker files from regular data/delete files.
+    // Flag-marker DataFiles carry the prefix "__flag__:" in their path and are NOT appended to
+    // the Iceberg table; instead they trigger the FLAG_PROCESSED_SENTINEL_ID broadcast so that
+    // workers can resume the paused source partitions.
+    boolean hasFlag =
+        filteredEnvelopeList.stream()
+            .flatMap(e -> ((DataWritten) e.event().payload()).dataFiles().stream())
+            .anyMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_MARKER_PREFIX));
+
     List<DataFile> dataFiles =
         Deduplicated.dataFiles(commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(dataFile -> dataFile.recordCount() > 0)
+            .filter(dataFile -> !dataFile.path().toString().startsWith(FlagWriterResult.FLAG_MARKER_PREFIX))
             .collect(toList());
 
     List<DeleteFile> deleteFiles =
@@ -273,6 +292,21 @@ public class Coordinator extends Channel implements AutoCloseable {
           snapshotId,
           commitState.currentCommitId(),
           vtts);
+    }
+
+    // After handling all regular data, broadcast the flag-processed sentinel so that workers
+    // can resume the source partitions that were paused for this table's flag.
+    if (hasFlag) {
+      Event sentinel =
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  FLAG_PROCESSED_SENTINEL_ID,
+                  TableReference.of(config.catalogName(), tableIdentifier),
+                  null,
+                  null));
+      send(sentinel);
+      LOG.info("Broadcast FLAG_PROCESSED sentinel for table {}", tableIdentifier);
     }
   }
 

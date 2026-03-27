@@ -81,13 +81,10 @@ public abstract class Channel {
     send(ImmutableList.of(event), ImmutableMap.of(), null);
   }
 
-  protected void send(
+  protected void sendWithOffsetMetadata(
       List<Event> events,
-      Map<TopicPartition, Offset> sourceOffsets,
+      Map<TopicPartition, OffsetAndMetadata> offsetsToCommit,
       ConsumerGroupMetadata consumerGroupMetadata) {
-    Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
-    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
-
     List<ProducerRecord<String, byte[]>> recordList =
         events.stream()
             .map(
@@ -104,7 +101,7 @@ public abstract class Channel {
       try {
         recordList.forEach(producer::send);
         producer.flush();
-        if (!sourceOffsets.isEmpty()) {
+        if (!offsetsToCommit.isEmpty()) {
           producer.sendOffsetsToTransaction(offsetsToCommit, consumerGroupMetadata);
         }
         producer.commitTransaction();
@@ -117,6 +114,15 @@ public abstract class Channel {
         throw e;
       }
     }
+  }
+
+  protected void send(
+      List<Event> events,
+      Map<TopicPartition, Offset> sourceOffsets,
+      ConsumerGroupMetadata consumerGroupMetadata) {
+    Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
+    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
+    sendWithOffsetMetadata(events, offsetsToCommit, consumerGroupMetadata);
   }
 
   protected void consumeAvailable(Duration pollDuration, Function<Envelope, Boolean> receiveFn) {

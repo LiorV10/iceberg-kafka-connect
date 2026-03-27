@@ -69,6 +69,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_PROP = "iceberg.tables";
   private static final String TABLES_DYNAMIC_PROP = "iceberg.tables.dynamic-enabled";
   private static final String TABLES_ROUTE_FIELD_PROP = "iceberg.tables.route-field";
+  private static final String TABLES_FLAG_KEY_PREFIX_PROP = "iceberg.tables.flag-key-prefix";
   private static final String TABLES_DEFAULT_COMMIT_BRANCH = "iceberg.tables.default-commit-branch";
   private static final String TABLES_DEFAULT_ID_COLUMNS = "iceberg.tables.default-id-columns";
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
@@ -135,6 +136,12 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Source record field for routing records to tables");
+    configDef.define(
+        TABLES_FLAG_KEY_PREFIX_PROP,
+        Type.STRING,
+        null,
+        Importance.MEDIUM,
+        "Key prefix that identifies flag records; partitions are paused until the coordinator confirms the flag");
     configDef.define(
         TABLES_DEFAULT_COMMIT_BRANCH,
         Type.STRING,
@@ -335,6 +342,10 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public String tablesRouteField() {
     return getString(TABLES_ROUTE_FIELD_PROP);
+  }
+
+  public String flagKeyPrefix() {
+    return getString(TABLES_FLAG_KEY_PREFIX_PROP);
   }
 
   public String tablesDefaultCommitBranch() {

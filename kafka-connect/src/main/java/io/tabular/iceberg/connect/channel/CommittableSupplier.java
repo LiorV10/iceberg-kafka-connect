@@ -18,6 +18,19 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import org.apache.iceberg.catalog.TableIdentifier;
+
 interface CommittableSupplier {
   Committable committable();
+
+  /**
+   * Called by {@link CommitterImpl} when it receives the per-table
+   * {@link org.apache.iceberg.connect.events.CommitToTable} sentinel that the Coordinator
+   * broadcasts after processing all flag events for {@code tableIdentifier}.  Implementations
+   * should resume any source partitions that were paused for this table.
+   *
+   * <p>The default is a no-op so that anonymous/lambda suppliers used in tests and the
+   * {@link CommitterImpl} constructor do not need to override this method.
+   */
+  default void onFlagProcessed(TableIdentifier tableIdentifier) {}
 }

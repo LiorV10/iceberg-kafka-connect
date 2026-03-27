@@ -23,4 +23,14 @@ import org.apache.kafka.connect.sink.SinkRecord;
 
 public interface Task {
   void put(Collection<SinkRecord> sinkRecords);
+
+  /**
+   * Polls the control topic for coordinator events ({@code START_COMMIT}, flag-processed
+   * {@code CommitToTable}, etc.) without requiring new source records to be delivered.
+   *
+   * <p>Must be called from {@link io.tabular.iceberg.connect.IcebergSinkTask#preCommit} so that
+   * the control consumer keeps running even while all source partitions are paused (in which case
+   * Kafka Connect stops calling {@link #put}).
+   */
+  void commit();
 }
