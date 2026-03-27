@@ -25,14 +25,12 @@ import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.Offset;
 import java.io.IOException;
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
@@ -48,7 +46,6 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkTaskContext;
@@ -61,13 +58,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
-
-  // Pending-flag state detected in committed consumer-group offset metadata on startup.
-  // Maps source TopicPartition → (committedOffset, rawTableId).
-  // Populated in the constructor; consumed (and cleared) on the first commit() call.
-  private final Map<TopicPartition, Long> startupFlagOffsets = new HashMap<>();
-  private final Map<TopicPartition, TableIdentifier> startupFlagTables = new HashMap<>();
-  private boolean pendingFlagStateRestored = false;
 
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
@@ -103,34 +93,11 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
     this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
 
-    // The source-of-truth for source-topic offsets is the control-group-id.
-    // Fetch the full OffsetAndMetadata so we can inspect per-partition metadata for FLAG_PENDING.
-    Map<TopicPartition, OffsetAndMetadata> stableOffsets =
+    // The source-of-truth for source-topic offsets is the control-group-id
+    Map<TopicPartition, Long> stableConsumerOffsets =
         fetchStableConsumerOffsets(config.controlGroupId());
-
-    Map<TopicPartition, Long> plainOffsets =
-        stableOffsets.entrySet().stream()
-            .collect(toMap(Map.Entry::getKey, e -> e.getValue().offset()));
-
     // Rewind kafka connect consumer to avoid duplicates
-    context.offset(plainOffsets);
-
-    // Detect any FLAG_PENDING metadata left by a previous run that crashed while a flag was in
-    // progress.  We record the info here and restore it in the first commit() call (after the
-    // Worker has been fully initialised by TaskImpl).
-    stableOffsets.forEach(
-        (tp, oam) -> {
-          String meta = oam.metadata();
-          if (meta != null && meta.startsWith(CommittableSupplier.FLAG_METADATA_PREFIX)) {
-            String rawTableId = meta.substring(CommittableSupplier.FLAG_METADATA_PREFIX.length());
-            LOG.info(
-                "Detected FLAG_PENDING metadata for partition {} table {} at offset {} — "
-                    + "will restore paused state on first commit",
-                tp, rawTableId, oam.offset());
-            startupFlagOffsets.put(tp, oam.offset());
-            startupFlagTables.put(tp, TableIdentifier.parse(rawTableId));
-          }
-        });
+    context.offset(stableConsumerOffsets);
 
     consumeAvailable(
         // initial poll with longer duration so the consumer will initialize...
@@ -142,7 +109,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                 () -> new Committable(ImmutableMap.of(), ImmutableList.of())));
   }
 
-  private Map<TopicPartition, OffsetAndMetadata> fetchStableConsumerOffsets(String groupId) {
+  private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
     try {
       ListConsumerGroupOffsetsResult response =
           admin()
@@ -150,7 +117,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                   groupId, new ListConsumerGroupOffsetsOptions().requireStable(true));
       return response.partitionsToOffsetAndMetadata().get().entrySet().stream()
           .filter(entry -> context.assignment().contains(entry.getKey()))
-          .collect(toMap(Map.Entry::getKey, Map.Entry::getValue));
+          .collect(toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
     } catch (InterruptedException | ExecutionException e) {
       throw new ConnectException(e);
     }
@@ -184,11 +151,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
   private void sendCommitResponse(UUID commitId, CommittableSupplier committableSupplier) {
     Committable committable = committableSupplier.committable();
-
-    // Obtain any FLAG_PENDING metadata that should be encoded in the committed offsets.
-    // This keeps the persistent "flag in progress" state alive in controlGroupId across restarts
-    // until onFlagProcessed() clears it on the next cycle.
-    Map<TopicPartition, String> flagMeta = committableSupplier.pendingFlagMetadata();
 
     List<Event> events = Lists.newArrayList();
 
@@ -233,26 +195,13 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     events.add(commitReady);
 
     Map<TopicPartition, Offset> offsets = committable.offsetsByTopicPartition();
-    send(events, offsets, flagMeta, new ConsumerGroupMetadata(config.controlGroupId()));
-    send(ImmutableList.of(), offsets, flagMeta, new ConsumerGroupMetadata(config.connectGroupId()));
+    send(events, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
+    send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
   }
 
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-
-    // On the first commit() call after startup, restore any FLAG_PENDING state that was detected
-    // from committed consumer-group offset metadata.  This is done here rather than in the
-    // constructor because the Worker (CommittableSupplier) is created and fully initialised by
-    // TaskImpl before commit() is ever called.
-    if (!pendingFlagStateRestored) {
-      pendingFlagStateRestored = true;
-      startupFlagOffsets.forEach(
-          (tp, offset) ->
-              committableSupplier.restorePendingFlagState(
-                  tp, startupFlagTables.get(tp), offset));
-    }
-
     consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
   }
 

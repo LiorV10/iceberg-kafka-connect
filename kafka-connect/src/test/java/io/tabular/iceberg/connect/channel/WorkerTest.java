@@ -161,19 +161,23 @@ public class WorkerTest {
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // Pause is now IMMEDIATE — called inside write(), not deferred to committable()
+    // pause() must NOT yet be called — the pause is deferred until committable() time
+    verify(context, never()).pause(tp);
+
+    // After committable() is called the pause must have been requested
+    worker.committable();
     verify(context, times(1)).pause(tp);
     // resume() must NOT have been called yet
     verify(context, never()).resume(tp);
   }
 
   /**
-   * Verifies that records arriving after the flag in the same batch are dropped (the partition is
-   * paused immediately on flag detection, so isPaused=true for subsequent records in the same
-   * write() call).  They will be re-delivered after resume.
+   * Verifies that records arriving after the flag in the same batch are immediately written but
+   * rerouted to the flag's branch table, and that {@link Worker#onFlagProcessed()} resumes the
+   * partitions and clears the reroute so that new records go to their natural destination.
    */
   @Test
-  public void testPostFlagRecordsInSameBatchAreDroppedDueToPause() {
+  public void testPostFlagRecordsInSameBatchAreReroutedToFlagBranch() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -191,7 +195,7 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // A data record that arrives after the flag in the same batch
+    // A data record whose natural route is "db.other", but arrives after the flag in the batch
     String otherTable = "db.other";
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
@@ -202,8 +206,8 @@ public class WorkerTest {
 
     worker.write(ImmutableList.of(flagRec, dataRec));
 
-    // Post-flag record is DROPPED (isPaused=true after flag detection), so no writer is created
-    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // Post-flag record must be written immediately, but to the rerouted (flag) table, not "db.other"
+    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
     verify(writerFactory, never()).createWriter(eq(otherTable), any(), anyBoolean());
   }
 
@@ -316,21 +320,20 @@ public class WorkerTest {
     // Resume must NOT have been called — this worker is still paused for its own table's flag
     verify(context, never()).resume(tp);
 
-    // The partition is paused: a new record is dropped (isPaused=true), not rerouted
+    // The reroute should still be active (a new record gets rerouted)
     SinkRecord postRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
             ImmutableMap.of(FIELD_NAME, "db.should_not_be_used"), 2L);
     worker.write(ImmutableList.of(postRec));
-    verify(writerFactory, never()).createWriter(any(), any(), anyBoolean());
+    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
   }
 
   /**
-   * Verifies that pre-flag records in the same batch are written to their natural destination,
-   * while post-flag records in the same batch are DROPPED because the partition is paused
-   * immediately when the flag is detected.  Post-flag records are re-delivered after resume.
+   * Verifies that pre-flag records in the same batch are written immediately to their natural
+   * destination, while post-flag records are immediately written but rerouted to the flag branch.
    */
   @Test
-  public void testPreFlagRecordsWrittenNormallyPostFlagRecordsDropped() {
+  public void testPreFlagRecordsWrittenNormallyPostFlagRecordsRerouted() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -364,168 +367,10 @@ public class WorkerTest {
 
     // Pre-flag record is written to its natural table
     verify(writerFactory, times(1)).createWriter(eq(preTable), any(), anyBoolean());
-    // Post-flag record is DROPPED (isPaused=true after flag detection) — no writer created for it
+    // Post-flag record is written immediately, but rerouted to the flag branch table
+    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // The post-flag record's natural route is never used
     verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
-    // The flag's own table is never written to by worker (FlagWriterResult is not via writerFactory)
-    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
-  }
-
-  /**
-   * Verifies that the source offset committed for the flag partition is F+1 (past the flag).
-   * Crash-recovery persistence is handled by FLAG_PENDING metadata, not by anchoring at F.
-   * Committing F+1 guarantees that the FlagWriterResult is sent to the coordinator in the same
-   * Kafka transaction that commits F+1; this makes the two actions atomic.
-   */
-  @Test
-  public void testFlagOffsetIsCommittedPastFlagRecordWithMetadataPersistence() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    Worker worker = new Worker(config, writerFactory);
-
-    long flagKafkaOffset = 5L;
-    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    SinkRecord flagRec =
-        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, flagKafkaOffset);
-    worker.write(ImmutableList.of(flagRec));
-
-    Committable committable = worker.committable();
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    assertThat(committable.offsetsByTopicPartition()).containsKey(tp);
-    // Offset must be F+1 (past the flag) — recovery uses FLAG_PENDING metadata, not offset re-read.
-    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
-        .as("Committed offset must be F+1 (past the flag); persistence is via FLAG_PENDING metadata")
-        .isEqualTo(flagKafkaOffset + 1);
-  }
-
-  /**
-   * Verifies that {@link Worker#pendingFlagMetadata()} returns FLAG_PENDING:<tableId> for the
-   * flag partition while a flag is in progress, and an empty map once it is cleared.
-   */
-  @Test
-  public void testPendingFlagMetadataLifecycle() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    SinkTaskContext context = mock(SinkTaskContext.class);
-    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    Worker worker = new Worker(config, writerFactory, context);
-
-    // Before flag: metadata is empty
-    assertThat(worker.pendingFlagMetadata()).isEmpty();
-
-    long flagKafkaOffset = 3L;
-    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    SinkRecord flagRec =
-        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, flagKafkaOffset);
-    worker.write(ImmutableList.of(flagRec));
-
-    // After flag detected: metadata encodes FLAG_PENDING:<tableId>
-    assertThat(worker.pendingFlagMetadata())
-        .containsKey(tp)
-        .containsValue(CommittableSupplier.FLAG_METADATA_PREFIX + TABLE_NAME);
-
-    // After flag processed: metadata is cleared
-    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
-    assertThat(worker.pendingFlagMetadata()).isEmpty();
-  }
-
-  /**
-   * Verifies that {@link Worker#restorePendingFlagState} correctly re-establishes the paused
-   * state, re-queues a FlagWriterResult, stores the committed offset, and requests an immediate
-   * commit — exactly mirroring the original flag detection path so the FlagWriterResult is
-   * delivered to the Coordinator promptly without waiting for the next periodic START_COMMIT.
-   */
-  @Test
-  public void testRestorePendingFlagStateReestablishesPausedState() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    SinkTaskContext context = mock(SinkTaskContext.class);
-    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    Worker worker = new Worker(config, writerFactory, context);
-
-    long committedOffset = 6L; // F+1 — what was stored in controlGroupId
-    worker.restorePendingFlagState(tp, TableIdentifier.parse(TABLE_NAME), committedOffset);
-
-    // Partition must be paused immediately
-    verify(context, times(1)).pause(tp);
-
-    // An immediate commit must be requested so the FlagWriterResult reaches the coordinator
-    // without waiting for the next periodic START_COMMIT (mirrors original flag detection)
-    verify(context, times(1)).requestCommit();
-
-    // FlagWriterResult must be in the committable
-    Committable committable = worker.committable();
-    assertThat(committable.writerResults())
-        .hasSize(1)
-        .allMatch(r -> r instanceof FlagWriterResult);
-
-    // Committed offset must be F+1 (so FLAG_PENDING metadata stays alive until cleared)
-    assertThat(committable.offsetsByTopicPartition()).containsKey(tp);
-    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
-        .isEqualTo(committedOffset);
-  }
-
-  /**
-   * Verifies that after {@link Worker#onFlagProcessed} is called, the next {@link
-   * Worker#committable()} includes offset F+1 WITHOUT FLAG_PENDING metadata (reroute=null →
-   * pendingFlagMetadata() is empty), permanently clearing the persistent state.
-   */
-  @Test
-  public void testOnFlagProcessedClearsFlagMetadataOnNextCommit() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    SinkTaskContext context = mock(SinkTaskContext.class);
-    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    Worker worker = new Worker(config, writerFactory, context);
-
-    long flagKafkaOffset = 7L;
-    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    SinkRecord flagRec =
-        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, flagKafkaOffset);
-
-    // Detect the flag, flush through a committable cycle (FLAG_PENDING metadata present)
-    worker.write(ImmutableList.of(flagRec));
-    worker.committable(); // clears sourceOffsets after snapshot
-
-    // Signal that the Coordinator finished the flag action
-    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
-
-    // reroute is now null → pendingFlagMetadata() returns empty
-    assertThat(worker.pendingFlagMetadata()).isEmpty();
-
-    // The next committable should carry F+1 so that when CommitterImpl commits it WITHOUT
-    // FLAG_PENDING metadata the persistent state is cleared in controlGroupId
-    Committable afterResume = worker.committable();
-    assertThat(afterResume.offsetsByTopicPartition()).containsKey(tp);
-    assertThat(afterResume.offsetsByTopicPartition().get(tp).offset())
-        .as("After flag processed, offset F+1 must be committed without FLAG_PENDING metadata")
-        .isEqualTo(flagKafkaOffset + 1);
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {

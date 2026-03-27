@@ -101,12 +101,6 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final Map<TableIdentifier, Map<String, Set<Integer>>> pendingFlagVotes = Maps.newHashMap();
   // First-seen flag payload per table per flag type, held until the vote count is complete.
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
-  // Flag types that have already been fully processed (branch switch executed), keyed by table
-  // identifier after branch-stripping.  Used to detect re-submitted flags from restarted workers
-  // (a worker that crashed before receiving the sentinel will re-read the flag on restart and
-  // re-submit a FlagWriterResult).  When such a duplicate is detected the sentinel is re-sent
-  // immediately so the worker can resume without waiting for a full new round of votes.
-  private final Map<TableIdentifier, Set<String>> recentlyProcessedFlags = Maps.newHashMap();
 
   public Coordinator(
       Catalog catalog,
@@ -274,11 +268,6 @@ public class Coordinator extends Channel implements AutoCloseable {
     // are persisted across cycles until the quorum is reached.
     accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
-    // If a flag vote arrives for a type that was already fully processed (e.g. from a worker
-    // that restarted after the sentinel was sent), re-send the sentinel immediately so that
-    // restarted worker can resume without waiting for a new full round of votes.
-    resendSentinelForAlreadyProcessedFlags(paramTableIdentifier, tableIdentifier, filteredEnvelopeList);
-
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
@@ -344,11 +333,6 @@ public class Coordinator extends Channel implements AutoCloseable {
     Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
     if (!readyFlags.isEmpty()) {
       processFlagMessages(table, readyFlags);
-      // Record these flag types as processed so that re-submitted flags from restarted workers
-      // can be detected and handled by resendSentinelForAlreadyProcessedFlags().
-      recentlyProcessedFlags
-          .computeIfAbsent(tableIdentifier, k -> new HashSet<>())
-          .addAll(readyFlags.keySet());
       // Send a per-table sentinel CommitToTable so that only workers routing to this table's
       // original identifier (before any branch-stripping) clear their reroute state and resume.
       // Using FLAG_PROCESSED_SENTINEL_ID as the commitId lets CommitterImpl distinguish this
@@ -366,68 +350,6 @@ public class Coordinator extends Channel implements AutoCloseable {
                   null));
       send(flagSentinel);
     }
-  }
-
-  /**
-   * Checks whether the current commit batch contains flag votes for flag types that were already
-   * fully processed (i.e. whose action was executed and sentinel was sent in a prior commit).
-   * This situation arises when a worker crashes after sending its {@link
-   * io.tabular.iceberg.connect.data.FlagWriterResult} but before receiving the sentinel: on
-   * restart the worker re-reads the flag from its persisted offset and re-submits the result.
-   *
-   * <p>For each such flag type the coordinator removes it from the pending-vote maps (to avoid
-   * double-processing) and immediately re-sends the sentinel so the restarted worker can resume.
-   */
-  private void resendSentinelForAlreadyProcessedFlags(
-      TableIdentifier paramTableIdentifier,
-      TableIdentifier tableIdentifier,
-      List<Envelope> filteredEnvelopeList) {
-
-    Set<String> processedTypes =
-        recentlyProcessedFlags.getOrDefault(tableIdentifier, Collections.emptySet());
-    if (processedTypes.isEmpty()) {
-      return;
-    }
-
-    Map<String, Set<Integer>> flagTypesInBatch =
-        Deduplicated.flagMessageSourcePartitions(filteredEnvelopeList, config.flagTypeField());
-    if (flagTypesInBatch.isEmpty()) {
-      return;
-    }
-
-    Set<String> alreadyProcessed =
-        flagTypesInBatch.keySet().stream()
-            .filter(processedTypes::contains)
-            .collect(Collectors.toSet());
-    if (alreadyProcessed.isEmpty()) {
-      return;
-    }
-
-    LOG.info(
-        "Received flag vote(s) for already-processed flag type(s) {} for table {} — "
-            + "likely from a restarted worker. Re-sending resume sentinel.",
-        alreadyProcessed, tableIdentifier);
-
-    // Remove from pending maps to prevent re-processing the same flag action.
-    Map<String, Set<Integer>> votes =
-        pendingFlagVotes.getOrDefault(tableIdentifier, Collections.emptyMap());
-    Map<String, Pair<TableContext, Map<String, Object>>> data =
-        pendingFlagData.getOrDefault(tableIdentifier, Collections.emptyMap());
-    alreadyProcessed.forEach(type -> {
-      votes.remove(type);
-      data.remove(type);
-    });
-
-    // Re-send the sentinel so the restarted worker can resume immediately.
-    Event flagSentinel =
-        new Event(
-            config.controlGroupId(),
-            new CommitToTable(
-                FLAG_PROCESSED_SENTINEL_ID,
-                TableReference.of(config.catalogName(), paramTableIdentifier),
-                0L,
-                null));
-    send(flagSentinel);
   }
 
   /**
