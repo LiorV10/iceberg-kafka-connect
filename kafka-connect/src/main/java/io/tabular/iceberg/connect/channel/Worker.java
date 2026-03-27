@@ -61,12 +61,9 @@ class Worker implements Writer, AutoCloseable {
   private boolean isPaused;
   private final SinkTaskContext context;
 
-  // Non-null while a flag has been detected but not yet cleared by onFlagProcessed().
-  // Used to route post-flag records to the correct table and to gate pause/resume.
-  private TableIdentifier reroute;
-  // The partition number that carried the flag record; used to pause only that partition
-  // in committable() rather than at save() time.
-  private int flagPartition = -1;
+  // Non-null while this worker is paused waiting for coordinator to process a flag.
+  // Used only by onFlagProcessed() to verify the sentinel is for the correct table.
+  private TableIdentifier pendingFlagTable;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
     this(config, new IcebergWriterFactory(catalog, config), context);
@@ -86,8 +83,7 @@ class Worker implements Writer, AutoCloseable {
     this.flagWriterResults = Lists.newArrayList();
     this.isPaused = false;
     this.context = context;
-    this.reroute = null;
-    this.flagPartition = -1;
+    this.pendingFlagTable = null;
   }
 
   @Override
@@ -105,16 +101,6 @@ class Worker implements Writer, AutoCloseable {
     writers.clear();
     sourceOffsets.clear();
     flagWriterResults.clear();
-    // NOTE: do NOT clear reroute here.  Reroute must remain set across commit cycles because the
-    // flag result is sent in this cycle's sendCommitResponse(), and onFlagProcessed() is only
-    // triggered later when the Coordinator broadcasts the per-table sentinel after all partitions
-    // have reported — which may happen in a subsequent commit cycle.
-
-    // Pause the flag partition now (deferred from save() so that the commit cycle containing the
-    // FlagWriterResult completes before the partition is paused and put() stops being called).
-    if (reroute != null && !isPaused) {
-      pauseAssignment(flagPartition);
-    }
 
     LOG.debug("Committing {} records", writeResults.size());
 
@@ -127,21 +113,20 @@ class Worker implements Writer, AutoCloseable {
    * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
    * partitions for a specific table and executed the flag action (e.g. branch switch).
    * <p>
-   * Only acts when this worker is currently rerouting to {@code tableIdentifier}.  Workers for
-   * other tables, or workers that never detected a flag, are unaffected.
+   * Only acts when this worker is paused waiting for the sentinel for {@code tableIdentifier}.
+   * Sentinels for other tables are silently ignored.
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
-    if (reroute == null || !reroute.equals(tableIdentifier)) {
-      // Either no flag was ever detected, or this sentinel is for a different table — nothing to do.
+    if (pendingFlagTable == null || !pendingFlagTable.equals(tableIdentifier)) {
+      // Either no flag was detected on this worker, or the sentinel is for a different table.
       return;
     }
 
-    LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+    LOG.debug("Flag-processed signal received for table {}, resuming partitions", tableIdentifier);
 
     resumeAssignment();
-    reroute = null;
-    flagPartition = -1;
+    pendingFlagTable = null;
   }
 
   @Override
@@ -151,8 +136,7 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.clear();
     flagWriterResults.clear();
     this.isPaused = false;
-    this.reroute = null;
-    this.flagPartition = -1;
+    this.pendingFlagTable = null;
   }
 
   @Override
@@ -192,28 +176,22 @@ class Worker implements Writer, AutoCloseable {
       FlagWriterResult flagResult =
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
-
-      // Remember the flag's target table and partition so we can reroute subsequent records
-      // and defer the pause to committable() time.  Pausing here would prevent put() from
-      // being called again, which would prevent committable() from ever being invoked, so
-      // the FlagWriterResult would never reach the coordinator.
-      this.reroute = tableIdentifier;
-      this.flagPartition = record.kafkaPartition();
+      this.pendingFlagTable = tableIdentifier;
 
       if (context != null) {
         context.requestCommit();
       }
 
+      // Pause immediately so no further records from this partition are delivered until the
+      // coordinator has processed the flag and sent the per-table sentinel.
+      pauseAssignment(record.kafkaPartition());
       LOG.info(
-          "Flag detected — rerouting same-batch records to {} (branch: {})",
-          tableContext.tableIdentifier(),
-          tableContext.branch());
+          "Flag detected at partition {} offset {} — pausing partition for table {}",
+          record.kafkaPartition(),
+          record.kafkaOffset(),
+          tableContext.tableIdentifier());
     } else {
-      // If a flag was detected earlier in this batch (or a previous one), route all subsequent
-      // records to the flag's target table until the coordinator sends the FLAG_PROCESSED_SENTINEL.
-      if (reroute != null) {
-        writerForTable(reroute.toString(), record, true).write(record);
-      } else if (config.dynamicTablesEnabled()) {
+      if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
         routeRecordStatically(record);
