@@ -81,6 +81,13 @@ public class CommitState {
   public boolean isCommitIntervalReached() {
     if (startTime == 0) {
       startTime = System.currentTimeMillis();
+      // Fire the very first StartCommit immediately on startup.  Workers subscribe to the
+      // control topic from 'latest' (a fresh transient consumer group), so they will miss any
+      // StartCommit sent before they joined.  By firing immediately the coordinator gives
+      // all CommitterImpls — which finish their own 1-second initialization poll before the
+      // coordinator is even started — a chance to receive and respond to the first StartCommit
+      // within a second rather than waiting a full commitIntervalMs after restart.
+      return !isCommitInProgress();
     }
 
     return (!isCommitInProgress()
