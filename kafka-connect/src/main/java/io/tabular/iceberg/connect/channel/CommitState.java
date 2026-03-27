@@ -88,11 +88,14 @@ public class CommitState {
   }
 
   public void startNewCommit() {
-    currentCommitId = UUID.randomUUID();
-    startTime = System.currentTimeMillis();
+    startCommit(UUID.randomUUID());
   }
 
   public void resumeCommit(UUID commitId) {
+    startCommit(commitId);
+  }
+
+  private void startCommit(UUID commitId) {
     currentCommitId = commitId;
     startTime = System.currentTimeMillis();
   }
