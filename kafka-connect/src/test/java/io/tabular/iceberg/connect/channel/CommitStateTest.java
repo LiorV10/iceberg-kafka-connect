@@ -102,6 +102,18 @@ public class CommitStateTest {
     assertThat(commitState.vtts(true)).isNull();
   }
 
+  @Test
+  public void testResumeCommitSetsCommitId() {
+    CommitState commitState = new CommitState(mock(IcebergSinkConfig.class));
+    assertThat(commitState.isCommitInProgress()).isFalse();
+
+    UUID resumedId = UUID.randomUUID();
+    commitState.resumeCommit(resumedId);
+
+    assertThat(commitState.isCommitInProgress()).isTrue();
+    assertThat(commitState.currentCommitId()).isEqualTo(resumedId);
+  }
+
   private Envelope wrapInEnvelope(Payload payload) {
     Event event = mock(Event.class);
     when(event.payload()).thenReturn(payload);

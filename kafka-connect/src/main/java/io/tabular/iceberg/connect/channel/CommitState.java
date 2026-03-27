@@ -92,6 +92,11 @@ public class CommitState {
     startTime = System.currentTimeMillis();
   }
 
+  public void resumeCommit(UUID commitId) {
+    currentCommitId = commitId;
+    startTime = System.currentTimeMillis();
+  }
+
   public void endCurrentCommit() {
     readyBuffer.clear();
     currentCommitId = null;
