@@ -25,7 +25,7 @@ public class CoordinatorThread extends Thread {
   private static final Logger LOG = LoggerFactory.getLogger(CoordinatorThread.class);
   private static final String THREAD_NAME = "iceberg-coord";
 
-  private Coordinator coordinator;
+  private volatile Coordinator coordinator;
   private volatile boolean terminated;
 
   public CoordinatorThread(Coordinator coordinator) {
@@ -54,6 +54,23 @@ public class CoordinatorThread extends Thread {
 
   public boolean isTerminated() {
     return terminated;
+  }
+
+  /**
+   * Asks the wrapped {@link Coordinator} to fire its next
+   * {@link org.apache.iceberg.connect.events.StartCommit} immediately, without waiting for the
+   * normal commit-interval timer.  Called by the Kafka Connect thread when a worker transitions
+   * into "pending flag commit" state so that the coordinator unblocks the flag-commit flow
+   * without a full {@code commitIntervalMs} wait.
+   *
+   * <p>Safe to call after the thread has stopped: the {@code coordinator} field is {@code null}
+   * once {@link #run()} returns, so the null-check prevents a {@link NullPointerException}.
+   */
+  public void requestImmediateCommit() {
+    Coordinator c = coordinator;
+    if (c != null) {
+      c.requestImmediateCommit();
+    }
   }
 
   public void terminate() {

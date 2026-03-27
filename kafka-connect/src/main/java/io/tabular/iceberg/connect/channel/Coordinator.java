@@ -123,6 +123,17 @@ public class Coordinator extends Channel implements AutoCloseable {
     consumeAvailable(Duration.ofMillis(1000), this::receive);
   }
 
+  /**
+   * Asks this coordinator to fire the next {@link org.apache.iceberg.connect.events.StartCommit}
+   * without waiting for {@link io.tabular.iceberg.connect.IcebergSinkConfig#commitIntervalMs()}.
+   *
+   * <p>Thread-safe: called from the Kafka Connect thread (via {@link CommitterImpl}) while the
+   * coordinator loop runs in a background thread.
+   */
+  public void requestImmediateCommit() {
+    commitState.requestImmediateCommit();
+  }
+
   public void process() {
     if (commitState.isCommitIntervalReached()) {
       // send out begin commit

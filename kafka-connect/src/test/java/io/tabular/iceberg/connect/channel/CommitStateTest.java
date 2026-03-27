@@ -75,6 +75,55 @@ public class CommitStateTest {
   }
 
   @Test
+  public void testRequestImmediateCommitFiresBeforeCommitIntervalElapses() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.commitIntervalMs()).thenReturn(300_000);
+
+    CommitState commitState = new CommitState(config);
+
+    // Consume the fast-start firing, then end the commit so the state is idle again.
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+    commitState.startNewCommit();
+    commitState.endCurrentCommit();
+
+    // Interval has not elapsed — normally would have to wait 5 minutes.
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+
+    // Signal: a worker has a pending flag commit and needs an immediate StartCommit.
+    commitState.requestImmediateCommit();
+
+    // Must fire right away, bypassing commitIntervalMs.
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+
+    // The flag is consumed by the firing — subsequent call must go back to the timer.
+    commitState.startNewCommit();
+    commitState.endCurrentCommit();
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+  }
+
+  @Test
+  public void testRequestImmediateCommitDoesNotFireWhileCommitAlreadyInProgress() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.commitIntervalMs()).thenReturn(300_000);
+
+    CommitState commitState = new CommitState(config);
+
+    // Consume the fast-start firing and leave the commit in progress.
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+    commitState.startNewCommit();
+
+    // Signal an immediate commit while a commit is already in progress.
+    commitState.requestImmediateCommit();
+
+    // In-progress commit must gate the check regardless of the flag.
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+
+    // Once the commit ends, the deferred flag fires immediately.
+    commitState.endCurrentCommit();
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+  }
+
+  @Test
   public void testIsCommitReady() {
     TopicPartitionOffset tp = mock(TopicPartitionOffset.class);
 

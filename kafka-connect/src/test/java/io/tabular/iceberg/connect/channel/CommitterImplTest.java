@@ -25,6 +25,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -883,4 +884,101 @@ class CommitterImplTest {
           ImmutableMap.of(SOURCE_TP0, Pair.of(111L, offsetDateTime(200L))));
     }
   }
+
+  /**
+   * Verifies that when {@link CommittableSupplier#isPendingFlagCommit()} first returns
+   * {@code true}, {@link CommitterImpl#commit} calls
+   * {@link CoordinatorThread#requestImmediateCommit()} exactly once.
+   *
+   * <p>After a pod crash + restart the fast-start {@link StartCommit} may be consumed before
+   * the rewound flag record arrives (Kafka fetch pipelining).  Without
+   * {@code requestImmediateCommit()} the coordinator would wait up to {@code commitIntervalMs}
+   * (e.g. 5 minutes) before sending the next StartCommit, keeping the Worker paused with a
+   * pending flag commit for far longer than necessary.
+   */
+  @Test
+  public void testRequestImmediateCommitCalledOnCoordinatorWhenFlagFirstPending()
+      throws IOException {
+    SinkTaskContext mockContext = mockContext();
+
+    CoordinatorThread mockCoordinatorThread = mock(CoordinatorThread.class);
+    Mockito.doNothing().when(mockCoordinatorThread).start();
+    Mockito.doNothing().when(mockCoordinatorThread).terminate();
+    CoordinatorThreadFactory coordinatorThreadFactory =
+        (ctx, cfg) -> Optional.of(mockCoordinatorThread);
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    CommittableSupplier pendingFlagSupplier =
+        new CommittableSupplier() {
+          @Override
+          public Committable committable() {
+            return new Committable(ImmutableMap.of(), ImmutableList.of());
+          }
+
+          @Override
+          public boolean isPendingFlagCommit() {
+            return true;
+          }
+        };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+
+      committerImpl.commit(pendingFlagSupplier);
+
+      verify(mockCoordinatorThread).requestImmediateCommit();
+    }
+  }
+
+  /**
+   * Verifies that repeated {@link CommitterImpl#commit} calls while
+   * {@link CommittableSupplier#isPendingFlagCommit()} is {@code true} do NOT call
+   * {@link CoordinatorThread#requestImmediateCommit()} more than once per flag cycle,
+   * preventing unnecessary coordinator wake-ups when partitions are paused and
+   * {@code commit()} is called frequently via {@code preCommit()}.
+   */
+  @Test
+  public void testRequestImmediateCommitCalledOnlyOncePerFlagCycle() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+
+    CoordinatorThread mockCoordinatorThread = mock(CoordinatorThread.class);
+    Mockito.doNothing().when(mockCoordinatorThread).start();
+    Mockito.doNothing().when(mockCoordinatorThread).terminate();
+    CoordinatorThreadFactory coordinatorThreadFactory =
+        (ctx, cfg) -> Optional.of(mockCoordinatorThread);
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
+
+    CommittableSupplier pendingFlagSupplier =
+        new CommittableSupplier() {
+          @Override
+          public Committable committable() {
+            return new Committable(ImmutableMap.of(), ImmutableList.of());
+          }
+
+          @Override
+          public boolean isPendingFlagCommit() {
+            return true;
+          }
+        };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+
+      // Simulate multiple commit() calls while the flag is still pending (e.g. repeated
+      // preCommit() invocations from Kafka Connect's periodic flush timer).
+      committerImpl.commit(pendingFlagSupplier);
+      committerImpl.commit(pendingFlagSupplier);
+      committerImpl.commit(pendingFlagSupplier);
+
+      // Must fire exactly once — not once per call.
+      verify(mockCoordinatorThread, times(1)).requestImmediateCommit();
+    }
+  }
 }
+

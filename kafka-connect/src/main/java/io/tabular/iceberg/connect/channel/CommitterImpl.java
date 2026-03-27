@@ -84,6 +84,14 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private UUID pendingStartCommitId = null;
 
   /**
+   * Set to {@code true} after {@link #requestImmediateCommit()} has been forwarded to the
+   * coordinator for the current flag-commit cycle.  Reset to {@code false} when the flag is
+   * resolved (sentinel received) or when the flag-pending state ends, so that the mechanism
+   * is available for subsequent flag cycles.
+   */
+  private boolean immediateCommitTriggered = false;
+
+  /**
    * Set to {@code true} after the first {@link org.apache.iceberg.connect.events.StartCommit} has
    * been seen (whether deferred or responded-to immediately).  Once set, subsequent StartCommits
    * are always responded to without deferral so normal steady-state commit latency is unaffected.
@@ -274,6 +282,24 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
       LOG.info("Responding to deferred StartCommit {}", pendingStartCommitId);
       sendCommitResponse(pendingStartCommitId, committableSupplier);
       pendingStartCommitId = null;
+    }
+
+    // After a pod crash + restart, the coordinator's fast-start StartCommit can be consumed and
+    // responded to with empty data before the rewound flag record arrives (Kafka Connect fetch
+    // pipelining).  Without intervention the Worker would wait up to commitIntervalMs for the
+    // next StartCommit while paused.  The first time we detect that a flag commit is pending we
+    // ask the coordinator (which runs in the same JVM when this task is the leader) to fire a
+    // new StartCommit immediately, bypassing the timer.  The flag is broadcast to all source
+    // partitions, so the coordinator/leader task always receives it and can trigger itself.
+    if (committableSupplier.isPendingFlagCommit()) {
+      if (!immediateCommitTriggered) {
+        LOG.info("Flag commit pending — requesting immediate StartCommit from coordinator");
+        maybeCoordinatorThread.ifPresent(CoordinatorThread::requestImmediateCommit);
+        immediateCommitTriggered = true;
+      }
+    } else {
+      // Flag resolved (or never set) — reset so the mechanism is available for the next cycle.
+      immediateCommitTriggered = false;
     }
 
     // Use a positive duration while waiting for the flag sentinel so the consumer doesn't
