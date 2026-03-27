@@ -123,6 +123,7 @@ class Worker implements Writer, AutoCloseable {
     }
 
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
+
     resumeAssignment();
   }
 
@@ -150,12 +151,19 @@ class Worker implements Writer, AutoCloseable {
       return;
     }
 
+    // the consumer stores the offsets that corresponds to the next record to consume,
+    // so increment the record offset by one
+    sourceOffsets.put(
+            new TopicPartition(record.topic(), record.kafkaPartition()),
+            new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
           "Flag record detected at topic: {}, partition: {}, offset: {}",
           record.topic(),
           record.kafkaPartition(),
           record.kafkaOffset());
+
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
       TableContext tableContext =
@@ -165,6 +173,7 @@ class Worker implements Writer, AutoCloseable {
       FlagWriterResult flagResult =
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
+      this.context.requestCommit();
 
       // The partition will be paused at committable() time, preventing new records from arriving after this batch.
       pauseAssignment(record.kafkaPartition());
@@ -173,12 +182,6 @@ class Worker implements Writer, AutoCloseable {
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
-      // the consumer stores the offsets that corresponds to the next record to consume,
-      // so increment the record offset by one
-      sourceOffsets.put(
-              new TopicPartition(record.topic(), record.kafkaPartition()),
-              new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
