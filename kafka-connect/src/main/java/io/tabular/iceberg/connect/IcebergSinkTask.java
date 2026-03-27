@@ -80,9 +80,6 @@ public class IcebergSinkTask extends SinkTask {
   @Override
   public Map<TopicPartition, OffsetAndMetadata> preCommit(
       Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
-    if (task != null) {
-      task.sync();
-    }
     return ImmutableMap.of();
   }
 
