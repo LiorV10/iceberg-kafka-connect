@@ -33,10 +33,10 @@ import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -64,18 +64,15 @@ class Worker implements Writer, AutoCloseable {
   private boolean isPaused;
   private final SinkTaskContext context;
 
-  // Non-null while a flag has been detected but not yet processed by the Coordinator.
-  // Used to route post-flag records in the same batch to the flag's target table,
-  // and to identify the sentinel when onFlagProcessed() is called.
+  // Non-null while a flag has been detected but not yet cleared by onFlagProcessed().
+  // Identifies the target table so onFlagProcessed() can match the correct sentinel.
   private TableIdentifier reroute;
 
-  // The TopicPartition and offset of the detected flag record.  The offset is committed AT the
-  // flag (not past it) so that if the worker crashes before the Coordinator sends the
-  // FLAG_PROCESSED_SENTINEL, the next restart will re-read and re-process the flag record,
-  // naturally re-establishing the paused state.
+  // The source TopicPartition that carried the flag record, and the committed offset for that
+  // partition (F+1 — one past the flag).  Retained until onFlagProcessed() so it can re-insert
+  // the offset WITHOUT FLAG_PENDING metadata, which permanently clears the persistent state.
   private TopicPartition flagTopicPartition;
-  private long flagOffset;
-  private Long flagTimestamp;
+  private Long flagCommittedOffset;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
     this(config, new IcebergWriterFactory(catalog, config), context);
@@ -117,15 +114,75 @@ class Worker implements Writer, AutoCloseable {
     // is triggered only when the Coordinator broadcasts the per-table sentinel after all partitions
     // have reported — which may happen in a subsequent commit cycle.
 
-    // Deferred pause: now that the flag batch is committed, pause the flag partition so that
-    // no new records arrive from it until the Coordinator signals flag-processed.
-    if (reroute != null && !isPaused) {
-      pauseAssignment(flagTopicPartition.partition());
-    }
-
     LOG.debug("Committing {} records", writeResults.size());
 
     return new Committable(offsets, writeResults);
+  }
+
+  /**
+   * Returns the per-partition FLAG_PENDING metadata to encode in the committed consumer-group
+   * offsets while a flag is in progress.  When the flag partition is paused and waiting for the
+   * Coordinator's sentinel, this returns {@code {flagPartition: "FLAG_PENDING:<rawTableId>"}}.
+   * Otherwise returns an empty map.  {@link CommitterImpl} calls this inside
+   * {@code sendCommitResponse()} so the metadata is committed atomically with the offset.
+   */
+  @Override
+  public Map<TopicPartition, String> pendingFlagMetadata() {
+    if (reroute == null || flagTopicPartition == null) {
+      return Collections.emptyMap();
+    }
+    return Collections.singletonMap(
+        flagTopicPartition, CommittableSupplier.FLAG_METADATA_PREFIX + reroute.toString());
+  }
+
+  /**
+   * Called by {@link CommitterImpl} on startup when it detects {@link
+   * CommittableSupplier#FLAG_METADATA_PREFIX} in a committed consumer-group offset.  Immediately
+   * pauses the given partition and re-queues a {@link FlagWriterResult} for re-submission to the
+   * Coordinator, without needing to re-read the flag record from the source topic.
+   *
+   * <p>The worker will remain paused until the Coordinator sends the FLAG_PROCESSED_SENTINEL and
+   * {@link #onFlagProcessed} is called.
+   */
+  @Override
+  public void restorePendingFlagState(
+      TopicPartition tp, TableIdentifier tableId, long committedOffset) {
+    LOG.info(
+        "Restoring FLAG_PENDING state for partition {} table {} from committed offset {}",
+        tp, tableId, committedOffset);
+
+    // Reconstruct a minimal flag JSON.  The Coordinator only needs the "partition" field to count
+    // votes; all other fields are informational.  The original flag offset is committedOffset-1
+    // (we committed F+1 = past the flag).
+    Map<String, Object> envelope = new LinkedHashMap<>();
+    envelope.put("topic", tp.topic());
+    envelope.put("partition", tp.partition());
+    envelope.put("offset", committedOffset - 1L);
+    envelope.put("timestamp", null);
+    envelope.put("key", null);
+    envelope.put("value", null);
+    String recordJson;
+    try {
+      recordJson = MAPPER.writeValueAsString(envelope);
+    } catch (JsonProcessingException e) {
+      throw new UncheckedIOException(e);
+    }
+
+    TableContext tableContext = TableContext.parse(tableId, config.branchesRegexDelimiter());
+    FlagWriterResult flagResult =
+        new FlagWriterResult(tableId, tableContext.branch(), recordJson);
+    flagWriterResults.add(flagResult);
+
+    this.reroute = tableId;
+    this.flagTopicPartition = tp;
+    this.flagCommittedOffset = committedOffset;
+
+    // Put the committed offset (F+1) into sourceOffsets so it is included in the next
+    // sendCommitResponse().  This keeps the FLAG_PENDING metadata alive in controlGroupId until
+    // onFlagProcessed() explicitly clears it.
+    sourceOffsets.put(tp, new Offset(committedOffset, null));
+
+    pauseAssignment(tp.partition());
   }
 
   /**
@@ -137,33 +194,29 @@ class Worker implements Writer, AutoCloseable {
    * <p>Only acts when this worker has a pending flag for exactly {@code tableIdentifier}. Workers
    * for other tables, or workers that never detected a flag, are unaffected.
    *
-   * <p>On success, advances the committed source offset one past the flag record so that a
-   * subsequent restart does not re-read the flag.
+   * <p>Puts the committed offset (F+1) back into {@code sourceOffsets} WITHOUT
+   * {@link CommittableSupplier#FLAG_METADATA_PREFIX} metadata so that the next
+   * {@code sendCommitResponse()} permanently clears the persistent state in {@code controlGroupId}.
    */
   @Override
   public void onFlagProcessed(TableIdentifier tableIdentifier) {
-    if (reroute == null) {
-      // This worker did not detect a flag — nothing to do.
-      return;
-    }
-    if (!reroute.equals(tableIdentifier)) {
-      // Sentinel is for a different table — this worker is still waiting for its own.
+    if (reroute == null || !reroute.equals(tableIdentifier)) {
       return;
     }
 
-    LOG.debug("Flag-processed signal received for table {}, advancing offset and resuming", tableIdentifier);
+    LOG.debug("Flag-processed signal received for table {}, resuming", tableIdentifier);
 
-    // Advance the committed source offset one past the flag record.  Storing it in sourceOffsets
-    // here means it will be included in the next sendCommitResponse(), committing F+1 to the
-    // control-group consumer-group.  After that, a restart will begin at F+1 and the flag will
-    // not be re-read again.
-    if (flagTopicPartition != null) {
-      sourceOffsets.put(flagTopicPartition, new Offset(flagOffset + 1L, flagTimestamp));
+    // Re-insert the committed offset WITHOUT FLAG_PENDING metadata.  Since reroute is about to be
+    // set to null, pendingFlagMetadata() will return empty on the next commit cycle, causing
+    // controlGroupId to be updated with plain F+1 — permanently clearing the persistent state.
+    if (flagTopicPartition != null && flagCommittedOffset != null) {
+      sourceOffsets.put(flagTopicPartition, new Offset(flagCommittedOffset, null));
     }
 
     // Clear flag state
     reroute = null;
     flagTopicPartition = null;
+    flagCommittedOffset = null;
 
     resumeAssignment();
   }
@@ -177,6 +230,7 @@ class Worker implements Writer, AutoCloseable {
     this.isPaused = false;
     this.reroute = null;
     this.flagTopicPartition = null;
+    this.flagCommittedOffset = null;
   }
 
   @Override
@@ -202,13 +256,13 @@ class Worker implements Writer, AutoCloseable {
           record.kafkaPartition(),
           record.kafkaOffset());
 
-      // Commit AT the flag offset (not offset+1) so that if the worker crashes before the
-      // Coordinator sends the FLAG_PROCESSED_SENTINEL, the consumer restarts from F and
-      // re-reads the flag, naturally re-establishing the paused state.
-      sourceOffsets.put(tp, new Offset(record.kafkaOffset(), record.timestamp()));
+      // Commit F+1 (past the flag) as normal.  Crash-recovery persistence is handled by
+      // encoding FLAG_PENDING:<tableId> in the OffsetAndMetadata.metadata() field (via
+      // pendingFlagMetadata()), not by anchoring the offset at F.
+      long committedOffset = record.kafkaOffset() + 1L;
+      sourceOffsets.put(tp, new Offset(committedOffset, record.timestamp()));
       this.flagTopicPartition = tp;
-      this.flagOffset = record.kafkaOffset();
-      this.flagTimestamp = record.timestamp();
+      this.flagCommittedOffset = committedOffset;
 
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
@@ -222,25 +276,30 @@ class Worker implements Writer, AutoCloseable {
 
       this.reroute = tableIdentifier;
 
+      // Pause immediately so that records after the flag (in the same poll batch or future batches)
+      // are not processed until the Coordinator completes the flag action and sends the sentinel.
+      pauseAssignment(tp.partition());
+
       // Request a commit so the FlagWriterResult is sent to the Coordinator promptly.
       if (context != null) {
         context.requestCommit();
       }
 
       LOG.info(
-          "Flag detected — rerouting same-batch records to {} (branch: {})",
+          "Flag detected — paused partition {}, queued FlagWriterResult for table {} (branch: {})",
+          tp.partition(),
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
-      // For records on the flag partition that arrive after the flag in the same batch: do NOT
-      // advance the committed offset past the flag.  This keeps the committed offset at F so that
-      // a restart will re-read the flag and re-establish the paused state correctly.
-      if (reroute == null || !tp.equals(flagTopicPartition)) {
-        sourceOffsets.put(tp, new Offset(record.kafkaOffset() + 1, record.timestamp()));
-      }
+      // Normal record: advance the committed offset one past this record.
+      // Post-flag records in the same poll batch are already handled by the isPaused guard above —
+      // once the flag is detected and pauseAssignment() is called, isPaused is true and subsequent
+      // records in the same write() call are dropped here, to be re-delivered after resume.
+      sourceOffsets.put(tp, new Offset(record.kafkaOffset() + 1, record.timestamp()));
 
       if (reroute != null) {
-        // Post-flag record in the same batch: route to the flag's target table.
+        // This path is reached only if reroute was set by a PREVIOUS (still-pending) flag from a
+        // different partition.  Route this record to the flag's target table.
         writerForTable(reroute.toString(), record, true).write(record);
       } else if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);

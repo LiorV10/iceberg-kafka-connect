@@ -78,15 +78,33 @@ public abstract class Channel {
   }
 
   protected void send(Event event) {
-    send(ImmutableList.of(event), ImmutableMap.of(), null);
+    send(ImmutableList.of(event), ImmutableMap.of(), ImmutableMap.of(), null);
   }
 
   protected void send(
       List<Event> events,
       Map<TopicPartition, Offset> sourceOffsets,
       ConsumerGroupMetadata consumerGroupMetadata) {
+    send(events, sourceOffsets, ImmutableMap.of(), consumerGroupMetadata);
+  }
+
+  /**
+   * Sends {@code events} and commits {@code sourceOffsets} to the given consumer group, encoding
+   * optional per-partition {@code offsetMetadata} in the committed {@link OffsetAndMetadata}.
+   * Callers pass a non-empty {@code offsetMetadata} map only when they need to persist extra state
+   * (e.g. {@link CommittableSupplier#FLAG_METADATA_PREFIX}) alongside the committed offset.
+   */
+  protected void send(
+      List<Event> events,
+      Map<TopicPartition, Offset> sourceOffsets,
+      Map<TopicPartition, String> offsetMetadata,
+      ConsumerGroupMetadata consumerGroupMetadata) {
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
-    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
+    sourceOffsets.forEach(
+        (k, v) -> {
+          String meta = offsetMetadata.getOrDefault(k, "");
+          offsetsToCommit.put(k, new OffsetAndMetadata(v.offset(), meta));
+        });
 
     List<ProducerRecord<String, byte[]>> recordList =
         events.stream()
