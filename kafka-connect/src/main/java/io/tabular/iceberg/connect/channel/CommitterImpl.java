@@ -59,6 +59,37 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
 
+  /**
+   * The commit-ID from the very first {@link org.apache.iceberg.connect.events.StartCommit} that
+   * arrived when {@link CommittableSupplier#isPendingFlagCommit()} was still {@code false}.
+   *
+   * <p><b>Why this is needed:</b> After a task restart the Kafka Connect framework fetches one
+   * batch of source records <em>before</em> the {@link SinkTaskContext#offset} rewind (issued in
+   * the constructor) takes effect.  That first batch therefore does <em>not</em> contain the flag
+   * record.  Concurrently, the coordinator fires its fast-start
+   * {@link org.apache.iceberg.connect.events.StartCommit} immediately after being created.  If
+   * {@link #commit} calls {@code consumer.poll(Duration.ZERO)} at this moment the StartCommit is
+   * consumed and the worker responds with <em>empty</em> flag data — because the flag has not been
+   * detected yet.  The flag record then arrives in the <em>second</em> batch (from the rewound
+   * offset), {@code isPendingFlagCommit()} flips to {@code true}, but the next StartCommit is
+   * {@code commitIntervalMs} away (default five minutes).
+   *
+   * <p><b>Fix:</b> The very first StartCommit that arrives while
+   * {@code isPendingFlagCommit() == false} is <em>deferred</em> by one {@code put()} cycle.  At
+   * the top of the <em>next</em> {@link #commit} call the deferred commitId is responded to using
+   * the supplied {@link CommittableSupplier} — by which time {@code write()} has already processed
+   * the current batch (which may include the flag record), so {@code committable()} returns the
+   * {@link io.tabular.iceberg.connect.data.FlagWriterResult}.
+   */
+  private UUID pendingStartCommitId = null;
+
+  /**
+   * Set to {@code true} after the first {@link org.apache.iceberg.connect.events.StartCommit} has
+   * been seen (whether deferred or responded-to immediately).  Once set, subsequent StartCommits
+   * are always responded to without deferral so normal steady-state commit latency is unaffected.
+   */
+  private boolean firstStartCommitHandled = false;
+
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
   }
@@ -138,7 +169,19 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private boolean receive(Envelope envelope, CommittableSupplier committableSupplier) {
     if (envelope.event().type() == PayloadType.START_COMMIT) {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
-      sendCommitResponse(commitId, committableSupplier);
+      if (!firstStartCommitHandled && !committableSupplier.isPendingFlagCommit()) {
+        // Defer this StartCommit by one put() cycle.  write() will run before the next commit()
+        // call, so any flag record in the current batch will be visible in committable() when we
+        // respond.  Only the very first StartCommit is deferred; after that normal behaviour
+        // resumes so steady-state commit latency is unaffected.
+        LOG.info(
+            "Deferring first StartCommit {} to next put() cycle (no flag pending yet)",
+            commitId);
+        pendingStartCommitId = commitId;
+      } else {
+        sendCommitResponse(commitId, committableSupplier);
+      }
+      firstStartCommitHandled = true;
       return true;
     }
     if (envelope.event().type() == PayloadType.COMMIT_TO_TABLE) {
@@ -223,6 +266,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
+
+    // Respond to a StartCommit that was deferred from the previous put() cycle.  By the time
+    // this runs, write() has already processed the current batch, so committable() will include
+    // any FlagWriterResult that was detected in that write() call.
+    if (pendingStartCommitId != null) {
+      LOG.info("Responding to deferred StartCommit {}", pendingStartCommitId);
+      sendCommitResponse(pendingStartCommitId, committableSupplier);
+      pendingStartCommitId = null;
+    }
+
     // Use a positive duration while waiting for the flag sentinel so the consumer doesn't
     // return immediately with 0 records.  In normal operation (not paused) Duration.ZERO
     // keeps overhead negligible.
