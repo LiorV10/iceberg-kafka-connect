@@ -183,6 +183,18 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.put(tp, new Offset(committedOffset, null));
 
     pauseAssignment(tp.partition());
+
+    // Request a commit immediately so that the re-queued FlagWriterResult is delivered to the
+    // Coordinator on the next poll cycle — exactly as it would be if the flag had been re-sent.
+    // Without this, the restored state waits silently for the Coordinator's next periodic
+    // START_COMMIT (which can be minutes away).
+    if (context != null) {
+      context.requestCommit();
+    }
+
+    LOG.info(
+        "Restored FLAG_PENDING state for partition {} table {} — requested immediate commit",
+        tp, tableId);
   }
 
   /**

@@ -443,8 +443,9 @@ public class WorkerTest {
 
   /**
    * Verifies that {@link Worker#restorePendingFlagState} correctly re-establishes the paused
-   * state, re-queues a FlagWriterResult, and stores the committed offset so the next
-   * sendCommitResponse() includes it.
+   * state, re-queues a FlagWriterResult, stores the committed offset, and requests an immediate
+   * commit — exactly mirroring the original flag detection path so the FlagWriterResult is
+   * delivered to the Coordinator promptly without waiting for the next periodic START_COMMIT.
    */
   @Test
   public void testRestorePendingFlagStateReestablishesPausedState() {
@@ -466,6 +467,10 @@ public class WorkerTest {
 
     // Partition must be paused immediately
     verify(context, times(1)).pause(tp);
+
+    // An immediate commit must be requested so the FlagWriterResult reaches the coordinator
+    // without waiting for the next periodic START_COMMIT (mirrors original flag detection)
+    verify(context, times(1)).requestCommit();
 
     // FlagWriterResult must be in the committable
     Committable committable = worker.committable();
