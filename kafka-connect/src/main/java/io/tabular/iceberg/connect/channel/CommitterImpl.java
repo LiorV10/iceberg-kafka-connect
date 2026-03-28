@@ -57,6 +57,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
+  private UUID pendingCommitId;
 
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
@@ -101,11 +102,15 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     consumeAvailable(
         // initial poll with longer duration so the consumer will initialize...
         Duration.ofMillis(1000),
-        envelope ->
-            receive(
-                envelope,
-                // CommittableSupplier that always returns empty committables
-                () -> new Committable(ImmutableMap.of(), ImmutableList.of())));
+        envelope -> {
+          if (envelope.event().type() == PayloadType.START_COMMIT) {
+            // Save the commit ID so we can respond when commit() is called
+            // with the real committable supplier
+            pendingCommitId = ((StartCommit) envelope.event().payload()).commitId();
+            return true;
+          }
+          return false;
+        });
   }
 
   private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
@@ -190,6 +195,10 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
+    if (pendingCommitId != null) {
+      sendCommitResponse(pendingCommitId, committableSupplier);
+      pendingCommitId = null;
+    }
     consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
   }
 

@@ -592,4 +592,83 @@ class CommitterImplTest {
           .isEqualTo(ImmutableMap.of(CONFIG.connectGroupId(), expectedConsumerOffset));
     }
   }
+
+  @Test
+  public void testPendingCommitFromInitialPollIsRespondedToOnNextCommit() throws IOException {
+    // Simulates crash recovery: a START_COMMIT message is on the control topic
+    // when CommitterImpl is constructed. The initial poll should save it as pending,
+    // and the next commit() call should respond to it with the real committable.
+
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+    UUID commitId = UUID.randomUUID();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    // Schedule a task to run during the first poll() in the constructor.
+    // This sets up the consumer partitions and adds a START_COMMIT record
+    // so the initial poll reads it.
+    consumer.schedulePollTask(
+        () -> {
+          consumer.rebalance(ImmutableList.of(CONTROL_TOPIC_PARTITION));
+          consumer.updateBeginningOffsets(ImmutableMap.of(CONTROL_TOPIC_PARTITION, 0L));
+          consumer.addRecord(
+              new ConsumerRecord<>(
+                  CONTROL_TOPIC_PARTITION.topic(),
+                  CONTROL_TOPIC_PARTITION.partition(),
+                  0,
+                  UUID.randomUUID().toString(),
+                  AvroUtil.encode(
+                      new Event(CONFIG.controlGroupId(), new StartCommit(commitId)))));
+        });
+
+    List<DataFile> dataFiles = ImmutableList.of(createDataFile());
+    List<DeleteFile> deleteFiles = ImmutableList.of();
+    Types.StructType partitionStruct = Types.StructType.of();
+    Map<TopicPartition, Offset> sourceOffsets = ImmutableMap.of(SOURCE_TP0, new Offset(100L, 200L));
+    CommittableSupplier committableSupplier =
+        () ->
+            new Committable(
+                sourceOffsets,
+                ImmutableList.of(
+                    new WriterResult(TABLE_1_IDENTIFIER, dataFiles, deleteFiles, partitionStruct)));
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      Committer committer = committerImpl;
+
+      // The initial poll should have consumed the START_COMMIT but NOT responded.
+      // Producer should have no history yet.
+      assertThat(producer.history()).isEmpty();
+
+      // Now call commit with the real committable supplier
+      committer.commit(committableSupplier);
+
+      // Should have responded to the pending commit with real data
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(2);
+      assertDataWritten(
+          producer.history().get(0),
+          producerId,
+          commitId,
+          TABLE_1_IDENTIFIER,
+          dataFiles,
+          deleteFiles);
+      assertDataComplete(
+          producer.history().get(1),
+          producerId,
+          commitId,
+          ImmutableMap.of(SOURCE_TP0, Pair.of(100L, offsetDateTime(200L))));
+
+      assertThat(producer.consumerGroupOffsetsHistory()).hasSize(2);
+      Map<TopicPartition, OffsetAndMetadata> expectedConsumerOffset =
+          ImmutableMap.of(SOURCE_TP0, new OffsetAndMetadata(100L));
+      assertThat(producer.consumerGroupOffsetsHistory().get(0))
+          .isEqualTo(ImmutableMap.of(CONFIG.controlGroupId(), expectedConsumerOffset));
+      assertThat(producer.consumerGroupOffsetsHistory().get(1))
+          .isEqualTo(ImmutableMap.of(CONFIG.connectGroupId(), expectedConsumerOffset));
+    }
+  }
 }
