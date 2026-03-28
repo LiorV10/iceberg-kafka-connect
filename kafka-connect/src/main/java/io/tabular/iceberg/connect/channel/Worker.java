@@ -60,8 +60,8 @@ class Worker implements Writer, AutoCloseable {
   // When non-null, records on flagged partitions are rerouted to this table.
   // Set when a flag is detected; cleared by onFlagProcessed().
   private TableIdentifier reroute;
-  // Partitions that contained a flag record.  Their offsets are excluded from
-  // sourceOffsets so the flag can be re-read after restart.
+  // Partitions that contained a flag record.  Their offsets are included in
+  // sourceOffsets WITH metadata so the pending-flag state persists across restarts.
   private final Set<Integer> flaggedPartitions;
   // When true, committable() will pause the flagged partitions via context.pause().
   private boolean pendingPause;
