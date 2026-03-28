@@ -25,6 +25,7 @@ import static org.mockito.Mockito.when;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
+import io.tabular.iceberg.connect.data.SchemaUpdate.MakeOptional;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
 import java.math.BigDecimal;
 import java.nio.ByteBuffer;
@@ -759,6 +760,26 @@ public class RecordConverterTest {
 
     assertThat(updateMap.get("st.ii").type()).isInstanceOf(LongType.class);
     assertThat(updateMap.get("st.ff").type()).isInstanceOf(DoubleType.class);
+  }
+
+  @Test
+  public void testRerouteToExistingPendingColumnMap() {
+    org.apache.iceberg.Schema tableSchema =
+        new org.apache.iceberg.Schema(
+            Types.NestedField.required(1, "ii", Types.IntegerType.get()),
+            Types.NestedField.optional(2, "ii_pending_type_update", Types.StringType.get()));
+
+    Table table = mock(Table.class);
+    when(table.schema()).thenReturn(tableSchema);
+    RecordConverter converter = new RecordConverter(table, config);
+
+    // ii arrives as a String — should be rerouted to the pre-existing ii_pending_type_update column
+    Map<String, Object> data = ImmutableMap.of("ii", "hello");
+
+    Record record = converter.convert(data, null);
+
+    assertThat(record.getField("ii")).isNull();
+    assertThat(record.getField("ii_pending_type_update")).isEqualTo("hello");
   }
 
   private Map<String, Object> createMapData() {
