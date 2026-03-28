@@ -373,6 +373,72 @@ public class WorkerTest {
     verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
   }
 
+  /**
+   * Verifies that the offset for a paused partition carries the {@code paused} flag
+   * so that the pause state is persisted through the committed consumer group offsets.
+   */
+  @Test
+  public void testFlagRecordMarksOffsetAsPaused() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 10L);
+    worker.write(ImmutableList.of(flagRec));
+
+    Committable committable = worker.committable();
+
+    // The offset for partition 0 should be flag_offset + 1 = 11
+    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
+        .as("Offset should be flag record offset + 1")
+        .isEqualTo(11L);
+
+    // The offset should carry the paused flag
+    assertThat(committable.offsetsByTopicPartition().get(tp).paused())
+        .as("Offset must be marked as paused when a flag is detected")
+        .isTrue();
+  }
+
+  /**
+   * Verifies that normal (non-flag) records produce offsets that are NOT marked as paused.
+   */
+  @Test
+  public void testNormalRecordOffsetIsNotPaused() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory);
+
+    Map<String, Object> value = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord rec = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null, value, 5L);
+    worker.write(ImmutableList.of(rec));
+
+    Committable committable = worker.committable();
+
+    assertThat(committable.offsetsByTopicPartition().values())
+        .as("Normal record offsets must NOT be marked as paused")
+        .allMatch(offset -> !offset.paused());
+  }
+
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
     WriterResult writeResult =
         new WriterResult(

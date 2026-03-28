@@ -175,6 +175,13 @@ class Worker implements Writer, AutoCloseable {
       flagWriterResults.add(flagResult);
       this.context.requestCommit();
 
+      // Mark the offset as paused so the pause state is persisted through the offset commit.
+      // On restart, CommitterImpl detects the paused metadata and rewinds the offset by one
+      // so this flag record is re-consumed, causing the Worker to re-detect it and re-pause.
+      sourceOffsets.put(
+          new TopicPartition(record.topic(), record.kafkaPartition()),
+          new Offset(record.kafkaOffset() + 1, record.timestamp(), true));
+
       // The partition will be paused at committable() time, preventing new records from arriving after this batch.
       pauseAssignment(record.kafkaPartition());
       LOG.info(

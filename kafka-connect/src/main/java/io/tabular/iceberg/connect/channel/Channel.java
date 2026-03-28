@@ -86,7 +86,12 @@ public abstract class Channel {
       Map<TopicPartition, Offset> sourceOffsets,
       ConsumerGroupMetadata consumerGroupMetadata) {
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
-    sourceOffsets.forEach((k, v) -> offsetsToCommit.put(k, new OffsetAndMetadata(v.offset())));
+    sourceOffsets.forEach(
+        (k, v) ->
+            offsetsToCommit.put(
+                k,
+                new OffsetAndMetadata(
+                    v.offset(), v.paused() ? Offset.PAUSED_METADATA : null)));
 
     List<ProducerRecord<String, byte[]>> recordList =
         events.stream()
