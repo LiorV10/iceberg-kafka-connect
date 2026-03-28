@@ -36,6 +36,27 @@ interface CommittableSupplier {
   default void onFlagProcessed(TableIdentifier tableIdentifier) {}
 
   /**
+   * Returns {@code true} when all assigned source partitions have been paused due to flag
+   * processing and the flag has not yet been fully processed (i.e. {@link #onFlagProcessed}
+   * has not been called with the matching table).
+   *
+   * <p>When this returns {@code true}, the Kafka Connect framework will not call
+   * {@code SinkTask.put()} because there are no records to deliver.  Since
+   * {@link CommitterImpl#commit} is called from {@code put()}, the control topic would never
+   * be polled again — creating a deadlock where the {@code onFlagProcessed} sentinel is never
+   * received and the partitions are never unpaused.
+   *
+   * <p>{@link CommitterImpl} uses this method to detect the deadlock condition and keep polling
+   * the control topic in a loop until the flag is processed and partitions are unpaused.
+   *
+   * <p>The default returns {@code false} so that lambda/anonymous suppliers in tests and the
+   * CommitterImpl constructor do not need to implement it.
+   */
+  default boolean isAllPartitionsPaused() {
+    return false;
+  }
+
+  /**
    * Drains any pending flag results that should be sent eagerly to the Coordinator without
    * waiting for a {@code START_COMMIT} event.
    *

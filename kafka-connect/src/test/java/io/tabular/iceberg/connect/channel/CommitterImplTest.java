@@ -944,4 +944,192 @@ class CommitterImplTest {
       assertThat(completeEvent.type()).isEqualTo(PayloadType.DATA_COMPLETE);
     }
   }
+
+  /**
+   * Verifies the fix for the deadlock after a pod restart: when ALL source partitions are paused
+   * (because the flag was broadcast to every partition), the polling loop in {@code commit()}
+   * keeps consuming the control topic until the per-table sentinel is received and partitions
+   * are unpaused.
+   *
+   * <p>Without this fix, Kafka Connect stops calling {@code put()} when all partitions are
+   * paused, so {@code commit()} would never be called again, and the {@code onFlagProcessed}
+   * sentinel would never be received — creating a permanent deadlock.
+   *
+   * <p>This test adds the sentinel to the control topic before calling commit(). The sentinel
+   * is consumed in the initial consumeAvailable() call, which calls onFlagProcessed(), which
+   * makes isAllPartitionsPaused() return false. The polling loop condition is checked but the
+   * loop body never runs because the sentinel was already processed. This verifies the full
+   * flow: sentinel → onFlagProcessed → partitions unpaused → no deadlock.
+   */
+  @Test
+  public void testSentinelProcessedInCommitUnpausesPartitions() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    // Simulate the state after restart: all partitions paused, waiting for sentinel.
+    // onFlagProcessed() will flip allPaused to false.
+    boolean[] allPaused = {true};
+    TableIdentifier[] flagProcessedTable = {null};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(ImmutableMap.of(), ImmutableList.of());
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        return null; // already drained in a previous commit() call
+      }
+
+      @Override
+      public boolean isAllPartitionsPaused() {
+        return allPaused[0];
+      }
+
+      @Override
+      public void onFlagProcessed(TableIdentifier tableIdentifier) {
+        flagProcessedTable[0] = tableIdentifier;
+        allPaused[0] = false; // sentinel received — unpause
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      // Add the per-table sentinel CommitToTable event to the control topic.
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(
+                      CONFIG.controlGroupId(),
+                      new CommitToTable(
+                          Coordinator.FLAG_PROCESSED_SENTINEL_ID,
+                          TableReference.of(CATALOG_NAME, TABLE_1_IDENTIFIER),
+                          0L,
+                          null)))));
+
+      // commit() must complete without deadlocking — the sentinel unblocks the loop
+      committer.commit(committableSupplier);
+
+      // onFlagProcessed must have been called with the correct table
+      assertThat(flagProcessedTable[0])
+          .as("onFlagProcessed() must be called when sentinel is received")
+          .isEqualTo(TABLE_1_IDENTIFIER);
+
+      // allPaused must now be false
+      assertThat(allPaused[0])
+          .as("Partitions must be unpaused after sentinel is processed")
+          .isFalse();
+    }
+  }
+
+  /**
+   * Verifies that the polling loop in {@code commit()} runs and keeps polling when
+   * {@code isAllPartitionsPaused()} returns true, and exits when it transitions to false.
+   *
+   * <p>This simulates the case where the sentinel arrives during the polling loop (not
+   * during the initial consumeAvailable). The test uses a counter to simulate the sentinel
+   * arriving after a few iterations.
+   */
+  @Test
+  public void testPollingLoopRunsUntilPartitionsUnpaused() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    // Simulate isAllPartitionsPaused returning true for 3 iterations, then false
+    int[] checkCount = {0};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        return new Committable(ImmutableMap.of(), ImmutableList.of());
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        return null;
+      }
+
+      @Override
+      public boolean isAllPartitionsPaused() {
+        checkCount[0]++;
+        // Returns true for the first 3 checks, then false on the 4th
+        return checkCount[0] <= 3;
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      // commit() should run the loop 3 times, then exit on the 4th check
+      committer.commit(committableSupplier);
+
+      // isAllPartitionsPaused was checked: once entering the loop, then after each
+      // iteration, for a total of 4 checks (3 true + 1 false)
+      assertThat(checkCount[0])
+          .as("Loop must run 3 iterations (3 true) and then exit (1 false)")
+          .isEqualTo(4);
+    }
+  }
+
+  /**
+   * Verifies that the polling loop does NOT run when not all partitions are paused
+   * (the normal, non-deadlock case).
+   */
+  @Test
+  public void testPollingLoopDoesNotRunWhenNotAllPartitionsPaused() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    int[] pauseCheckCount = {0};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        throw new NotImplementedException("Should not be called");
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        return null;
+      }
+
+      @Override
+      public boolean isAllPartitionsPaused() {
+        pauseCheckCount[0]++;
+        return false; // not all paused — loop should not run
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      committer.commit(committableSupplier);
+
+      // isAllPartitionsPaused should have been checked exactly once (the while condition)
+      assertThat(pauseCheckCount[0])
+          .as("isAllPartitionsPaused() should be checked once and return false")
+          .isEqualTo(1);
+    }
+  }
 }

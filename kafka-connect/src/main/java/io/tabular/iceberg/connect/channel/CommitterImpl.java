@@ -287,6 +287,28 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
       // have reported their flags.
       send(events, ImmutableMap.of(), null);
     }
+
+    // When ALL source partitions are paused (typically after a pod restart where the flag was
+    // broadcast to every partition), Kafka Connect stops calling put() because there are no
+    // records to deliver.  Since commit() is called from put(), this method would never be
+    // called again — creating a deadlock where the onFlagProcessed sentinel is never received
+    // and the partitions are never unpaused.
+    //
+    // To break the deadlock, keep polling the control topic here until the flag is processed
+    // and partitions are unpaused.  The CoordinatorThread runs on a separate thread and will
+    // eventually send START_COMMIT; this loop handles both START_COMMIT (via receive() →
+    // sendCommitResponse() → committable()) and the per-table sentinel COMMIT_TO_TABLE
+    // (via receive() → onFlagProcessed()).
+    while (committableSupplier.isAllPartitionsPaused()) {
+      throwExceptionIfCoordinatorIsTerminated();
+      consumeAvailable(COMMIT_POLL_DURATION, envelope -> receive(envelope, committableSupplier));
+      try {
+        Thread.sleep(COMMIT_POLL_DURATION.toMillis());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
   }
 
   @Override

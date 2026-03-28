@@ -534,4 +534,151 @@ public class WorkerTest {
     // The flag partition's offset must NOT be tracked (so the flag is re-read on restart)
     assertThat(committable.offsetsByTopicPartition()).doesNotContainKey(tp);
   }
+
+  /**
+   * Verifies that {@link Worker#isAllPartitionsPaused()} returns false when no flag has been
+   * detected (no reroute is active).
+   */
+  @Test
+  public void testIsAllPartitionsPausedReturnsFalseWhenNoFlag() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.flagKeyPrefix()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    assertThat(worker.isAllPartitionsPaused()).isFalse();
+  }
+
+  /**
+   * Verifies that {@link Worker#isAllPartitionsPaused()} returns false when a flag has been
+   * detected but the pause hasn't been applied yet (pendingPause is still true).
+   */
+  @Test
+  public void testIsAllPartitionsPausedReturnsFalseBeforePauseApplied() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Write a flag — pendingPause is true but pause not yet applied
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // pendingPause = true → not yet paused
+    assertThat(worker.isAllPartitionsPaused()).isFalse();
+  }
+
+  /**
+   * Verifies that {@link Worker#isAllPartitionsPaused()} returns true after all partitions are
+   * paused via drainPendingFlagCommittable() and the flag hasn't been processed yet.
+   * This is the deadlock condition after a pod restart.
+   */
+  @Test
+  public void testIsAllPartitionsPausedReturnsTrueAfterAllPartitionsPaused() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Write a flag
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // Drain applies the pause
+    worker.drainPendingFlagCommittable();
+
+    // Now all partitions are paused and reroute is active
+    assertThat(worker.isAllPartitionsPaused()).isTrue();
+  }
+
+  /**
+   * Verifies that {@link Worker#isAllPartitionsPaused()} returns false after
+   * {@link Worker#onFlagProcessed} clears the reroute and resumes partitions.
+   */
+  @Test
+  public void testIsAllPartitionsPausedReturnsFalseAfterFlagProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Write flag → drain (apply pause)
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    worker.drainPendingFlagCommittable();
+
+    assertThat(worker.isAllPartitionsPaused()).isTrue();
+
+    // Process the flag — clears reroute, resumes partitions
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    assertThat(worker.isAllPartitionsPaused()).isFalse();
+  }
+
+  /**
+   * Verifies that {@link Worker#isAllPartitionsPaused()} returns false when only SOME
+   * partitions are flagged (not all).
+   */
+  @Test
+  public void testIsAllPartitionsPausedReturnsFalseWhenOnlySomePartitionsFlagged() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    // Two partitions assigned, but only partition 0 will have a flag
+    TopicPartition tp0 = new TopicPartition(SRC_TOPIC_NAME, 0);
+    TopicPartition tp1 = new TopicPartition(SRC_TOPIC_NAME, 1);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp0, tp1));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Flag only on partition 0
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+    worker.drainPendingFlagCommittable();
+
+    // Only partition 0 is flagged, partition 1 is not — not all paused
+    assertThat(worker.isAllPartitionsPaused()).isFalse();
+  }
 }

@@ -191,6 +191,31 @@ class Worker implements Writer, AutoCloseable {
     return new Committable(Maps.newHashMap(), flags);
   }
 
+  /**
+   * Returns {@code true} when all assigned source partitions have been paused due to flag
+   * processing and the flag-processed sentinel has not yet been received.
+   *
+   * <p>This is the case after a pod restart when the flag was broadcast to ALL source partitions:
+   * every partition is re-read, every partition becomes flagged, and
+   * {@link #drainPendingFlagCommittable()} (or {@link #committable()}) pauses them all.
+   * Since Kafka Connect stops calling {@code put()} when all partitions are paused, the
+   * control topic would never be polled again — creating a deadlock.
+   *
+   * <p>{@link CommitterImpl} calls this to decide whether to enter a polling loop that keeps
+   * consuming the control topic until {@link #onFlagProcessed} unpauses the partitions.
+   */
+  @Override
+  public boolean isAllPartitionsPaused() {
+    // Not paused if: no context, no reroute active, or pause hasn't been applied yet
+    if (context == null || reroute == null || pendingPause) {
+      return false;
+    }
+    // Pause has been applied (pendingPause == false) and reroute is still active.
+    // Check whether ALL assigned partitions were paused.
+    return context.assignment().stream()
+        .allMatch(tp -> flaggedPartitions.contains(tp.partition()));
+  }
+
   @Override
   public void close() throws IOException {
     writers.values().forEach(RecordWriter::close);
