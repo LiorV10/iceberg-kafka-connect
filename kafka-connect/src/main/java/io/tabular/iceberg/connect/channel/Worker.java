@@ -60,6 +60,7 @@ class Worker implements Writer, AutoCloseable {
   private final List<WriterResult> flagWriterResults;
   private boolean isPaused;
   private SinkRecord pausingFlag;
+  private TableIdentifier pausedTableIdentifier;
   private final SinkTaskContext context;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
@@ -80,6 +81,7 @@ class Worker implements Writer, AutoCloseable {
     this.flagWriterResults = Lists.newArrayList();
     this.isPaused = false;
     this.pausingFlag = null;
+    this.pausedTableIdentifier = null;
     this.context = context;
   }
 
@@ -124,14 +126,30 @@ class Worker implements Writer, AutoCloseable {
       return;
     }
 
+    if (!tableIdentifier.equals(this.pausedTableIdentifier)) {
+      // This sentinel is for a different table — this worker is still waiting for its own.
+      return;
+    }
+
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
 
-    sourceOffsets.put(
-            new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()),
-            new Offset(this.pausingFlag.kafkaOffset() + 1, this.pausingFlag.timestamp()));
+    TopicPartition tp =
+        new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition());
+    long nextOffset = this.pausingFlag.kafkaOffset() + 1;
+
+    sourceOffsets.put(tp, new Offset(nextOffset, this.pausingFlag.timestamp()));
 
     this.pausingFlag = null;
+    this.pausedTableIdentifier = null;
     resumeAssignment();
+
+    // Seek the Kafka Connect consumer back to the record immediately after the flag.
+    // Without this, records that were in the same batch as the flag and skipped during
+    // the pause would be lost because the framework's internal consumer position has
+    // already moved past them even though their offsets were never committed.
+    if (context != null) {
+      context.offset(tp, nextOffset);
+    }
   }
 
   @Override
@@ -142,6 +160,7 @@ class Worker implements Writer, AutoCloseable {
     flagWriterResults.clear();
     this.isPaused = false;
     this.pausingFlag = null;
+    this.pausedTableIdentifier = null;
   }
 
   @Override
@@ -181,6 +200,7 @@ class Worker implements Writer, AutoCloseable {
       flagWriterResults.add(flagResult);
 
       this.pausingFlag = record;
+      this.pausedTableIdentifier = tableIdentifier;
       pauseAssignment(record.kafkaPartition());
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",
