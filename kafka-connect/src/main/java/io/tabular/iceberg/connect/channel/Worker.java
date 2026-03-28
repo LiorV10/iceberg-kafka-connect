@@ -148,9 +148,39 @@ class Worker implements Writer, AutoCloseable {
   }
 
   /**
+   * Restores the paused/rerouted state from persistent offset metadata detected at startup.
+   * This is called by {@link TaskImpl} after the {@link CommitterImpl} has read the committed
+   * offsets and detected pending-flag metadata.  The Worker pauses the corresponding partitions
+   * and sets its reroute target so that any records arriving before the Coordinator sends the
+   * flag-processed sentinel are correctly rerouted.
+   */
+  @Override
+  public void restorePausedState(Map<TopicPartition, String> pendingFlags) {
+    if (pendingFlags == null || pendingFlags.isEmpty()) {
+      return;
+    }
+
+    // All pending flags should point to the same reroute table (a flag event targets one table).
+    // Use the first entry to determine the reroute target.
+    String flagTable = pendingFlags.values().iterator().next();
+    this.reroute = TableIdentifier.parse(flagTable);
+    pendingFlags.keySet().forEach(tp -> this.flaggedPartitions.add(tp.partition()));
+
+    LOG.info(
+        "Restored paused state from offset metadata: reroute={}, flaggedPartitions={}",
+        reroute,
+        flaggedPartitions);
+
+    pauseFlaggedPartitions();
+  }
+
+  /**
    * Drains only the pending flag results, leaving normal write results and source offsets
    * untouched.  Also applies the deferred {@code context.pause()} if it hasn't been applied yet.
    * Returns {@code null} if there are no pending flags.
+   *
+   * <p>Flag partition offsets remain in {@code sourceOffsets} and will be committed during
+   * the next regular commit cycle via {@link #committable()}.
    */
   @Override
   public Committable drainPendingFlagCommittable() {
@@ -170,8 +200,8 @@ class Worker implements Writer, AutoCloseable {
       pendingPause = false;
     }
 
-    // Return a Committable with empty offsets — flag partition offsets must NOT be committed
-    // until the Coordinator processes all flags and onFlagProcessed() fires.
+    // Return a Committable with empty offsets — flag partition offsets will be committed
+    // via committable() during the next regular commit cycle.
     return new Committable(Maps.newHashMap(), flags);
   }
 
@@ -221,10 +251,13 @@ class Worker implements Writer, AutoCloseable {
         context.requestCommit();
       }
 
-      // Do NOT update sourceOffsets for the flag record — its offset must not be committed
-      // until all partitions have reported their flags and onFlagProcessed() fires.
-      // Do NOT call context.pause() here — that is deferred to committable() so that the
-      // flagWriterResult is guaranteed to be sent to the Coordinator first.
+      // Include the flag record offset in sourceOffsets WITH metadata so that:
+      //   (a) the offset IS committed — avoiding errors from re-reading the flag on restart
+      //   (b) the metadata persists the pending-flag state so it can be restored on restart
+      sourceOffsets.put(
+          new TopicPartition(record.topic(), record.kafkaPartition()),
+          new Offset(record.kafkaOffset() + 1, record.timestamp(), tableIdentifier.toString()));
+
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",
           tableContext.tableIdentifier(),
@@ -233,9 +266,12 @@ class Worker implements Writer, AutoCloseable {
     }
 
     // If a reroute is active and this record is on a flagged partition,
-    // reroute it to the flag table but do NOT track its offset (so the
-    // flag can be re-read after restart).
+    // reroute it to the flag table.  Track the offset WITH metadata so
+    // that the pending-flag state persists across restarts.
     if (reroute != null && flaggedPartitions.contains(record.kafkaPartition())) {
+      sourceOffsets.put(
+          new TopicPartition(record.topic(), record.kafkaPartition()),
+          new Offset(record.kafkaOffset() + 1, record.timestamp(), reroute.toString()));
       writerForTable(reroute.toString(), record, true).write(record);
       return;
     }

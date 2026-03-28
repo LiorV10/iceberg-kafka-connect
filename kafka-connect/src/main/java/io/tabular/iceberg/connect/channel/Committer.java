@@ -18,6 +18,21 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import java.util.Map;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+
 interface Committer {
   void commit(CommittableSupplier committableSupplier);
+
+  /**
+   * Returns pending flag partitions detected from committed offset metadata at startup.
+   * Each entry maps a source {@link TopicPartition} to the table identifier that was being
+   * rerouted when the offset was committed.  An empty map means no flag was pending.
+   *
+   * <p>The default implementation returns an empty map.
+   */
+  default Map<TopicPartition, String> pendingFlagsByPartition() {
+    return ImmutableMap.of();
+  }
 }

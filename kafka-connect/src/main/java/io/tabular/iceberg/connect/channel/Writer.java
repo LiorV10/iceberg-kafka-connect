@@ -19,8 +19,20 @@
 package io.tabular.iceberg.connect.channel;
 
 import java.util.Collection;
+import java.util.Map;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.connect.sink.SinkRecord;
 
 interface Writer extends CommittableSupplier {
   void write(Collection<SinkRecord> sinkRecords);
+
+  /**
+   * Restores the paused/rerouted state from persistent offset metadata detected at startup.
+   * Each entry maps a source {@link TopicPartition} to the table identifier that was being
+   * rerouted when the offset was committed.  Implementations should set their reroute target
+   * and pause the corresponding partitions.
+   *
+   * <p>The default implementation is a no-op.
+   */
+  default void restorePausedState(Map<TopicPartition, String> pendingFlags) {}
 }
