@@ -115,35 +115,9 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
           admin()
               .listConsumerGroupOffsets(
                   groupId, new ListConsumerGroupOffsetsOptions().requireStable(true));
-      Map<TopicPartition, Long> offsets =
-          response.partitionsToOffsetAndMetadata().get().entrySet().stream()
-              .filter(entry -> context.assignment().contains(entry.getKey()))
-              .collect(toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
-
-      // Detect partitions that were paused due to a pending flag before a crash/restart.
-      // For those partitions, rewind the offset by 1 so the flag record is re-consumed,
-      // causing the Worker to re-detect the flag and re-pause the partition.
-      List<TopicPartition> pausedPartitions =
-          response.partitionsToOffsetAndMetadata().get().entrySet().stream()
-              .filter(entry -> context.assignment().contains(entry.getKey()))
-              .filter(entry -> Offset.PAUSED_METADATA.equals(entry.getValue().metadata()))
-              .map(Map.Entry::getKey)
-              .collect(toList());
-
-      if (!pausedPartitions.isEmpty()) {
-        LOG.info(
-            "Detected {} partitions paused by a pending flag before restart: {}",
-            pausedPartitions.size(),
-            pausedPartitions);
-        for (TopicPartition tp : pausedPartitions) {
-          Long offset = offsets.get(tp);
-          if (offset != null && offset > 0) {
-            offsets.put(tp, offset - 1);
-          }
-        }
-      }
-
-      return offsets;
+      return response.partitionsToOffsetAndMetadata().get().entrySet().stream()
+          .filter(entry -> context.assignment().contains(entry.getKey()))
+          .collect(toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
     } catch (InterruptedException | ExecutionException e) {
       throw new ConnectException(e);
     }

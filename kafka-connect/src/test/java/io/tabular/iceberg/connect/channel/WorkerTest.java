@@ -374,11 +374,12 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that the offset for a paused partition carries the {@code paused} flag
-   * so that the pause state is persisted through the committed consumer group offsets.
+   * Verifies that a flag record does NOT update the committed offset for its partition.
+   * By not advancing the offset past the flag, a crash/restart will cause Kafka to
+   * re-deliver the flag record so the Worker re-detects it and re-pauses automatically.
    */
   @Test
-  public void testFlagRecordMarksOffsetAsPaused() {
+  public void testFlagRecordDoesNotUpdateOffset() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -399,44 +400,50 @@ public class WorkerTest {
 
     Committable committable = worker.committable();
 
-    // The offset for partition 0 should be flag_offset + 1 = 11
-    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
-        .as("Offset should be flag record offset + 1")
-        .isEqualTo(11L);
-
-    // The offset should carry the paused flag
-    assertThat(committable.offsetsByTopicPartition().get(tp).paused())
-        .as("Offset must be marked as paused when a flag is detected")
-        .isTrue();
+    // The flag record should NOT produce an offset entry for its partition
+    assertThat(committable.offsetsByTopicPartition())
+        .as("Flag record must not update the committed offset")
+        .doesNotContainKey(tp);
   }
 
   /**
-   * Verifies that normal (non-flag) records produce offsets that are NOT marked as paused.
+   * Verifies that when a normal record precedes a flag in the same batch, the committed
+   * offset stays at the pre-flag record's offset (flag does not advance it further).
    */
   @Test
-  public void testNormalRecordOffsetIsNotPaused() {
+  public void testPreFlagOffsetIsPreservedWhenFlagFollows() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
     when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
     when(config.branchesRegexDelimiter()).thenReturn(null);
 
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
     IcebergWriter dataWriter = mock(IcebergWriter.class);
     when(dataWriter.complete()).thenReturn(ImmutableList.of());
     IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
     when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
 
-    Worker worker = new Worker(config, writerFactory);
+    Worker worker = new Worker(config, writerFactory, context);
 
-    Map<String, Object> value = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
-    SinkRecord rec = new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null, value, 5L);
-    worker.write(ImmutableList.of(rec));
+    // Normal record at offset 5, then flag at offset 6
+    SinkRecord normalRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
+            ImmutableMap.of(FIELD_NAME, TABLE_NAME), 5L);
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 6L);
+    worker.write(ImmutableList.of(normalRec, flagRec));
 
     Committable committable = worker.committable();
 
-    assertThat(committable.offsetsByTopicPartition().values())
-        .as("Normal record offsets must NOT be marked as paused")
-        .allMatch(offset -> !offset.paused());
+    // Offset should be 6 (normal record offset 5 + 1), NOT 7 (flag offset 6 + 1)
+    assertThat(committable.offsetsByTopicPartition().get(tp).offset())
+        .as("Offset should stay at the pre-flag record position")
+        .isEqualTo(6L);
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {

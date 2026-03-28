@@ -26,30 +26,18 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 
 public class Offset {
 
-  public static final String PAUSED_METADATA = "paused";
-
   private final Long offset;
   private final Long timestamp;
-  private final boolean paused;
 
   public Offset(Long offset, Long timestamp) {
-    this(offset, timestamp, false);
-  }
-
-  public Offset(Long offset, Long timestamp, boolean paused) {
     Preconditions.checkNotNull(offset, "offset cannot be null");
 
     this.offset = offset;
     this.timestamp = timestamp;
-    this.paused = paused;
   }
 
   public Long offset() {
     return offset;
-  }
-
-  public boolean paused() {
-    return paused;
   }
 
   public OffsetDateTime timestamp() {
@@ -68,18 +56,16 @@ public class Offset {
       return false;
     }
     Offset offset1 = (Offset) o;
-    return Objects.equals(offset, offset1.offset)
-        && Objects.equals(timestamp, offset1.timestamp)
-        && paused == offset1.paused;
+    return Objects.equals(offset, offset1.offset) && Objects.equals(timestamp, offset1.timestamp);
   }
 
   @Override
   public int hashCode() {
-    return Objects.hash(offset, timestamp, paused);
+    return Objects.hash(offset, timestamp);
   }
 
   @Override
   public String toString() {
-    return "Offset{" + "offset=" + offset + ", timestamp=" + timestamp + ", paused=" + paused + '}';
+    return "Offset{" + "offset=" + offset + ", timestamp=" + timestamp + '}';
   }
 }

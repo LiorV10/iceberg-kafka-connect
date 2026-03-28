@@ -182,20 +182,15 @@ class CommitterImplTest {
 
   private ListConsumerGroupOffsetsResult listConsumerGroupOffsetsResult(
       Map<TopicPartition, Long> consumerOffsets) {
-    return listConsumerGroupOffsetsResultWithMetadata(
-        consumerOffsets.entrySet().stream()
-            .collect(
-                Collectors.toMap(
-                    Map.Entry::getKey, e -> new OffsetAndMetadata(e.getValue()))));
-  }
-
-  private ListConsumerGroupOffsetsResult listConsumerGroupOffsetsResultWithMetadata(
-      Map<TopicPartition, OffsetAndMetadata> consumerOffsets) {
     return ctorListConsumerGroupOffsetsResult()
         .newInstance(
             ImmutableMap.of(
                 coordinatorKey,
-                KafkaFuture.completedFuture(consumerOffsets)));
+                KafkaFuture.completedFuture(
+                    consumerOffsets.entrySet().stream()
+                        .collect(
+                            Collectors.toMap(
+                                Map.Entry::getKey, e -> new OffsetAndMetadata(e.getValue()))))));
   }
 
   private void whenAdminListConsumerGroupOffsetsThenReturn(
@@ -205,12 +200,6 @@ class CommitterImplTest {
           when(admin.listConsumerGroupOffsets(eq(consumerGroup), listOffsetResultMatcher()))
               .thenReturn(listConsumerGroupOffsetsResult(consumerOffsets));
         });
-  }
-
-  private void whenAdminListConsumerGroupOffsetsWithMetadataThenReturn(
-      String consumerGroup, Map<TopicPartition, OffsetAndMetadata> consumerOffsets) {
-    when(admin.listConsumerGroupOffsets(eq(consumerGroup), listOffsetResultMatcher()))
-        .thenReturn(listConsumerGroupOffsetsResultWithMetadata(consumerOffsets));
   }
 
   private static class NoOpCoordinatorThreadFactory implements CoordinatorThreadFactory {
@@ -718,79 +707,6 @@ class CommitterImplTest {
       assertThat(onFlagProcessedCalled[0])
           .as("onFlagProcessed() must NOT be called for a regular CommitToTable")
           .isFalse();
-    }
-  }
-
-  /**
-   * Verifies that when a committed offset has "paused" metadata (indicating a pending flag was
-   * active before a crash/restart), CommitterImpl rewinds that partition's offset by 1 so the
-   * flag record is re-consumed by the Worker on the next put() call.
-   */
-  @Test
-  public void testPausedPartitionsAreRewoundOnStartup() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    // Simulate partition 0 having "paused" metadata (flag was active before crash)
-    // and partition 1 having no metadata (normal state)
-    Set<TopicPartition> assignedPartitions = ImmutableSet.of(SOURCE_TP0, SOURCE_TP1);
-    when(mockContext.assignment()).thenReturn(assignedPartitions);
-
-    whenAdminListConsumerGroupOffsetsWithMetadataThenReturn(
-        CONFIG.controlGroupId(),
-        ImmutableMap.of(
-            SOURCE_TP0, new OffsetAndMetadata(42L, Offset.PAUSED_METADATA),
-            SOURCE_TP1, new OffsetAndMetadata(100L)));
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-
-      // Capture the offsets passed to context.offset()
-      ArgumentCaptor<Map<TopicPartition, Long>> offsetCaptor =
-          ArgumentCaptor.forClass(Map.class);
-      verify(mockContext).offset(offsetCaptor.capture());
-
-      Map<TopicPartition, Long> setOffsets = offsetCaptor.getValue();
-
-      // Partition 0 should be rewound by 1 (42 -> 41) so the flag record is re-consumed
-      assertThat(setOffsets.get(SOURCE_TP0))
-          .as("Paused partition should be rewound by 1")
-          .isEqualTo(41L);
-
-      // Partition 1 should remain unchanged
-      assertThat(setOffsets.get(SOURCE_TP1))
-          .as("Non-paused partition should keep its offset")
-          .isEqualTo(100L);
-    }
-  }
-
-  /**
-   * Verifies that when no partitions have "paused" metadata, no offset rewind occurs.
-   */
-  @Test
-  public void testNoPausedPartitionsMeansNoRewind() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    whenAdminListConsumerGroupOffsetsThenReturn(
-        ImmutableMap.of(
-            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 42L)));
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-
-      ArgumentCaptor<Map<TopicPartition, Long>> offsetCaptor =
-          ArgumentCaptor.forClass(Map.class);
-      verify(mockContext).offset(offsetCaptor.capture());
-
-      Map<TopicPartition, Long> setOffsets = offsetCaptor.getValue();
-
-      // No paused metadata → offset should stay the same
-      assertThat(setOffsets.get(SOURCE_TP0))
-          .as("Offset should not be rewound when no paused metadata")
-          .isEqualTo(42L);
     }
   }
 }

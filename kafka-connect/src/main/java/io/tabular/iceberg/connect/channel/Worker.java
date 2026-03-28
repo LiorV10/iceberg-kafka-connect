@@ -151,12 +151,6 @@ class Worker implements Writer, AutoCloseable {
       return;
     }
 
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-            new TopicPartition(record.topic(), record.kafkaPartition()),
-            new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
           "Flag record detected at topic: {}, partition: {}, offset: {}",
@@ -175,12 +169,9 @@ class Worker implements Writer, AutoCloseable {
       flagWriterResults.add(flagResult);
       this.context.requestCommit();
 
-      // Mark the offset as paused so the pause state is persisted through the offset commit.
-      // On restart, CommitterImpl detects the paused metadata and rewinds the offset by one
-      // so this flag record is re-consumed, causing the Worker to re-detect it and re-pause.
-      sourceOffsets.put(
-          new TopicPartition(record.topic(), record.kafkaPartition()),
-          new Offset(record.kafkaOffset() + 1, record.timestamp(), true));
+      // Do NOT update sourceOffsets for flag records. By leaving the committed offset
+      // at the last non-flag position, a crash/restart will cause Kafka to re-deliver
+      // the flag record, so the Worker re-detects it and re-pauses automatically.
 
       // The partition will be paused at committable() time, preventing new records from arriving after this batch.
       pauseAssignment(record.kafkaPartition());
@@ -189,6 +180,12 @@ class Worker implements Writer, AutoCloseable {
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
+      // the consumer stores the offsets that corresponds to the next record to consume,
+      // so increment the record offset by one
+      sourceOffsets.put(
+              new TopicPartition(record.topic(), record.kafkaPartition()),
+              new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
