@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -42,6 +43,7 @@ import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTest
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsOptions;
 import org.apache.kafka.clients.admin.ListConsumerGroupOffsetsResult;
 import org.apache.kafka.clients.consumer.ConsumerGroupMetadata;
@@ -54,6 +56,40 @@ import org.slf4j.LoggerFactory;
 public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(CommitterImpl.class);
+
+  // Poll duration for the control topic consumer during commit().
+  //
+  // committable() is ONLY invoked when a START_COMMIT event is received from the Coordinator
+  // on the control topic.  The Coordinator sends START_COMMIT on a periodic timer
+  // (commitIntervalMs).  Sending more source-topic records does NOT trigger committable().
+  // SinkTaskContext.requestCommit() only tells the Kafka Connect framework to commit its own
+  // offsets — it has no effect on the Iceberg commit protocol.
+  //
+  // BEFORE restart (steady state):
+  //   The CommitterImpl consumer has been running continuously.  Its background Kafka fetch
+  //   thread keeps the internal record buffer populated with new control-topic messages.
+  //   When the Coordinator sends START_COMMIT, it is delivered to the buffer promptly.
+  //   Even poll(Duration.ZERO) returns it immediately because the record is already buffered.
+  //   committable() is called reliably on every Coordinator cycle.
+  //
+  // AFTER restart:
+  //   A brand-new CommitterImpl consumer is created with a random group ID and
+  //   auto.offset.reset=latest.  Two things change:
+  //   (a) The consumer's fetch thread has not started yet — poll(Duration.ZERO) returns
+  //       nothing even if a START_COMMIT message exists, because no network I/O is
+  //       performed.  A non-zero duration (100ms) gives the fetch thread time to deliver
+  //       any available records.
+  //   (b) More importantly: the Coordinator may also have restarted, so its commit-interval
+  //       timer starts fresh — no START_COMMIT has been produced yet.  In this case,
+  //       committable() will NOT be called until the timer fires (up to commitIntervalMs
+  //       later), regardless of the poll duration.
+  //
+  // For flag records specifically, drainPendingFlagCommittable() bypasses the START_COMMIT
+  // dependency entirely by sending flag results eagerly to the Coordinator.  This is the
+  // actual fix for the restart case — the non-zero poll duration only helps with (a) above.
+  @VisibleForTesting
+  static final Duration COMMIT_POLL_DURATION = Duration.ofMillis(100);
+
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
@@ -134,6 +170,17 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
       sendCommitResponse(commitId, committableSupplier);
       return true;
     }
+    if (envelope.event().type() == PayloadType.COMMIT_TO_TABLE) {
+      CommitToTable commitToTable = (CommitToTable) envelope.event().payload();
+      // The Coordinator sends a per-table sentinel CommitToTable (with the all-zeros UUID) after
+      // processing all pending flag messages for a specific table.  Only workers routing to that
+      // table clear their reroute state and resume; others are unaffected (the Worker checks the
+      // table identifier).
+      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(commitToTable.commitId())) {
+        committableSupplier.onFlagProcessed(commitToTable.tableReference().identifier());
+      }
+      return true;
+    }
     return false;
   }
 
@@ -190,7 +237,78 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-    consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
+    consumeAvailable(COMMIT_POLL_DURATION, envelope -> receive(envelope, committableSupplier));
+
+    // After polling the control topic, eagerly send any pending flag results to the Coordinator
+    // without waiting for START_COMMIT.
+    //
+    // Why this is needed:
+    // committable() is only invoked when a START_COMMIT event is received.  After a restart,
+    // committable() may not be called for up to commitIntervalMs because:
+    //   - The Coordinator's commit-interval timer starts fresh, so no START_COMMIT has been
+    //     sent yet (the Coordinator also restarts in a pod restart).
+    //   - Even if only this task restarted, the constructor's initial 1000ms poll may have
+    //     consumed the only available START_COMMIT, and the next one won't arrive until the
+    //     Coordinator's timer fires again.
+    //
+    // Before restart, this eager send is not needed because START_COMMIT events flow
+    // regularly and committable() is called on each cycle.  But the eager send is harmless
+    // in that case because flagWriterResults will already be empty (included in the regular
+    // committable() via sendCommitResponse()).
+    //
+    // Sending DataWritten events eagerly is safe because the Coordinator buffers them in
+    // commitState.addResponse() regardless of whether a commit is in progress, and includes
+    // them in the next commit cycle.  No DataComplete is sent here, so the Coordinator does
+    // not count this task as "ready" until the normal commit cycle.
+    Committable flagCommittable = committableSupplier.drainPendingFlagCommittable();
+    if (flagCommittable != null && !flagCommittable.writerResults().isEmpty()) {
+      UUID eagerCommitId = UUID.randomUUID();
+      LOG.info(
+          "Eagerly sending {} flag result(s) with eager-commit-id={}",
+          flagCommittable.writerResults().size(),
+          eagerCommitId);
+      List<Event> events = Lists.newArrayList();
+      flagCommittable
+          .writerResults()
+          .forEach(
+              writerResult ->
+                  events.add(
+                      new Event(
+                          config.controlGroupId(),
+                          new DataWritten(
+                              writerResult.partitionStruct(),
+                              eagerCommitId,
+                              TableReference.of(
+                                  config.catalogName(), writerResult.tableIdentifier()),
+                              writerResult.dataFiles(),
+                              writerResult.deleteFiles()))));
+      // Send without committing any source-topic offsets — flag partition offsets must remain
+      // uncommitted so the flag can be re-read if the task restarts before all partitions
+      // have reported their flags.
+      send(events, ImmutableMap.of(), null);
+    }
+
+    // When ALL source partitions are paused (typically after a pod restart where the flag was
+    // broadcast to every partition), Kafka Connect stops calling put() because there are no
+    // records to deliver.  Since commit() is called from put(), this method would never be
+    // called again — creating a deadlock where the onFlagProcessed sentinel is never received
+    // and the partitions are never unpaused.
+    //
+    // To break the deadlock, keep polling the control topic here until the flag is processed
+    // and partitions are unpaused.  The CoordinatorThread runs on a separate thread and will
+    // eventually send START_COMMIT; this loop handles both START_COMMIT (via receive() →
+    // sendCommitResponse() → committable()) and the per-table sentinel COMMIT_TO_TABLE
+    // (via receive() → onFlagProcessed()).
+    while (committableSupplier.isAllPartitionsPaused()) {
+      throwExceptionIfCoordinatorIsTerminated();
+      consumeAvailable(COMMIT_POLL_DURATION, envelope -> receive(envelope, committableSupplier));
+      try {
+        Thread.sleep(COMMIT_POLL_DURATION.toMillis());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
   }
 
   @Override
