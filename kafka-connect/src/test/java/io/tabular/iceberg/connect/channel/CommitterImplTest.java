@@ -709,4 +709,118 @@ class CommitterImplTest {
           .isFalse();
     }
   }
+
+  /**
+   * Verifies that pending flag results are sent eagerly to the control topic as
+   * {@link DataWritten} events even when no {@link StartCommit} has been received.
+   * This is critical after a task restart: the flag is re-read (offset not committed),
+   * but the Coordinator may not send {@code START_COMMIT} for up to {@code commitIntervalMs},
+   * so the flag result must be sent immediately via {@code drainPendingFlagCommittable()}.
+   */
+  @Test
+  public void testPendingFlagResultsSentEagerlyWithoutStartCommit() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    List<DataFile> flagDataFiles = ImmutableList.of(createDataFile());
+    Types.StructType partitionStruct = Types.StructType.of();
+
+    // CommittableSupplier whose committable() must NOT be called (no START_COMMIT)
+    // but drainPendingFlagCommittable() returns a pending flag result.
+    boolean[] committableCalled = {false};
+    boolean[] drainCalled = {false};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        committableCalled[0] = true;
+        return new Committable(ImmutableMap.of(), ImmutableList.of());
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        if (drainCalled[0]) {
+          return null; // second call returns null (already drained)
+        }
+        drainCalled[0] = true;
+        return new Committable(
+            ImmutableMap.of(),
+            ImmutableList.of(
+                new WriterResult(
+                    TABLE_1_IDENTIFIER, flagDataFiles, ImmutableList.of(), partitionStruct)));
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      // No START_COMMIT on the control topic — just call commit()
+      committer.commit(committableSupplier);
+
+      // committable() must NOT have been called (no START_COMMIT)
+      assertThat(committableCalled[0])
+          .as("committable() must not be called when no START_COMMIT is received")
+          .isFalse();
+
+      // drainPendingFlagCommittable() must have been called
+      assertThat(drainCalled[0])
+          .as("drainPendingFlagCommittable() must be called on every commit()")
+          .isTrue();
+
+      // The flag result must have been sent eagerly as a DataWritten event
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(1);
+
+      Event event = AvroUtil.decode(producer.history().get(0).value());
+      assertThat(event.type()).isEqualTo(PayloadType.DATA_WRITTEN);
+      DataWritten payload = (DataWritten) event.payload();
+      assertThat(payload.tableReference().identifier()).isEqualTo(TABLE_1_IDENTIFIER);
+      assertSameContentFiles(payload.dataFiles(), flagDataFiles);
+
+      // No source-topic offsets must be committed (flag offsets stay uncommitted)
+      assertThat(producer.consumerGroupOffsetsHistory()).isEmpty();
+    }
+  }
+
+  /**
+   * Verifies that when drainPendingFlagCommittable() returns null (no pending flags),
+   * no eager send is performed.
+   */
+  @Test
+  public void testNoPendingFlagResultsMeansNoEagerSend() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        throw new NotImplementedException("Should not be called");
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        return null; // no pending flags
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      committer.commit(committableSupplier);
+
+      assertThat(producer.history()).isEmpty();
+      assertThat(producer.consumerGroupOffsetsHistory()).isEmpty();
+    }
+  }
 }

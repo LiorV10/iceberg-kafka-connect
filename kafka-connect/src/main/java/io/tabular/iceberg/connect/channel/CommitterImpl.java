@@ -55,6 +55,17 @@ import org.slf4j.LoggerFactory;
 public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(CommitterImpl.class);
+
+  // Poll duration for the control topic consumer during commit().
+  // A non-zero duration is required so that the consumer has time to receive messages from
+  // the broker.  With Duration.ZERO the consumer only returns records already in its internal
+  // buffer (no network I/O is performed), which after a task restart means START_COMMIT
+  // events sent by the Coordinator are consistently missed — the consumer is brand new
+  // (random group, auto.offset.reset=latest) and its background fetch thread may not have
+  // delivered the record before the zero-timeout poll returns.
+  @VisibleForTesting
+  static final Duration COMMIT_POLL_DURATION = Duration.ofMillis(100);
+
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
@@ -202,7 +213,44 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-    consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
+    consumeAvailable(COMMIT_POLL_DURATION, envelope -> receive(envelope, committableSupplier));
+
+    // After polling the control topic, eagerly send any pending flag results to the Coordinator
+    // without waiting for START_COMMIT.  This is critical after a task restart: the flag is
+    // re-read (offset was not committed), but the Coordinator may not send START_COMMIT for up
+    // to commitIntervalMs — leaving the flag result stranded in the Worker.
+    //
+    // Sending DataWritten events eagerly is safe because the Coordinator buffers them in
+    // commitState.addResponse() regardless of whether a commit is in progress, and includes
+    // them in the next commit cycle.  No DataComplete is sent here, so the Coordinator does
+    // not count this task as "ready" until the normal commit cycle.
+    Committable flagCommittable = committableSupplier.drainPendingFlagCommittable();
+    if (flagCommittable != null && !flagCommittable.writerResults().isEmpty()) {
+      UUID eagerCommitId = UUID.randomUUID();
+      LOG.info(
+          "Eagerly sending {} flag result(s) with eager-commit-id={}",
+          flagCommittable.writerResults().size(),
+          eagerCommitId);
+      List<Event> events = Lists.newArrayList();
+      flagCommittable
+          .writerResults()
+          .forEach(
+              writerResult ->
+                  events.add(
+                      new Event(
+                          config.controlGroupId(),
+                          new DataWritten(
+                              writerResult.partitionStruct(),
+                              eagerCommitId,
+                              TableReference.of(
+                                  config.catalogName(), writerResult.tableIdentifier()),
+                              writerResult.dataFiles(),
+                              writerResult.deleteFiles()))));
+      // Send without committing any source-topic offsets — flag partition offsets must remain
+      // uncommitted so the flag can be re-read if the task restarts again before all partitions
+      // have reported their flags.
+      send(events, ImmutableMap.of(), null);
+    }
   }
 
   @Override

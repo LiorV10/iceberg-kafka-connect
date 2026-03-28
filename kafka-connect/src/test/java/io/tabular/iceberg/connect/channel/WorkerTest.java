@@ -403,4 +403,74 @@ public class WorkerTest {
                 .offset())
         .isEqualTo(1L);
   }
+
+  /**
+   * Verifies that {@link Worker#drainPendingFlagCommittable()} returns only flag results,
+   * leaves normal write results intact, and applies the deferred pause.
+   */
+  @Test
+  public void testDrainPendingFlagCommittableDrainsOnlyFlags() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
+
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    Worker worker = new Worker(config, writerFactory, context);
+
+    // Write a flag record
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
+    worker.write(ImmutableList.of(flagRec));
+
+    // Before draining: pause has not yet been called via context
+    verify(context, never()).pause(tp);
+
+    // Drain should return the flag result
+    Committable flagCommittable = worker.drainPendingFlagCommittable();
+    assertThat(flagCommittable).isNotNull();
+    assertThat(flagCommittable.writerResults())
+        .hasSize(1)
+        .allMatch(r -> r instanceof FlagWriterResult);
+    // No offsets in the flag committable
+    assertThat(flagCommittable.offsetsByTopicPartition()).isEmpty();
+
+    // Pause must now be applied
+    verify(context, times(1)).pause(tp);
+
+    // Second drain should return null (already drained)
+    assertThat(worker.drainPendingFlagCommittable()).isNull();
+
+    // committable() should NOT include the flag (already drained)
+    Committable committable = worker.committable();
+    assertThat(committable.writerResults().stream()
+        .filter(r -> r instanceof FlagWriterResult)
+        .count())
+        .isZero();
+  }
+
+  /**
+   * Verifies that {@link Worker#drainPendingFlagCommittable()} returns null when no flags
+   * have been detected.
+   */
+  @Test
+  public void testDrainPendingFlagCommittableReturnsNullWhenNoFlags() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.flagKeyPrefix()).thenReturn(null);
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory);
+
+    assertThat(worker.drainPendingFlagCommittable()).isNull();
+  }
 }

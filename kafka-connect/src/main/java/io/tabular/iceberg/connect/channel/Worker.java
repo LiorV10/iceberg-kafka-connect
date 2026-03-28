@@ -147,6 +147,34 @@ class Worker implements Writer, AutoCloseable {
     resumeAssignment();
   }
 
+  /**
+   * Drains only the pending flag results, leaving normal write results and source offsets
+   * untouched.  Also applies the deferred {@code context.pause()} if it hasn't been applied yet.
+   * Returns {@code null} if there are no pending flags.
+   */
+  @Override
+  public Committable drainPendingFlagCommittable() {
+    if (flagWriterResults.isEmpty()) {
+      return null;
+    }
+
+    LOG.info("Draining {} pending flag result(s) for eager send", flagWriterResults.size());
+
+    List<WriterResult> flags = Lists.newArrayList(flagWriterResults);
+    flagWriterResults.clear();
+
+    // Apply the deferred pause now — the flag results are about to be sent to the Coordinator,
+    // so we can safely pause the flagged partitions.
+    if (pendingPause) {
+      pauseFlaggedPartitions();
+      pendingPause = false;
+    }
+
+    // Return a Committable with empty offsets — flag partition offsets must NOT be committed
+    // until the Coordinator processes all flags and onFlagProcessed() fires.
+    return new Committable(Maps.newHashMap(), flags);
+  }
+
   @Override
   public void close() throws IOException {
     writers.values().forEach(RecordWriter::close);
