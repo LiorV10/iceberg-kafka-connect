@@ -35,6 +35,9 @@ public class TaskImpl implements Task, AutoCloseable {
   private final Writer writer;
   private final Committer committer;
 
+  private static final Logger LOG = LoggerFactory.getLogger(TaskImpl.class);
+
+
   public TaskImpl(SinkTaskContext context, IcebergSinkConfig config) {
     this.catalog = Utilities.loadCatalog(config);
     this.writer = new Worker(config, catalog, context);
@@ -43,8 +46,11 @@ public class TaskImpl implements Task, AutoCloseable {
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
+    LOG.debug("Putting new records");
     writer.write(sinkRecords);
+    LOG.debug("Committing new records");
     committer.commit(writer);
+    LOG.debug("Finished committing new records");
   }
 
   @Override

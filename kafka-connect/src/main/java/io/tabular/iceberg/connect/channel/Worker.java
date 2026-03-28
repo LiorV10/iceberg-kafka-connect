@@ -59,6 +59,7 @@ class Worker implements Writer, AutoCloseable {
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
   private boolean isPaused;
+  private SinkRecord pausingFlag;
   private final SinkTaskContext context;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
@@ -78,6 +79,7 @@ class Worker implements Writer, AutoCloseable {
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
     this.isPaused = false;
+    this.pausingFlag = null;
     this.context = context;
   }
 
@@ -124,6 +126,11 @@ class Worker implements Writer, AutoCloseable {
 
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
 
+    sourceOffsets.put(
+            new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()),
+            new Offset(this.pausingFlag.kafkaOffset() + 1, this.pausingFlag.timestamp()));
+
+    this.pausingFlag = null;
     resumeAssignment();
   }
 
@@ -134,6 +141,7 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.clear();
     flagWriterResults.clear();
     this.isPaused = false;
+    this.pausingFlag = null;
   }
 
   @Override
@@ -151,18 +159,16 @@ class Worker implements Writer, AutoCloseable {
       return;
     }
 
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-            new TopicPartition(record.topic(), record.kafkaPartition()),
-            new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
       LOG.info(
           "Flag record detected at topic: {}, partition: {}, offset: {}",
           record.topic(),
           record.kafkaPartition(),
           record.kafkaOffset());
+
+      sourceOffsets.put(
+              new TopicPartition(record.topic(), record.kafkaPartition()),
+              new Offset(record.kafkaOffset(), record.timestamp()));
 
       String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
       TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
@@ -173,15 +179,20 @@ class Worker implements Writer, AutoCloseable {
       FlagWriterResult flagResult =
           new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
       flagWriterResults.add(flagResult);
-      this.context.requestCommit();
 
-      // The partition will be paused at committable() time, preventing new records from arriving after this batch.
+      this.pausingFlag = record;
       pauseAssignment(record.kafkaPartition());
       LOG.info(
           "Flag detected — rerouting same-batch records to {} (branch: {})",
           tableContext.tableIdentifier(),
           tableContext.branch());
     } else {
+      // the consumer stores the offsets that corresponds to the next record to consume,
+      // so increment the record offset by one
+      sourceOffsets.put(
+              new TopicPartition(record.topic(), record.kafkaPartition()),
+              new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
       } else {
@@ -281,6 +292,7 @@ class Worker implements Writer, AutoCloseable {
               .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
               .toArray(TopicPartition[]::new);
 
+      context.resume(partitions);
       context.pause(partitions);
       this.isPaused = true;
       LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
@@ -290,8 +302,8 @@ class Worker implements Writer, AutoCloseable {
   private void resumeAssignment() {
     if (context != null) {
       // Always call context.assignment() fresh for the same reason as pauseAssignment().
-      context.resume(context.assignment().toArray(new TopicPartition[0]));
       this.isPaused = false;
+      context.resume(context.assignment().toArray(new TopicPartition[0]));
     }
   }
 
