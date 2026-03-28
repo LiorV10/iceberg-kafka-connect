@@ -89,6 +89,19 @@ class Worker implements Writer, AutoCloseable {
     this.context = context;
   }
 
+  /**
+   * Returns the accumulated write results and source offsets for the current commit cycle.
+   *
+   * <p>This method is called by {@link CommitterImpl#sendCommitResponse} when a
+   * {@code START_COMMIT} event is received from the Coordinator on the control topic.
+   * It is <em>not</em> triggered by writing source-topic records or by calling
+   * {@link SinkTaskContext#requestCommit()}.
+   *
+   * <p>After a task/pod restart there may be a delay of up to {@code commitIntervalMs}
+   * before the first {@code START_COMMIT} arrives, during which this method is never called.
+   * Flag results are handled separately via {@link #drainPendingFlagCommittable()} to avoid
+   * this delay.
+   */
   @Override
   public Committable committable() {
     LOG.debug("About to commit latest records");
@@ -221,6 +234,9 @@ class Worker implements Writer, AutoCloseable {
       pendingPause = true;
 
       if (context != null) {
+        // NOTE: requestCommit() tells the Kafka Connect framework to commit its own offsets.
+        // It does NOT trigger committable() or the Iceberg commit protocol.  committable()
+        // is only called when CommitterImpl receives a START_COMMIT event from the Coordinator.
         context.requestCommit();
       }
 

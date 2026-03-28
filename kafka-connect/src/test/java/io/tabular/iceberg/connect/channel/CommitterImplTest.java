@@ -823,4 +823,125 @@ class CommitterImplTest {
       assertThat(producer.consumerGroupOffsetsHistory()).isEmpty();
     }
   }
+
+  /**
+   * Simulates the restart scenario that explains why committable() is not called after a pod
+   * restart, and verifies that drainPendingFlagCommittable() correctly handles it.
+   *
+   * <p><strong>Before restart (steady state):</strong> The Coordinator sends
+   * {@code START_COMMIT} on a regular timer. The CommitterImpl consumer picks it up,
+   * {@code sendCommitResponse()} calls {@code committable()}, and the flag result is included.
+   *
+   * <p><strong>After restart:</strong> The CommitterImpl consumer is brand new (random group,
+   * auto.offset.reset=latest). The Coordinator also restarted, so its timer starts fresh —
+   * no {@code START_COMMIT} has been produced yet. {@code committable()} is never called.
+   * Without the eager send, the flag result would be stranded in the Worker forever.
+   *
+   * <p>This test verifies:
+   * <ol>
+   *   <li>{@code committable()} is NOT called (no START_COMMIT)</li>
+   *   <li>{@code drainPendingFlagCommittable()} IS called and the flag result IS sent</li>
+   *   <li>On a subsequent call (after START_COMMIT arrives), {@code committable()} is called
+   *       but the flag result is not duplicated</li>
+   * </ol>
+   */
+  @Test
+  public void testRestartScenarioCommittableNotCalledButFlagSentEagerly() throws IOException {
+    SinkTaskContext mockContext = mockContext();
+    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
+
+    whenAdminListConsumerGroupOffsetsThenReturn(
+        ImmutableMap.of(
+            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L, SOURCE_TP1, 100L)));
+
+    List<DataFile> flagDataFiles = ImmutableList.of(createDataFile());
+    Types.StructType partitionStruct = Types.StructType.of();
+
+    // Track whether each method is called and how many times
+    int[] committableCallCount = {0};
+    int[] drainCallCount = {0};
+    CommittableSupplier committableSupplier = new CommittableSupplier() {
+      @Override
+      public Committable committable() {
+        committableCallCount[0]++;
+        return new Committable(ImmutableMap.of(), ImmutableList.of());
+      }
+
+      @Override
+      public Committable drainPendingFlagCommittable() {
+        drainCallCount[0]++;
+        if (drainCallCount[0] == 1) {
+          // First call: return the pending flag result (simulating flag re-read after restart)
+          return new Committable(
+              ImmutableMap.of(),
+              ImmutableList.of(
+                  new WriterResult(
+                      TABLE_1_IDENTIFIER, flagDataFiles, ImmutableList.of(), partitionStruct)));
+        }
+        return null; // subsequent calls: already drained
+      }
+    };
+
+    try (CommitterImpl committerImpl =
+        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
+      initConsumer();
+      Committer committer = committerImpl;
+
+      // === First commit() call: simulates immediately after restart ===
+      // No START_COMMIT on the control topic (Coordinator also restarted, timer not yet fired)
+      committer.commit(committableSupplier);
+
+      // committable() must NOT have been called (no START_COMMIT available)
+      assertThat(committableCallCount[0])
+          .as("committable() must not be called when no START_COMMIT is available after restart")
+          .isZero();
+
+      // drainPendingFlagCommittable() must have been called
+      assertThat(drainCallCount[0])
+          .as("drainPendingFlagCommittable() must be called to eagerly send flag results")
+          .isEqualTo(1);
+
+      // The flag result must have been sent eagerly
+      assertThat(producer.transactionCommitted()).isTrue();
+      assertThat(producer.history()).hasSize(1);
+      Event event = AvroUtil.decode(producer.history().get(0).value());
+      assertThat(event.type()).isEqualTo(PayloadType.DATA_WRITTEN);
+
+      // No offsets committed (flag offsets must stay uncommitted for re-read)
+      assertThat(producer.consumerGroupOffsetsHistory()).isEmpty();
+
+      // Clear producer history for the next assertion
+      producer.clear();
+
+      // === Second commit() call: simulates after START_COMMIT eventually arrives ===
+      UUID commitId = UUID.randomUUID();
+      consumer.addRecord(
+          new ConsumerRecord<>(
+              CONTROL_TOPIC_PARTITION.topic(),
+              CONTROL_TOPIC_PARTITION.partition(),
+              0,
+              UUID.randomUUID().toString(),
+              AvroUtil.encode(
+                  new Event(
+                      CONFIG.controlGroupId(),
+                      new StartCommit(commitId)))));
+
+      committer.commit(committableSupplier);
+
+      // NOW committable() must have been called (START_COMMIT received)
+      assertThat(committableCallCount[0])
+          .as("committable() must be called when START_COMMIT is received")
+          .isEqualTo(1);
+
+      // drainPendingFlagCommittable() is called again but returns null (already drained)
+      assertThat(drainCallCount[0])
+          .as("drainPendingFlagCommittable() is called on every commit()")
+          .isEqualTo(2);
+
+      // Only DataComplete should be sent (no flag result — already drained in first call)
+      assertThat(producer.history()).hasSize(1);
+      Event completeEvent = AvroUtil.decode(producer.history().get(0).value());
+      assertThat(completeEvent.type()).isEqualTo(PayloadType.DATA_COMPLETE);
+    }
+  }
 }
