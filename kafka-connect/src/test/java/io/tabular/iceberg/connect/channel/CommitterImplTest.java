@@ -193,15 +193,6 @@ class CommitterImplTest {
                                 Map.Entry::getKey, e -> new OffsetAndMetadata(e.getValue()))))));
   }
 
-  private ListConsumerGroupOffsetsResult listConsumerGroupOffsetsResultWithMetadata(
-      Map<TopicPartition, OffsetAndMetadata> consumerOffsets) {
-    return ctorListConsumerGroupOffsetsResult()
-        .newInstance(
-            ImmutableMap.of(
-                coordinatorKey,
-                KafkaFuture.completedFuture(consumerOffsets)));
-  }
-
   private void whenAdminListConsumerGroupOffsetsThenReturn(
       Map<String, Map<TopicPartition, Long>> consumersOffsets) {
     consumersOffsets.forEach(
@@ -830,58 +821,6 @@ class CommitterImplTest {
 
       assertThat(producer.history()).isEmpty();
       assertThat(producer.consumerGroupOffsetsHistory()).isEmpty();
-    }
-  }
-
-  /**
-   * Verifies that committed offset metadata containing a table identifier is detected as a
-   * pending flag by {@link CommitterImpl} on construction.  This is the mechanism that makes
-   * flag-based pause persistent across task restarts without re-reading the flag record.
-   */
-  @Test
-  public void testPendingFlagsDetectedFromOffsetMetadata() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    // Simulate committed offsets where SOURCE_TP0 has flag metadata
-    when(admin.listConsumerGroupOffsets(eq(CONFIG.controlGroupId()), listOffsetResultMatcher()))
-        .thenReturn(
-            listConsumerGroupOffsetsResultWithMetadata(
-                ImmutableMap.of(
-                    SOURCE_TP0, new OffsetAndMetadata(110L, TABLE_1_NAME))));
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-
-      Map<TopicPartition, String> pendingFlags = committerImpl.pendingFlagsByPartition();
-      assertThat(pendingFlags)
-          .as("Pending flags must be detected from offset metadata")
-          .hasSize(1)
-          .containsEntry(SOURCE_TP0, TABLE_1_NAME);
-    }
-  }
-
-  /**
-   * Verifies that committed offsets WITHOUT metadata produce no pending flags.
-   */
-  @Test
-  public void testNoPendingFlagsWhenNoMetadata() throws IOException {
-    SinkTaskContext mockContext = mockContext();
-    NoOpCoordinatorThreadFactory coordinatorThreadFactory = new NoOpCoordinatorThreadFactory();
-
-    whenAdminListConsumerGroupOffsetsThenReturn(
-        ImmutableMap.of(
-            CONFIG.controlGroupId(), ImmutableMap.of(SOURCE_TP0, 110L)));
-
-    try (CommitterImpl committerImpl =
-        new CommitterImpl(mockContext, CONFIG, kafkaClientFactory, coordinatorThreadFactory)) {
-      initConsumer();
-
-      Map<TopicPartition, String> pendingFlags = committerImpl.pendingFlagsByPartition();
-      assertThat(pendingFlags)
-          .as("No pending flags expected when offset metadata is empty")
-          .isEmpty();
     }
   }
 }

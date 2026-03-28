@@ -39,8 +39,6 @@ public class TaskImpl implements Task, AutoCloseable {
     this.catalog = Utilities.loadCatalog(config);
     this.writer = new Worker(config, catalog, context);
     this.committer = new CommitterImpl(context, config, catalog);
-    // Restore paused state from committed offset metadata (if a flag was pending at shutdown)
-    writer.restorePausedState(committer.pendingFlagsByPartition());
   }
 
   @Override

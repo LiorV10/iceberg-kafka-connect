@@ -70,9 +70,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   private final SinkTaskContext context;
   private final IcebergSinkConfig config;
   private final Optional<CoordinatorThread> maybeCoordinatorThread;
-  // Pending flag partitions detected from committed offset metadata at startup.
-  // Maps source TopicPartition → table identifier string that was being rerouted.
-  private final Map<TopicPartition, String> pendingFlagsByPartition;
 
   public CommitterImpl(SinkTaskContext context, IcebergSinkConfig config, Catalog catalog) {
     this(context, config, catalog, new KafkaClientFactory(config.kafkaProps()));
@@ -105,7 +102,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
     this.context = context;
     this.config = config;
-    this.pendingFlagsByPartition = Maps.newHashMap();
 
     this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
 
@@ -133,22 +129,10 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                   groupId, new ListConsumerGroupOffsetsOptions().requireStable(true));
       return response.partitionsToOffsetAndMetadata().get().entrySet().stream()
           .filter(entry -> context.assignment().contains(entry.getKey()))
-          .peek(
-              entry -> {
-                String meta = entry.getValue().metadata();
-                if (meta != null && !meta.isEmpty()) {
-                  pendingFlagsByPartition.put(entry.getKey(), meta);
-                }
-              })
           .collect(toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
     } catch (InterruptedException | ExecutionException e) {
       throw new ConnectException(e);
     }
-  }
-
-  @Override
-  public Map<TopicPartition, String> pendingFlagsByPartition() {
-    return ImmutableMap.copyOf(pendingFlagsByPartition);
   }
 
   private void throwExceptionIfCoordinatorIsTerminated() {
@@ -233,16 +217,14 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     consumeAvailable(COMMIT_POLL_DURATION, envelope -> receive(envelope, committableSupplier));
 
     // After polling the control topic, eagerly send any pending flag results to the Coordinator
-    // without waiting for START_COMMIT.  This ensures flag results reach the Coordinator as
-    // quickly as possible after a flag is first detected.
+    // without waiting for START_COMMIT.  This is critical after a task restart: the flag is
+    // re-read (offset was not committed), but the Coordinator may not send START_COMMIT for up
+    // to commitIntervalMs — leaving the flag result stranded in the Worker.
     //
     // Sending DataWritten events eagerly is safe because the Coordinator buffers them in
     // commitState.addResponse() regardless of whether a commit is in progress, and includes
     // them in the next commit cycle.  No DataComplete is sent here, so the Coordinator does
     // not count this task as "ready" until the normal commit cycle.
-    //
-    // The flag partition offsets are NOT committed here — they are included in sourceOffsets
-    // and will be committed during the next regular commit cycle via committable().
     Committable flagCommittable = committableSupplier.drainPendingFlagCommittable();
     if (flagCommittable != null && !flagCommittable.writerResults().isEmpty()) {
       UUID eagerCommitId = UUID.randomUUID();
@@ -265,8 +247,9 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                                   config.catalogName(), writerResult.tableIdentifier()),
                               writerResult.dataFiles(),
                               writerResult.deleteFiles()))));
-      // Send without committing any source-topic offsets — flag partition offsets will be
-      // committed during the next regular commit cycle via committable().
+      // Send without committing any source-topic offsets — flag partition offsets must remain
+      // uncommitted so the flag can be re-read if the task restarts before all partitions
+      // have reported their flags.
       send(events, ImmutableMap.of(), null);
     }
   }

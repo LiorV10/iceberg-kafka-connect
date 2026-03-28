@@ -37,14 +37,14 @@ interface CommittableSupplier {
 
   /**
    * Drains any pending flag results that should be sent eagerly to the Coordinator without
-   * waiting for a {@code START_COMMIT} event.  This is needed when a flag record is first
-   * detected: the flag result must be forwarded to the Coordinator as soon as possible.
+   * waiting for a {@code START_COMMIT} event.  This is needed after a task restart: the flag
+   * record is re-read (because its offset was not committed), but the Coordinator may not send
+   * {@code START_COMMIT} for up to {@code commitIntervalMs}, leaving the flag result stranded.
    *
    * <p>Unlike {@link #committable()}, this method only removes flag results from the worker —
    * normal write results and source offsets are left untouched so they can still be included
-   * in the next regular commit cycle.  The returned {@link Committable} has empty offsets;
-   * flag partition offsets are committed during the next regular commit cycle via
-   * {@link #committable()}.
+   * in the next regular commit cycle.  The returned {@link Committable} has empty offsets so
+   * no source-topic offsets are committed for the flag partitions.
    *
    * <p>If the pending pause has not yet been applied, this method also applies it (via
    * {@code context.pause()}) to prevent further records from arriving on flagged partitions.

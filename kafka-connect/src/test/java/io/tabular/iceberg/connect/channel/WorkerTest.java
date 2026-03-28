@@ -475,11 +475,11 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that the flag record's offset IS included in sourceOffsets (with metadata)
-   * so that it gets committed and is not re-read on restart.
+   * Verifies that the flag record's offset is NOT included in sourceOffsets
+   * so that the flag is re-read on restart to restore the pause state.
    */
   @Test
-  public void testFlagOffsetIsIncludedInSourceOffsetsWithMetadata() {
+  public void testFlagOffsetIsExcludedFromSourceOffsets() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -497,19 +497,16 @@ public class WorkerTest {
     Committable committable = worker.committable();
     TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
 
-    // The flag offset must be included (offset 6 = 5 + 1)
-    assertThat(committable.offsetsByTopicPartition()).containsKey(tp);
-    assertThat(committable.offsetsByTopicPartition().get(tp).offset()).isEqualTo(6L);
-    // The metadata must contain the table identifier for persistent pause
-    assertThat(committable.offsetsByTopicPartition().get(tp).metadata()).isEqualTo(TABLE_NAME);
+    // The flag offset must NOT be included — it should be re-read on restart
+    assertThat(committable.offsetsByTopicPartition()).doesNotContainKey(tp);
   }
 
   /**
    * Verifies that rerouted records (after the flag on the same partition) also have their
-   * offsets tracked with metadata so that they are committed and not re-read on restart.
+   * offsets excluded so that the flag can be re-read on restart.
    */
   @Test
-  public void testReroutedRecordOffsetsAreTrackedWithMetadata() {
+  public void testReroutedRecordOffsetsAreExcludedFromSourceOffsets() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -534,73 +531,7 @@ public class WorkerTest {
     Committable committable = worker.committable();
     TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
 
-    // The latest offset (post-flag record) must be tracked (offset 7 = 6 + 1)
-    assertThat(committable.offsetsByTopicPartition()).containsKey(tp);
-    assertThat(committable.offsetsByTopicPartition().get(tp).offset()).isEqualTo(7L);
-    // Metadata must still be present for persistent pause
-    assertThat(committable.offsetsByTopicPartition().get(tp).metadata()).isEqualTo(TABLE_NAME);
-  }
-
-  /**
-   * Verifies that {@link Worker#restorePausedState} restores the reroute and pauses
-   * the flagged partitions, and that subsequent records on those partitions are rerouted.
-   */
-  @Test
-  public void testRestorePausedStateRestoresRerouteAndPause() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.dynamicTablesEnabled()).thenReturn(true);
-    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
-    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
-    when(config.branchesRegexDelimiter()).thenReturn(null);
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    SinkTaskContext context = mock(SinkTaskContext.class);
-    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
-
-    IcebergWriter dataWriter = mock(IcebergWriter.class);
-    when(dataWriter.complete()).thenReturn(ImmutableList.of());
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
-
-    Worker worker = new Worker(config, writerFactory, context);
-
-    // Simulate restart: restore paused state from committed offset metadata
-    worker.restorePausedState(ImmutableMap.of(tp, TABLE_NAME));
-
-    // Partitions must be paused
-    verify(context, times(1)).pause(tp);
-
-    // Records on the paused partition should be rerouted to the flag table
-    SinkRecord dataRec =
-        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
-            ImmutableMap.of(FIELD_NAME, "db.other"), 10L);
-    worker.write(ImmutableList.of(dataRec));
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
-    verify(writerFactory, never()).createWriter(eq("db.other"), any(), anyBoolean());
-
-    // After onFlagProcessed, the reroute is cleared and partitions are resumed
-    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
-    verify(context, times(1)).resume(tp);
-  }
-
-  /**
-   * Verifies that {@link Worker#restorePausedState} is a no-op when passed an empty map.
-   */
-  @Test
-  public void testRestorePausedStateNoOpWhenEmpty() {
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.flagKeyPrefix()).thenReturn(null);
-
-    TopicPartition tp = new TopicPartition(SRC_TOPIC_NAME, 0);
-    SinkTaskContext context = mock(SinkTaskContext.class);
-    when(context.assignment()).thenReturn(ImmutableSet.of(tp));
-
-    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
-    Worker worker = new Worker(config, writerFactory, context);
-
-    worker.restorePausedState(ImmutableMap.of());
-
-    // pause must NOT be called
-    verify(context, never()).pause(tp);
+    // The flag partition's offset must NOT be tracked (so the flag is re-read on restart)
+    assertThat(committable.offsetsByTopicPartition()).doesNotContainKey(tp);
   }
 }

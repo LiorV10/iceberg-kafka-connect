@@ -89,7 +89,7 @@ public abstract class Channel {
     sourceOffsets.forEach(
         (k, v) ->
             offsetsToCommit.put(
-                k, new OffsetAndMetadata(v.offset(), v.metadata())));
+                k, new OffsetAndMetadata(v.offset())));
 
     List<ProducerRecord<String, byte[]>> recordList =
         events.stream()
