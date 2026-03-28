@@ -31,7 +31,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
 import org.apache.iceberg.AppendFiles;
@@ -115,13 +114,6 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   private boolean receive(Envelope envelope) {
     switch (envelope.event().type()) {
-      case START_COMMIT:
-        if (!commitState.isCommitInProgress()) {
-          UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
-          LOG.info("Resuming commit from recovery with commit-id={}", commitId);
-          commitState.resumeCommit(commitId);
-        }
-        return true;
       case DATA_WRITTEN:
         commitState.addResponse(envelope);
         return true;
