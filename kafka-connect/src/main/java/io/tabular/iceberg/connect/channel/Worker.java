@@ -129,6 +129,7 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.put(
             new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()),
             new Offset(this.pausingFlag.kafkaOffset() + 1, this.pausingFlag.timestamp()));
+    context.offset(new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()), this.pausingFlag.kafkaOffset() + 1);
 
     this.pausingFlag = null;
     resumeAssignment();
@@ -192,6 +193,8 @@ class Worker implements Writer, AutoCloseable {
       sourceOffsets.put(
               new TopicPartition(record.topic(), record.kafkaPartition()),
               new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
+      LOG.debug("Processing record at {}", record.kafkaOffset());
 
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
