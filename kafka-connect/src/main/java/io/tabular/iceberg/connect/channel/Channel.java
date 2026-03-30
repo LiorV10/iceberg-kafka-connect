@@ -121,6 +121,7 @@ public abstract class Channel {
 
   protected void consumeAvailable(Duration pollDuration, Function<Envelope, Boolean> receiveFn) {
     ConsumerRecords<String, byte[]> records = consumer.poll(pollDuration);
+    LOG.debug("Consuming {} records", records.count());
     while (!records.isEmpty()) {
       records.forEach(
           record -> {
@@ -132,6 +133,7 @@ public abstract class Channel {
             if (event != null) {
               if (event.groupId().equals(groupId)) {
                 LOG.debug("Received event of type: {}", event.type().name());
+                LOG.debug("Sending to fn: {}", receiveFn.toString());
                 if (receiveFn.apply(new Envelope(event, record.partition(), record.offset()))) {
                   LOG.debug("Handled event of type: {}", event.type().name());
                 }

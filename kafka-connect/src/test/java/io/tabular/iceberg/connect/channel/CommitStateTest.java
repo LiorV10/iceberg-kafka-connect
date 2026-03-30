@@ -41,6 +41,40 @@ public class CommitStateTest {
   }
 
   @Test
+  public void testIsCommitIntervalReachedFiresImmediatelyOnFirstCall() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.commitIntervalMs()).thenReturn(300_000);
+
+    CommitState commitState = new CommitState(config);
+
+    // First call must return true immediately — no waiting for commitIntervalMs on startup.
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+
+    // Starting the commit advances startTime; subsequent calls must block until the interval.
+    commitState.startNewCommit();
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+
+    // Ending the commit resets the ID; still not enough time has passed.
+    commitState.endCurrentCommit();
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+  }
+
+  @Test
+  public void testIsCommitIntervalReachedDoesNotFireWhenCommitAlreadyInProgress() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.commitIntervalMs()).thenReturn(300_000);
+
+    CommitState commitState = new CommitState(config);
+
+    // Simulate: first call fires (fast-start), coordinator starts a commit immediately.
+    assertThat(commitState.isCommitIntervalReached()).isTrue();
+    commitState.startNewCommit();
+
+    // While that commit is in progress, the interval check must return false.
+    assertThat(commitState.isCommitIntervalReached()).isFalse();
+  }
+
+  @Test
   public void testIsCommitReady() {
     TopicPartitionOffset tp = mock(TopicPartitionOffset.class);
 

@@ -31,6 +31,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.connect.events.CommitToTable;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
@@ -90,8 +91,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     this.context = context;
     this.config = config;
 
-    this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
-
     // The source-of-truth for source-topic offsets is the control-group-id
     Map<TopicPartition, Long> stableConsumerOffsets =
         fetchStableConsumerOffsets(config.controlGroupId());
@@ -106,6 +105,14 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
                 envelope,
                 // CommittableSupplier that always returns empty committables
                 () -> new Committable(ImmutableMap.of(), ImmutableList.of())));
+
+    // Start the coordinator AFTER the initial poll completes.  CommitState now fires the
+    // very first StartCommit immediately (no commitIntervalMs wait), so starting the
+    // coordinator before the poll would risk having the constructor's empty-committable
+    // handler consume that fast-start StartCommit and respond with no flag data.
+    // Running the two 1-second initializations sequentially (total ~2 s) is an acceptable
+    // trade-off to eliminate this race.
+    this.maybeCoordinatorThread = coordinatorThreadFactory.create(context, config);
   }
 
   private Map<TopicPartition, Long> fetchStableConsumerOffsets(String groupId) {
@@ -130,14 +137,27 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
   private boolean receive(Envelope envelope, CommittableSupplier committableSupplier) {
     if (envelope.event().type() == PayloadType.START_COMMIT) {
+      LOG.debug("Got start commit event");
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
+      return true;
+    }
+    if (envelope.event().type() == PayloadType.COMMIT_TO_TABLE) {
+      CommitToTable commitToTable = (CommitToTable) envelope.event().payload();
+      // The Coordinator sends a per-table sentinel CommitToTable (with the all-zeros UUID) after
+      // processing all pending flag messages for a specific table.  Only workers routing to that
+      // table clear their reroute state and resume; others are unaffected (the Worker checks the
+      // table identifier).
+      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(commitToTable.commitId())) {
+        committableSupplier.onFlagProcessed(commitToTable.tableReference().identifier());
+      }
       return true;
     }
     return false;
   }
 
   private void sendCommitResponse(UUID commitId, CommittableSupplier committableSupplier) {
+    LOG.debug("Calling committable");
     Committable committable = committableSupplier.committable();
 
     List<Event> events = Lists.newArrayList();
@@ -190,7 +210,8 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-    consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
+    LOG.debug("Consuming avlbl");
+    consumeAvailable(Duration.ofMillis(1000), envelope -> receive(envelope, committableSupplier));
   }
 
   @Override
