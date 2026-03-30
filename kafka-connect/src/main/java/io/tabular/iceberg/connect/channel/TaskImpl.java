@@ -34,6 +34,11 @@ public class TaskImpl implements Task, AutoCloseable {
   private final Catalog catalog;
   private final Writer writer;
   private final Committer committer;
+  // Guard flag: true while put() is executing.  Kafka Connect calls put() and preCommit()
+  // from the same WorkerSinkTask thread, so there is no real concurrency, but this flag
+  // makes the contract explicit and prevents poll() from triggering committable() while
+  // writer.write() is still accumulating results.
+  private boolean inPut;
 
   private static final Logger LOG = LoggerFactory.getLogger(TaskImpl.class);
 
@@ -46,16 +51,23 @@ public class TaskImpl implements Task, AutoCloseable {
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    LOG.debug("Putting new records");
-    writer.write(sinkRecords);
-    LOG.debug("Committing new records");
-    committer.commit(writer);
-    LOG.debug("Finished committing new records");
+    inPut = true;
+    try {
+      LOG.debug("Putting new records");
+      writer.write(sinkRecords);
+      LOG.debug("Committing new records");
+      committer.commit(writer);
+      LOG.debug("Finished committing new records");
+    } finally {
+      inPut = false;
+    }
   }
 
   @Override
   public void poll() {
-    committer.commit(writer);
+    if (!inPut) {
+      committer.commit(writer);
+    }
   }
 
   @Override
