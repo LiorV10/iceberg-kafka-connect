@@ -19,5 +19,9 @@
 package io.tabular.iceberg.connect.channel;
 
 interface Committer {
+  /** Non-blocking: process any already-fetched control-topic events. */
   void commit(CommittableSupplier committableSupplier);
+
+  /** Blocking poll: wait briefly for control-topic events (e.g. StartCommit). */
+  void poll(CommittableSupplier committableSupplier);
 }

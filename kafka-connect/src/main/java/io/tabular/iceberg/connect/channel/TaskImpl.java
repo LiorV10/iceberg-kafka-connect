@@ -66,7 +66,7 @@ public class TaskImpl implements Task, AutoCloseable {
   @Override
   public void poll() {
     if (!inPut) {
-      committer.commit(writer);
+      committer.poll(writer);
     }
   }
 
