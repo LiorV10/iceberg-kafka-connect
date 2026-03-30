@@ -80,6 +80,17 @@ public class IcebergSinkTask extends SinkTask {
   @Override
   public Map<TopicPartition, OffsetAndMetadata> preCommit(
       Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
+    // In Kafka Connect, put() is only called when the consumer poll returns records.
+    // When no new records arrive on source topics, the CommitterImpl never gets to poll the
+    // control topic and will miss StartCommit events from the Coordinator.  Records buffered
+    // in the Worker from a previous put() call would then sit uncommitted indefinitely.
+    //
+    // preCommit() is invoked periodically by the framework (every offset.flush.interval.ms,
+    // default 60 s) regardless of record flow, so polling the control topic here ensures
+    // buffered data is eventually committed even without new source records.
+    if (task != null) {
+      task.poll();
+    }
     return ImmutableMap.of();
   }
 
