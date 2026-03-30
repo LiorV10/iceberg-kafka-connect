@@ -23,18 +23,4 @@ import org.apache.kafka.connect.sink.SinkRecord;
 
 public interface Task {
   void put(Collection<SinkRecord> sinkRecords);
-
-  /**
-   * Poll the control topic for pending commit requests without delivering new records.
-   *
-   * <p>In Kafka Connect, {@code put()} is only called when the consumer poll returns records.
-   * When no new records are produced to source topics, the framework's iteration loop still
-   * runs but skips {@code put()}.  This means the CommitterImpl never gets a chance to poll
-   * the control topic and process {@code StartCommit} events from the Coordinator.
-   *
-   * <p>This method should be called from {@link org.apache.kafka.connect.sink.SinkTask#preCommit}
-   * which the framework invokes periodically regardless of record flow, ensuring that buffered
-   * data is eventually committed even when no new records arrive.
-   */
-  default void poll() {}
 }
