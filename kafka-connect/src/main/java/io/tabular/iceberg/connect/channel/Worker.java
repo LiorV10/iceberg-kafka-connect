@@ -59,7 +59,7 @@ class Worker implements Writer, AutoCloseable {
   private final Map<TopicPartition, Offset> sourceOffsets;
   private final List<WriterResult> flagWriterResults;
   private boolean isPaused;
-  private SinkRecord pausingFlag;
+  private final Map<Integer, SinkRecord> pausingFlags;
   private final SinkTaskContext context;
 
   Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
@@ -79,7 +79,7 @@ class Worker implements Writer, AutoCloseable {
     this.sourceOffsets = Maps.newHashMap();
     this.flagWriterResults = Lists.newArrayList();
     this.isPaused = false;
-    this.pausingFlag = null;
+    this.pausingFlags = Maps.newHashMap();
     this.context = context;
   }
 
@@ -126,12 +126,14 @@ class Worker implements Writer, AutoCloseable {
 
     LOG.debug("Flag-processed signal received for table {}, clearing reroute", tableIdentifier);
 
-    sourceOffsets.put(
-            new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()),
-            new Offset(this.pausingFlag.kafkaOffset() + 1, this.pausingFlag.timestamp()));
-    context.offset(new TopicPartition(this.pausingFlag.topic(), this.pausingFlag.kafkaPartition()), this.pausingFlag.kafkaOffset() + 1);
+    // Advance offsets past ALL paused flags (one per partition in a broadcast scenario)
+    for (SinkRecord flag : pausingFlags.values()) {
+      TopicPartition tp = new TopicPartition(flag.topic(), flag.kafkaPartition());
+      sourceOffsets.put(tp, new Offset(flag.kafkaOffset() + 1, flag.timestamp()));
+      context.offset(tp, flag.kafkaOffset() + 1);
+    }
 
-    this.pausingFlag = null;
+    this.pausingFlags.clear();
     resumeAssignment();
   }
 
@@ -142,7 +144,7 @@ class Worker implements Writer, AutoCloseable {
     sourceOffsets.clear();
     flagWriterResults.clear();
     this.isPaused = false;
-    this.pausingFlag = null;
+    this.pausingFlags.clear();
   }
 
   @Override
@@ -154,9 +156,21 @@ class Worker implements Writer, AutoCloseable {
 
   private void save(SinkRecord record) {
     if (this.isPaused) {
-      LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
-              record.kafkaOffset(), record.topic(), record.kafkaPartition());
-
+      if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
+        // Still process flags from other partitions even while paused — the Coordinator
+        // needs a vote from EVERY source partition before the flag can be processed.
+        // Without this, flags arriving in the same batch from different partitions would
+        // be silently dropped, preventing the quorum from ever being reached.
+        LOG.info(
+            "Flag record detected while paused at topic: {}, partition: {}, offset: {}",
+            record.topic(),
+            record.kafkaPartition(),
+            record.kafkaOffset());
+        processFlag(record);
+      } else {
+        LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
+                record.kafkaOffset(), record.topic(), record.kafkaPartition());
+      }
       return;
     }
 
@@ -167,26 +181,7 @@ class Worker implements Writer, AutoCloseable {
           record.kafkaPartition(),
           record.kafkaOffset());
 
-      sourceOffsets.put(
-              new TopicPartition(record.topic(), record.kafkaPartition()),
-              new Offset(record.kafkaOffset(), record.timestamp()));
-
-      String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
-      TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
-      TableContext tableContext =
-          TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
-
-      String recordJson = serializeRecordToJson(record);
-      FlagWriterResult flagResult =
-          new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
-      flagWriterResults.add(flagResult);
-
-      this.pausingFlag = record;
-      pauseAssignment(record.kafkaPartition());
-      LOG.info(
-          "Flag detected — rerouting same-batch records to {} (branch: {})",
-          tableContext.tableIdentifier(),
-          tableContext.branch());
+      processFlag(record);
     } else {
       // the consumer stores the offsets that corresponds to the next record to consume,
       // so increment the record offset by one
@@ -202,6 +197,30 @@ class Worker implements Writer, AutoCloseable {
         routeRecordStatically(record);
       }
     }
+  }
+
+  private void processFlag(SinkRecord record) {
+    sourceOffsets.put(
+            new TopicPartition(record.topic(), record.kafkaPartition()),
+            new Offset(record.kafkaOffset(), record.timestamp()));
+
+    String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
+    TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
+    TableContext tableContext =
+        TableContext.parse(tableIdentifier, this.config.branchesRegexDelimiter());
+
+    String recordJson = serializeRecordToJson(record);
+    FlagWriterResult flagResult =
+        new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
+    flagWriterResults.add(flagResult);
+
+    this.pausingFlags.put(record.kafkaPartition(), record);
+    pauseAssignment(record.kafkaPartition());
+    LOG.info(
+        "Flag detected — pausing partition {} for table {} (branch: {})",
+        record.kafkaPartition(),
+        tableContext.tableIdentifier(),
+        tableContext.branch());
   }
 
   private void routeRecordStatically(SinkRecord record) {

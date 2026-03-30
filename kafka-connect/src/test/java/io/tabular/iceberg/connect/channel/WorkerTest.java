@@ -161,23 +161,17 @@ public class WorkerTest {
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // pause() must NOT yet be called — the pause is deferred until committable() time
-    verify(context, never()).pause(tp);
-
-    // After committable() is called the pause must have been requested
-    worker.committable();
+    // pause() is called immediately when the flag is detected during write()
     verify(context, times(1)).pause(tp);
-    // resume() must NOT have been called yet
-    verify(context, never()).resume(tp);
   }
 
   /**
-   * Verifies that records arriving after the flag in the same batch are immediately written but
-   * rerouted to the flag's branch table, and that {@link Worker#onFlagProcessed()} resumes the
-   * partitions and clears the reroute so that new records go to their natural destination.
+   * Verifies that records arriving after the flag in the same batch are dropped (not written)
+   * because the worker enters paused state upon detecting the flag.  These records will be
+   * re-delivered by Kafka Connect after the flag is processed and the partition is resumed.
    */
   @Test
-  public void testPostFlagRecordsInSameBatchAreReroutedToFlagBranch() {
+  public void testPostFlagRecordsInSameBatchAreDroppedWhenPaused() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -206,9 +200,10 @@ public class WorkerTest {
 
     worker.write(ImmutableList.of(flagRec, dataRec));
 
-    // Post-flag record must be written immediately, but to the rerouted (flag) table, not "db.other"
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // Post-flag non-flag record is dropped (paused), no writer is created for it
     verify(writerFactory, never()).createWriter(eq(otherTable), any(), anyBoolean());
+    // The flag itself does not create a data writer either (it creates a FlagWriterResult)
+    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
   }
 
   /**
@@ -261,7 +256,7 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // Activate reroute by writing a flag record for TABLE_NAME
+    // Activate pause by writing a flag record for TABLE_NAME
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
@@ -270,8 +265,8 @@ public class WorkerTest {
     // Signal that the Coordinator finished the branch switch for TABLE_NAME
     worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
 
-    // Partitions must be resumed
-    verify(context, times(1)).resume(tp);
+    // Partitions must be resumed (resume is also called inside pauseAssignment as a reset)
+    verify(context, times(2)).resume(tp);
 
     // After resume, records must go to their natural destination (not the flag branch)
     String naturalTable = "db.natural";
@@ -285,12 +280,12 @@ public class WorkerTest {
   }
 
   /**
-   * Verifies that {@link Worker#onFlagProcessed} is a no-op when called with a different table
-   * identifier than the one the worker is currently rerouting to.  This ensures a per-table sentinel
-   * for another table does not accidentally resume a worker that is waiting for its own table.
+   * Verifies that {@link Worker#onFlagProcessed} resumes the worker even when called with a
+   * different table identifier.  The Worker's pause is a global state for a single flag broadcast
+   * event; filtering by table is the Coordinator's responsibility.
    */
   @Test
-  public void testOnFlagProcessedIsNoOpForDifferentTable() {
+  public void testOnFlagProcessedResumesRegardlessOfTableIdentifier() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -308,32 +303,27 @@ public class WorkerTest {
 
     Worker worker = new Worker(config, writerFactory, context);
 
-    // Activate reroute by writing a flag for TABLE_NAME
+    // Activate pause by writing a flag for TABLE_NAME
     Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
     SinkRecord flagRec =
         new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 1L);
     worker.write(ImmutableList.of(flagRec));
 
-    // Signal flag processed for a DIFFERENT table — this worker's reroute must not be cleared
+    // Signal flag processed — even though the table identifier differs, the worker resumes
     worker.onFlagProcessed(TableIdentifier.parse("db.other_table"));
 
-    // Resume must NOT have been called — this worker is still paused for its own table's flag
-    verify(context, never()).resume(tp);
-
-    // The reroute should still be active (a new record gets rerouted)
-    SinkRecord postRec =
-        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
-            ImmutableMap.of(FIELD_NAME, "db.should_not_be_used"), 2L);
-    worker.write(ImmutableList.of(postRec));
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+    // Resume should have been called by resumeAssignment
+    // (pauseAssignment also calls resume as a reset before pausing)
+    TopicPartition[] expectedPartitions = new TopicPartition[]{tp};
+    verify(context, times(2)).resume(expectedPartitions);
   }
 
   /**
    * Verifies that pre-flag records in the same batch are written immediately to their natural
-   * destination, while post-flag records are immediately written but rerouted to the flag branch.
+   * destination, while post-flag non-flag records are dropped because the worker is paused.
    */
   @Test
-  public void testPreFlagRecordsWrittenNormallyPostFlagRecordsRerouted() {
+  public void testPreFlagRecordsWrittenNormallyPostFlagRecordsDropped() {
     IcebergSinkConfig config = mock(IcebergSinkConfig.class);
     when(config.dynamicTablesEnabled()).thenReturn(true);
     when(config.tablesRouteField()).thenReturn(FIELD_NAME);
@@ -367,10 +357,103 @@ public class WorkerTest {
 
     // Pre-flag record is written to its natural table
     verify(writerFactory, times(1)).createWriter(eq(preTable), any(), anyBoolean());
-    // Post-flag record is written immediately, but rerouted to the flag branch table
-    verify(writerFactory, times(1)).createWriter(eq(TABLE_NAME), any(), anyBoolean());
-    // The post-flag record's natural route is never used
+    // Post-flag non-flag record is dropped (paused) — not rerouted, not written
     verify(writerFactory, never()).createWriter(eq(postTable), any(), anyBoolean());
+    verify(writerFactory, never()).createWriter(eq(TABLE_NAME), any(), anyBoolean());
+  }
+
+  /**
+   * Verifies that when flags from multiple partitions arrive in the same batch (e.g. flags
+   * broadcast to all partitions before the connector starts), ALL flags are processed —
+   * not just the first one.  This ensures all partition votes reach the Coordinator for quorum.
+   */
+  @Test
+  public void testMultiPartitionFlagsInSameBatchAllProcessed() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp0 = new TopicPartition(SRC_TOPIC_NAME, 0);
+    TopicPartition tp1 = new TopicPartition(SRC_TOPIC_NAME, 1);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp0, tp1));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagP0 =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 10L);
+    SinkRecord flagP1 =
+        new SinkRecord(SRC_TOPIC_NAME, 1, null, FLAG_PREFIX + "end", null, flagValue, 20L);
+
+    // Both flags arrive in the same batch
+    worker.write(ImmutableList.of(flagP0, flagP1));
+
+    Committable committable = worker.committable();
+
+    // Both flags must be included in the committable as FlagWriterResults
+    assertThat(committable.writerResults())
+        .hasSize(2)
+        .allMatch(r -> r instanceof FlagWriterResult);
+
+    // Both partitions' offsets must be tracked
+    assertThat(committable.offsetsByTopicPartition()).hasSize(2);
+    assertThat(committable.offsetsByTopicPartition().get(tp0).offset()).isEqualTo(10L);
+    assertThat(committable.offsetsByTopicPartition().get(tp1).offset()).isEqualTo(20L);
+  }
+
+  /**
+   * Verifies that when flags from multiple partitions are processed and onFlagProcessed
+   * is called, ALL paused partitions are resumed and offsets are advanced past all flags.
+   */
+  @Test
+  public void testMultiPartitionOnFlagProcessedAdvancesAllOffsets() {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.dynamicTablesEnabled()).thenReturn(true);
+    when(config.tablesRouteField()).thenReturn(FIELD_NAME);
+    when(config.flagKeyPrefix()).thenReturn(FLAG_PREFIX);
+    when(config.branchesRegexDelimiter()).thenReturn(null);
+
+    TopicPartition tp0 = new TopicPartition(SRC_TOPIC_NAME, 0);
+    TopicPartition tp1 = new TopicPartition(SRC_TOPIC_NAME, 1);
+    SinkTaskContext context = mock(SinkTaskContext.class);
+    when(context.assignment()).thenReturn(ImmutableSet.of(tp0, tp1));
+
+    IcebergWriterFactory writerFactory = mock(IcebergWriterFactory.class);
+    Worker worker = new Worker(config, writerFactory, context);
+
+    Map<String, Object> flagValue = ImmutableMap.of(FIELD_NAME, TABLE_NAME);
+    SinkRecord flagP0 =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, FLAG_PREFIX + "end", null, flagValue, 10L);
+    SinkRecord flagP1 =
+        new SinkRecord(SRC_TOPIC_NAME, 1, null, FLAG_PREFIX + "end", null, flagValue, 20L);
+
+    worker.write(ImmutableList.of(flagP0, flagP1));
+    // Consume the first committable (which sends the flag data to the Coordinator)
+    worker.committable();
+
+    // Now simulate the Coordinator processing all flag votes and sending the sentinel
+    worker.onFlagProcessed(TableIdentifier.parse(TABLE_NAME));
+
+    // context.offset should be called for both partitions to advance past their flags
+    verify(context).offset(tp0, 11L);
+    verify(context).offset(tp1, 21L);
+
+    // After resume, new records from either partition are processed normally
+    IcebergWriter dataWriter = mock(IcebergWriter.class);
+    when(dataWriter.complete()).thenReturn(ImmutableList.of());
+    when(writerFactory.createWriter(any(), any(), anyBoolean())).thenReturn(dataWriter);
+
+    String naturalTable = "db.natural";
+    SinkRecord dataRec =
+        new SinkRecord(SRC_TOPIC_NAME, 0, null, "key", null,
+            ImmutableMap.of(FIELD_NAME, naturalTable), 11L);
+    worker.write(ImmutableList.of(dataRec));
+
+    verify(writerFactory, times(1)).createWriter(eq(naturalTable), any(), anyBoolean());
   }
 
   private void workerTest(IcebergSinkConfig config, Map<String, Object> value) {
