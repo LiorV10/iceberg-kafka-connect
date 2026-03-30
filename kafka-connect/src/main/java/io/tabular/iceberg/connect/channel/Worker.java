@@ -289,25 +289,21 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void pauseAssignment(Integer flagPartition) {
-    LOG.debug("About to pause task, context is {}", context);
-    if (context != null) {
-      TopicPartition[] partitions = context.assignment().stream()
-              .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
-              .toArray(TopicPartition[]::new);
-
-      context.resume(partitions);
-      context.pause(partitions);
-      this.isPaused = true;
-      LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
-    }
+    LOG.debug("Flag detected on partition {}, entering paused state", flagPartition);
+    // Do NOT call context.pause() here.  When all source partitions are paused via the
+    // Kafka Connect API, the framework may stop calling put() entirely.  Since
+    // committer.commit() is only called inside put(), pausing would prevent the
+    // CommitterImpl from ever polling the control topic — and it would never receive
+    // the flag-processed sentinel from the Coordinator, causing a deadlock.
+    //
+    // Instead, we only set isPaused = true so that Worker.save() drops subsequent
+    // records.  Kafka Connect keeps delivering records (and calling put()), which
+    // lets the CommitterImpl continue to poll the control topic normally.
+    this.isPaused = true;
   }
 
   private void resumeAssignment() {
-    if (context != null) {
-      // Always call context.assignment() fresh for the same reason as pauseAssignment().
-      this.isPaused = false;
-      context.resume(context.assignment().toArray(new TopicPartition[0]));
-    }
+    this.isPaused = false;
   }
 
   private RecordWriter writerForTable(
