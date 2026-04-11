@@ -154,10 +154,16 @@ class Worker implements Writer, AutoCloseable {
 
   private void save(SinkRecord record) {
     if (this.isPaused) {
-      LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
-              record.kafkaOffset(), record.topic(), record.kafkaPartition());
-
-      return;
+      // Even when paused, continue processing flag records so that all consecutive
+      // flags in the same batch are collected before the Kafka pause takes effect
+      // on the next poll. This prevents the scenario where only the first flag is
+      // processed per pause/resume cycle, causing subsequent flags to require
+      // additional resume signals that the producing app does not send.
+      if (!Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
+        LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
+                record.kafkaOffset(), record.topic(), record.kafkaPartition());
+        return;
+      }
     }
 
     if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
