@@ -30,6 +30,7 @@ import java.time.OffsetDateTime;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import io.tabular.iceberg.connect.TableContext;
 import org.apache.iceberg.*;
@@ -46,6 +47,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.rest.RESTCatalog;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
@@ -435,21 +437,27 @@ public class Coordinator extends Channel implements AutoCloseable {
             LOG.info("Processing flag message for table {}, switching to branch {}",
                     table.name(), targetBranch);
 
-            UpdateSchema updateSchemaCommit = table.updateSchema();
 
-            table.schema().columns().stream()
+            List<Types.NestedField> pending = table.schema().columns()
+                    .stream()
                     .filter(field -> field.name().endsWith("_pending_type_update"))
-                    .forEach(field -> {
-                      String original = field.name().split("_pending_type_update")[0];
+                    .collect(toList());
 
-                      updateSchemaCommit.deleteColumn(original).renameColumn(field.name(), original);
-                    });
+            if (!pending.isEmpty()) {
+              UpdateSchema updateSchemaCommit = table.updateSchema();
 
-            try {
-              updateSchemaCommit.commit();
-              LOG.info("Successfully updated types for table {}", table.name());
-            } catch (Exception e) {
-              LOG.error("Failed to update types for table {}. {}", table.name(), e.getMessage());
+              pending.forEach(field -> {
+                String original = field.name().split("_pending_type_update")[0];
+
+                updateSchemaCommit.deleteColumn(original).renameColumn(field.name(), original);
+              });
+
+              try {
+                updateSchemaCommit.commit();
+                LOG.info("Successfully updated types for table {}", table.name());
+              } catch (Exception e) {
+                LOG.error("Failed to update types for table {}. {}", table.name(), e.getMessage());
+              }
             }
 
             try {

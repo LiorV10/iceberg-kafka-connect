@@ -291,14 +291,12 @@ class Worker implements Writer, AutoCloseable {
   private void pauseAssignment(Integer flagPartition) {
     LOG.debug("About to pause task, context is {}", context);
     if (context != null) {
-      TopicPartition[] partitions = context.assignment().stream()
-              .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
-              .toArray(TopicPartition[]::new);
+//      TopicPartition[] partitions = context.assignment().stream()
+//              .filter(topicPartition -> flagPartition.equals(topicPartition.partition()))
+//              .toArray(TopicPartition[]::new);
 
-      context.resume(partitions);
-      context.pause(partitions);
       this.isPaused = true;
-      LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
+      // LOG.debug("Context has paused for partition {} at topic {}", flagPartition, Arrays.stream(partitions).findFirst().get().topic());
     }
   }
 
@@ -306,7 +304,7 @@ class Worker implements Writer, AutoCloseable {
     if (context != null) {
       // Always call context.assignment() fresh for the same reason as pauseAssignment().
       this.isPaused = false;
-      context.resume(context.assignment().toArray(new TopicPartition[0]));
+      // context.resume(context.assignment().toArray(new TopicPartition[0]));
     }
   }
 

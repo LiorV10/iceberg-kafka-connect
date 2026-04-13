@@ -210,8 +210,7 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   @Override
   public void commit(CommittableSupplier committableSupplier) {
     throwExceptionIfCoordinatorIsTerminated();
-    LOG.debug("Consuming avlbl");
-    consumeAvailable(Duration.ofMillis(1000), envelope -> receive(envelope, committableSupplier));
+    consumeAvailable(Duration.ZERO, envelope -> receive(envelope, committableSupplier));
   }
 
   @Override
