@@ -471,9 +471,18 @@ public class Coordinator extends Channel implements AutoCloseable {
             }
           }
           break;
-        case "TYPE-CHANGE":
+        case "DDL":
           UpdateSchema updateSchemaCommit = table.updateSchema();
 
+          // TODO: handle ddl event (probably only modified types and pks)
+
+          // stream pks in field:
+          // updateSchemaCommit.setIdentifierFields(pks);
+
+          // stream modified columns:
+          // updateSchemaCommit.addColumn(col.name() + "_pending_type_update", typeToIceberg());
+
+          updateSchemaCommit.commit();
 
           break;
         default:

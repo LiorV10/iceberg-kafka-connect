@@ -173,13 +173,18 @@ public class Utilities {
 
     Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
 
-    // override the identifier fields if the config is set
-    List<String> idCols = config.tableConfig(tableName).idColumns();
-    if (!idCols.isEmpty()) {
-      identifierFieldIds =
-          idCols.stream()
-              .map(colName -> table.schema().findField(colName).fieldId())
-              .collect(toSet());
+    // use identifier fields from config, if not defined in table
+    if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {
+      List<String> idCols = config.tableConfig(tableName).idColumns();
+      if (!idCols.isEmpty()) {
+        identifierFieldIds =
+                idCols.stream()
+                        .map(colName -> table.schema().findField(colName).fieldId())
+                        .collect(toSet());
+
+        // Update table id fields, becoming the source-of-truth
+        table.updateSchema().setIdentifierFields(idCols).commit();
+      }
     }
 
     FileAppenderFactory<Record> appenderFactory;
