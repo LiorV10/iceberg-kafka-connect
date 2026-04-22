@@ -472,13 +472,18 @@ public class Coordinator extends Channel implements AutoCloseable {
           }
           break;
         case "DDL":
-          UpdateSchema updateSchemaCommit = table.updateSchema();
-
           // TODO: handle ddl event (probably only modified types and pks)
 
           // stream pks in field:
-          // updateSchemaCommit.setIdentifierFields(pks);
+          List<Map<String, Object>> fields = (List<Map<String, Object>>)flagRecord.get("fields");
+          List<String> pks = fields.stream()
+                  .filter(field -> field.get("keyflag").equals("X"))
+                  .map(field -> field.get("fieldname").toString().toLowerCase())
+                  .collect(toList());
 
+          table.updateProperties().set("lakers.id-cols", String.join(",", pks)).commit();
+
+          UpdateSchema updateSchemaCommit = table.updateSchema();
           // stream modified columns:
           // updateSchemaCommit.addColumn(col.name() + "_pending_type_update", typeToIceberg());
 
