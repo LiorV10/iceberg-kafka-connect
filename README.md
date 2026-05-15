@@ -26,8 +26,9 @@ The zip archive will be found under `./kafka-connect-runtime/build/distributions
 | Property                                                    | Description                                                                                                      |
 |-------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------|
 | iceberg.tables                                              | Comma-separated list of destination tables                                                                       |
+| ### iceberg.flags.config ###                                | JSON config defining names of fields in ddl events                                                               |
 | ### iceberg.flags.key-prefix ###                            | The key prefix used to detect flag messages                                                                      |
-| ### iceberg.flags.type-field ###                            | The field that identifies the type of the flag                                                                    |
+| ### iceberg.flags.type-field ###                            | The field that identifies the type of the flag                                                                   |
 | ### iceberg.branch.dynamic-enabled          ###             | Set to `true` to route to a branch specified in `routeField` by splitting by `regex-delimiter`                   | 
 | ### iceberg.branch.regex-delimiter        ###               | The regex delimiter to extract `branch` name from `routeField`                                                   |
 | ### iceberg.branch.auto-create-enabled ###                  | Set to `true` to create the specified `branch` as a new empty one                                                |
