@@ -27,6 +27,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.regex.Pattern;
 import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
@@ -108,6 +110,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   /************************************************************************/
   private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
           "iceberg.tables.destructive-schema-evolution-enabled";
+  private static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
 
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
@@ -256,6 +259,12 @@ public class IcebergSinkConfig extends AbstractConfig {
             false,
             Importance.MEDIUM,
             "Set to true to drop missing record fields from table schema, false otherwise"
+    );
+    configDef.define(TABLES_EXCLUDE_FIELDS_PROP,
+            Type.LIST,
+            null,
+            Importance.MEDIUM,
+            "Fields to exclude from final schema"
     );
   }
 
@@ -470,6 +479,10 @@ public class IcebergSinkConfig extends AbstractConfig {
   /*                  Custom Lakers Configs - Getters                     */
   /************************************************************************/
   public boolean destructiveSchemaEvolutionEnabled() { return getBoolean(TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP); }
+
+  public Set<String> excludeFields() {
+    return new HashSet<>(getList(TABLES_EXCLUDE_FIELDS_PROP));
+  }
 
 
   public JsonConverter jsonConverter() {

@@ -162,6 +162,12 @@ public class RecordConverter {
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
+
+          // Skip excluded fields
+          if (config.excludeFields().contains(recordFieldName)) {
+            return;
+          }
+
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
           if (tableField == null) {
             // add the column if schema evolution is on, otherwise skip the value,
