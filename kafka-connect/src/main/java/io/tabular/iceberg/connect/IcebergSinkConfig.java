@@ -110,7 +110,13 @@ public class IcebergSinkConfig extends AbstractConfig {
   /************************************************************************/
   private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
           "iceberg.tables.destructive-schema-evolution-enabled";
+
   private static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
+
+  private static final String BRANCH_DYNAMIC_PROP = "iceberg.branch.dynamic-enabled";
+  private static final String BRANCH_DELIMITER_PROP = "iceberg.branch.delimiter";
+  private static final String BRANCHES_AUTO_CREATE_ENABLED_PROP =
+          "iceberg.branch.auto-create-enabled";
 
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
@@ -265,6 +271,27 @@ public class IcebergSinkConfig extends AbstractConfig {
             null,
             Importance.MEDIUM,
             "Fields to exclude from final schema"
+    );
+    configDef.define(
+            BRANCH_DYNAMIC_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Enable dynamic routing to branches based on a record value"
+    );
+    configDef.define(
+            BRANCH_DELIMITER_PROP,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "Delimiter separating table name and branch in target table field"
+    );
+    configDef.define(
+            BRANCHES_AUTO_CREATE_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to automatically create destination branches, false otherwise"
     );
   }
 
@@ -482,6 +509,18 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public Set<String> excludeFields() {
     return new HashSet<>(getList(TABLES_EXCLUDE_FIELDS_PROP));
+  }
+
+  public boolean dynamicBranchesEnabled() {
+    return getBoolean(BRANCH_DYNAMIC_PROP);
+  }
+
+  public String branchesDelimiter() {
+    return getString(BRANCH_DELIMITER_PROP);
+  }
+
+  public boolean branchAutoCreateEnabled() {
+    return getBoolean(BRANCHES_AUTO_CREATE_ENABLED_PROP);
   }
 
 

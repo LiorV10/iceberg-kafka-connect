@@ -33,6 +33,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
+
+import io.tabular.iceberg.connect.TableContext;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -48,6 +50,7 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.Tasks;
@@ -181,6 +184,15 @@ public class Coordinator extends Channel implements AutoCloseable {
       String offsetsJson,
       OffsetDateTime vtts) {
     Table table;
+    // TableIdentifier tableIdentifier = paramTableIdentifier;
+    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+
+    if (this.config.dynamicBranchesEnabled()) {
+      TableContext tableContext = TableContext.parse(tableIdentifier, this.config.branchesDelimiter());
+      tableIdentifier = tableContext.tableIdentifier();
+      branch = Optional.ofNullable(tableContext.branch());
+    }
+
     try {
       table = catalog.loadTable(tableIdentifier);
     } catch (NoSuchTableException e) {
@@ -188,7 +200,19 @@ public class Coordinator extends Channel implements AutoCloseable {
       return;
     }
 
-    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+    if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
+      try {
+        table.manageSnapshots().createBranch(branch.get(), table.history().get(0).snapshotId()).commit();
+
+        table.newDelete()
+                .toBranch(branch.get())
+                .deleteFromRowFilter(Expressions.alwaysTrue())
+                .commit();
+
+      } catch (IllegalArgumentException ignored) {
+        // branch already exists
+      }
+    }
 
     Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
 
