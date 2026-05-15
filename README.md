@@ -4,6 +4,12 @@ Please visit the [Documentation](https://iceberg.apache.org/docs/nightly/kafka-c
 # Apache Iceberg Sink Connector
 The Apache Iceberg Sink Connector for Kafka Connect is a sink connector for writing data from Kafka into Iceberg tables.
 
+# CDC Features
+* Destructive schema evolution
+* Exclude fields from target iceberg table
+* Dynamic branch routing, enabled by embedding branch name in target table field
+* Custom flag-events support: `END-LOAD`, `DDL` - with support of multiple partitions per sink
+
 # Features
 * Commit coordination for centralized Iceberg commits
 * Exactly-once delivery semantics
