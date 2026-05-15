@@ -37,12 +37,9 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.Temporal;
-import java.util.Base64;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
@@ -187,6 +184,18 @@ public class RecordConverter {
                     schemaUpdateConsumer));
           }
         });
+
+    // drop column if removed for schema and destructive evolution is on
+    if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+      Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
+
+      List<NestedField> columnsToDrop = tableSchema.columns().stream()
+              .filter(col -> !incomingFieldNames.contains(col.name()))
+              .collect(toList());
+
+      columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+    }
+
     return result;
   }
 

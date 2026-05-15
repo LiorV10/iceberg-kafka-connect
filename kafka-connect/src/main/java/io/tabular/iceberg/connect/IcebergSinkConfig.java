@@ -52,7 +52,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final Logger LOG = LoggerFactory.getLogger(IcebergSinkConfig.class.getName());
 
   public static final String INTERNAL_TRANSACTIONAL_SUFFIX_PROP =
-      "iceberg.coordinator.transactional.suffix";
+          "iceberg.coordinator.transactional.suffix";
   private static final String ROUTE_REGEX = "route-regex";
   private static final String ID_COLUMNS = "id-columns";
   private static final String PARTITION_BY = "partition-by";
@@ -74,15 +74,15 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
   private static final String TABLES_CDC_FIELD_PROP = "iceberg.tables.cdc-field";
   private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
-      "iceberg.tables.upsert-mode-enabled";
+          "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_AUTO_CREATE_ENABLED_PROP =
-      "iceberg.tables.auto-create-enabled";
+          "iceberg.tables.auto-create-enabled";
   private static final String TABLES_EVOLVE_SCHEMA_ENABLED_PROP =
-      "iceberg.tables.evolve-schema-enabled";
+          "iceberg.tables.evolve-schema-enabled";
   private static final String TABLES_SCHEMA_FORCE_OPTIONAL_PROP =
-      "iceberg.tables.schema-force-optional";
+          "iceberg.tables.schema-force-optional";
   private static final String TABLES_SCHEMA_CASE_INSENSITIVE_PROP =
-      "iceberg.tables.schema-case-insensitive";
+          "iceberg.tables.schema-case-insensitive";
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PROP = "iceberg.control.group-id";
   private static final String COMMIT_INTERVAL_MS_PROP = "iceberg.control.commit.interval-ms";
@@ -102,6 +102,12 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public static final int SCHEMA_UPDATE_RETRIES = 2; // 3 total attempts
   public static final int CREATE_TABLE_RETRIES = 2; // 3 total attempts
+
+  /************************************************************************/
+  /*                  Custom Lakers Configs - Props                       */
+  /************************************************************************/
+  private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
+          "iceberg.tables.destructive-schema-evolution-enabled";
 
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
@@ -237,7 +243,20 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Coordinator threads to use for table commits, default is (cores * 2)");
+
+    customConfigDef(configDef);
+
     return configDef;
+  }
+
+  private static void customConfigDef(ConfigDef configDef) {
+    configDef.define(
+            TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to drop missing record fields from table schema, false otherwise"
+    );
   }
 
   private final Map<String, String> originalProps;
@@ -446,6 +465,12 @@ public class IcebergSinkConfig extends AbstractConfig {
   public boolean schemaCaseInsensitive() {
     return getBoolean(TABLES_SCHEMA_CASE_INSENSITIVE_PROP);
   }
+
+  /************************************************************************/
+  /*                  Custom Lakers Configs - Getters                     */
+  /************************************************************************/
+  public boolean destructiveSchemaEvolutionEnabled() { return getBoolean(TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP); }
+
 
   public JsonConverter jsonConverter() {
     return jsonConverter;
