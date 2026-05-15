@@ -22,6 +22,7 @@ import static java.util.stream.Collectors.toList;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.tabular.iceberg.connect.FlagConfig;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -33,6 +34,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.SchemaUtils;
 import org.apache.iceberg.*;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableCommit;
@@ -43,6 +45,7 @@ import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -234,6 +237,12 @@ public class Coordinator extends Channel implements AutoCloseable {
     if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
       try {
         table.manageSnapshots().createBranch(branch.get(), table.history().get(0).snapshotId()).commit();
+
+        table.newDelete()
+                .toBranch(branch.get())
+                .deleteFromRowFilter(Expressions.alwaysTrue())
+                .commit();
+
       } catch (IllegalArgumentException ignored) {
         // branch already exists
       }
@@ -464,7 +473,7 @@ public class Coordinator extends Channel implements AutoCloseable {
               // Forward the branch: set current snapshot to the branch's snapshot
               // and clear the branch for further use
               table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
-              table.manageSnapshots().replaceBranch(targetBranch, table.history().get(0).snapshotId()).commit();
+              table.manageSnapshots().removeBranch(targetBranch).commit();
               LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
             } catch (Exception e) {
               LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
@@ -472,22 +481,30 @@ public class Coordinator extends Channel implements AutoCloseable {
           }
           break;
         case "DDL":
-          // TODO: handle ddl event (probably only modified types and pks)
+          FlagConfig flagConfig = this.config.flagConfig();
 
-          // stream pks in field:
-          List<Map<String, Object>> fields = (List<Map<String, Object>>)flagRecord.get("fields");
+          List<Map<String, Object>> fields = (List<Map<String, Object>>)flagRecord.get(flagConfig.getFields());
           List<String> pks = fields.stream()
-                  .filter(field -> field.get("keyflag").equals("X"))
-                  .map(field -> field.get("fieldname").toString().toLowerCase())
+                  .filter(field -> field.get(flagConfig.getKeyFlag()).equals("X"))
+                  .map(field -> field.get(flagConfig.getFieldName()).toString().toLowerCase())
                   .collect(toList());
 
           table.updateProperties().set("lakers.id-cols", String.join(",", pks)).commit();
 
-          UpdateSchema updateSchemaCommit = table.updateSchema();
-          // stream modified columns:
-          // updateSchemaCommit.addColumn(col.name() + "_pending_type_update", typeToIceberg());
+          List<Map<String, Object>> fields_modified = (List<Map<String, Object>>)flagRecord.get(flagConfig.getFieldsModified());
 
-          updateSchemaCommit.commit();
+          if (fields_modified != null && !fields_modified.isEmpty()) {
+            UpdateSchema updateSchemaCommit = table.updateSchema();
+            fields.forEach(field -> updateSchemaCommit
+                    .addColumn(
+                      field.get(flagConfig.getFieldName()).toString() + "_pending_type_update",
+                      SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
+                              .orElse(Types.StringType.get())
+                    )
+            );
+
+            updateSchemaCommit.commit();
+          }
 
           break;
         default:

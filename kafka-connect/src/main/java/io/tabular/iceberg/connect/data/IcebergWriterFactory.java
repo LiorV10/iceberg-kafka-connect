@@ -28,6 +28,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.NoSuchTableException;
+import org.apache.iceberg.exceptions.ServiceFailureException;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.Tasks;
@@ -59,7 +60,7 @@ public class IcebergWriterFactory {
 
     try {
       table = catalog.loadTable(identifier);
-    } catch (NoSuchTableException nst) {
+    } catch (Exception nst) {
       if (config.autoCreateEnabled()) {
         table = autoCreateTable(identifier.toString(), sample);
       } else if (ignoreMissingTable) {
@@ -89,8 +90,8 @@ public class IcebergWriterFactory {
       org.apache.iceberg.Schema schema = new org.apache.iceberg.Schema(structType.fields());
       TableIdentifier temp = TableIdentifier.parse(tableName);
       TableIdentifier identifier = this.config.dynamicBranchesEnabled()
-              ? temp
-              : TableContext.parse(temp, this.config.branchesRegexDelimiter()).tableIdentifier();
+              ? TableContext.parse(temp, this.config.branchesRegexDelimiter()).tableIdentifier()
+              : temp;
 
       List<String> partitionBy = config.tableConfig(tableName).partitionBy();
       PartitionSpec spec;

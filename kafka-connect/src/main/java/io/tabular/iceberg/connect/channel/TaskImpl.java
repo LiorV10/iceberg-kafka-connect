@@ -46,11 +46,8 @@ public class TaskImpl implements Task, AutoCloseable {
 
   @Override
   public void put(Collection<SinkRecord> sinkRecords) {
-    LOG.debug("Putting new records");
     writer.write(sinkRecords);
-    LOG.debug("Committing new records");
     committer.commit(writer);
-    LOG.debug("Finished committing new records");
   }
 
   @Override

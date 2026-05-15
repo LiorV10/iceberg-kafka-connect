@@ -137,7 +137,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
 
   private boolean receive(Envelope envelope, CommittableSupplier committableSupplier) {
     if (envelope.event().type() == PayloadType.START_COMMIT) {
-      LOG.debug("Got start commit event");
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
       return true;
@@ -157,7 +156,6 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
   }
 
   private void sendCommitResponse(UUID commitId, CommittableSupplier committableSupplier) {
-    LOG.debug("Calling committable");
     Committable committable = committableSupplier.committable();
 
     List<Event> events = Lists.newArrayList();

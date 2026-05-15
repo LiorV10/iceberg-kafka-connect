@@ -85,8 +85,6 @@ class Worker implements Writer, AutoCloseable {
 
   @Override
   public Committable committable() {
-    LOG.debug("About to commit latest records");
-
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
 
@@ -154,9 +152,6 @@ class Worker implements Writer, AutoCloseable {
 
   private void save(SinkRecord record) {
     if (this.isPaused) {
-      LOG.debug("Currently in pause, will process {} [topic: {}, partition: {}] when resume",
-              record.kafkaOffset(), record.topic(), record.kafkaPartition());
-
       return;
     }
 
@@ -193,8 +188,6 @@ class Worker implements Writer, AutoCloseable {
       sourceOffsets.put(
               new TopicPartition(record.topic(), record.kafkaPartition()),
               new Offset(record.kafkaOffset() + 1, record.timestamp()));
-
-      LOG.debug("Processing record at {}", record.kafkaOffset());
 
       if (config.dynamicTablesEnabled()) {
         routeRecordDynamically(record);
