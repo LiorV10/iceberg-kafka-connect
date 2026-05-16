@@ -20,6 +20,7 @@ package io.tabular.iceberg.connect;
 
 import static java.util.stream.Collectors.toList;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -30,6 +31,8 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.HashSet;
 import java.util.regex.Pattern;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -117,6 +120,10 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String BRANCH_DELIMITER_PROP = "iceberg.branch.delimiter";
   private static final String BRANCHES_AUTO_CREATE_ENABLED_PROP =
           "iceberg.branch.auto-create-enabled";
+
+  public static final String FLAG_MESSAGE_PREFIX = "iceberg.flags.key-prefix";
+  public static final String FLAG_TYPE_FIELD = "iceberg.flags.type-field";
+  public static final String FLAGS_CONFIG_PROP = "iceberg.flags.config";
 
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
@@ -293,8 +300,30 @@ public class IcebergSinkConfig extends AbstractConfig {
             Importance.MEDIUM,
             "Set to true to automatically create destination branches, false otherwise"
     );
+    configDef.define(
+            FLAG_MESSAGE_PREFIX,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "The key prefix used to detect flag messages"
+    );
+    configDef.define(
+            FLAG_TYPE_FIELD,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "The field that identifies the type of the flag"
+    );
+    configDef.define(
+            FLAGS_CONFIG_PROP,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "JSON object grouping all flag-message settings: key-prefix, type-field, field-name, and any additional variables"
+    );
   }
 
+  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
   private final Map<String, String> originalProps;
   private final Map<String, String> catalogProps;
   private final Map<String, String> hadoopProps;
@@ -303,6 +332,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private final Map<String, String> writeProps;
   private final Map<String, TableSinkConfig> tableConfigMap = Maps.newHashMap();
   private final JsonConverter jsonConverter;
+  private final FlagConfig flagConfig;
 
   public IcebergSinkConfig(Map<String, String> originalProps) {
     super(CONFIG_DEF, originalProps);
@@ -326,7 +356,23 @@ public class IcebergSinkConfig extends AbstractConfig {
             ConverterConfig.TYPE_CONFIG,
             ConverterType.VALUE.getName()));
 
+    this.flagConfig = parseFlagConfig();
+
+    LOG.info("Initialized using following flag config: {}", this.flagConfig.toString());
+
     validate();
+  }
+
+  private FlagConfig parseFlagConfig() {
+    String json = getString(FLAGS_CONFIG_PROP);
+    if (json == null || json.isEmpty()) {
+      return null;
+    }
+    try {
+      return OBJECT_MAPPER.readValue(json, FlagConfig.class);
+    } catch (IOException e) {
+      throw new ConfigException(FLAGS_CONFIG_PROP, json, "Must be a valid JSON object: " + e.getMessage());
+    }
   }
 
   private void validate() {
@@ -522,6 +568,12 @@ public class IcebergSinkConfig extends AbstractConfig {
   public boolean branchAutoCreateEnabled() {
     return getBoolean(BRANCHES_AUTO_CREATE_ENABLED_PROP);
   }
+
+  public String flagKeyPrefix() { return getString(FLAG_MESSAGE_PREFIX); }
+
+  public String flagTypeField() { return getString(FLAG_TYPE_FIELD); }
+
+  public FlagConfig flagConfig() { return this.flagConfig; }
 
 
   public JsonConverter jsonConverter() {

@@ -18,6 +18,10 @@
  */
 package io.tabular.iceberg.connect.channel;
 
+import org.apache.iceberg.catalog.TableIdentifier;
+
 interface CommittableSupplier {
   Committable committable();
+
+  default void onFlagProcessed(TableIdentifier tableIdentifier) {}
 }
