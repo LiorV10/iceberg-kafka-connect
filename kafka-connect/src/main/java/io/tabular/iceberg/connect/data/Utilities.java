@@ -31,10 +31,9 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Table;
@@ -171,16 +170,19 @@ public class Utilities {
         PropertyUtil.propertyAsLong(
             tableProps, WRITE_TARGET_FILE_SIZE_BYTES, WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
+    String idCols = table.properties().get("lakers.id-cols");
+    List<String> idColNames;
 
-    // override the identifier fields if the config is set
-    List<String> idCols = config.tableConfig(tableName).idColumns();
-    if (!idCols.isEmpty()) {
-      identifierFieldIds =
-          idCols.stream()
-              .map(colName -> table.schema().findField(colName).fieldId())
-              .collect(toSet());
+    if (idCols == null || idCols.isEmpty()) {
+      idColNames = config.tableConfig(tableName).idColumns();
+      table.updateProperties().set("lakers.id-cols", config.tablesDefaultIdColumns()).commit();
+    } else {
+      idColNames = Arrays.stream(idCols.split(",")).collect(Collectors.toList());
     }
+
+    Set<Integer> identifierFieldIds = idColNames.stream()
+            .map(colName -> table.schema().findField(colName).fieldId())
+            .collect(toSet());
 
     FileAppenderFactory<Record> appenderFactory;
     if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {
