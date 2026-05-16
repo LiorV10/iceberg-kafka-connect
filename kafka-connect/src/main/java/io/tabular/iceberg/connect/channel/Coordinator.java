@@ -298,23 +298,23 @@ public class Coordinator extends Channel implements AutoCloseable {
           snapshotId,
           commitState.currentCommitId(),
           vtts);
+    }
 
-      Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
-      if (!readyFlags.isEmpty()) {
-        processFlagMessages(table, readyFlags);
-        LOG.info(
-                "Flags processed for table {} in commit {}, sending per-table resume signal",
-                paramTableIdentifier, commitState.currentCommitId());
-        Event flagSentinel =
-                new Event(
-                        config.controlGroupId(),
-                        new CommitToTable(
-                                FLAG_PROCESSED_SENTINEL_ID,
-                                TableReference.of(config.catalogName(), paramTableIdentifier),
-                                0L,
-                                null));
-        send(flagSentinel);
-      }
+    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
+    if (!readyFlags.isEmpty()) {
+      processFlagMessages(table, readyFlags);
+      LOG.info(
+              "Flags processed for table {} in commit {}, sending per-table resume signal",
+              paramTableIdentifier, commitState.currentCommitId());
+      Event flagSentinel =
+              new Event(
+                      config.controlGroupId(),
+                      new CommitToTable(
+                              FLAG_PROCESSED_SENTINEL_ID,
+                              TableReference.of(config.catalogName(), paramTableIdentifier),
+                              0L,
+                              null));
+      send(flagSentinel);
     }
   }
 
@@ -438,13 +438,18 @@ public class Coordinator extends Channel implements AutoCloseable {
 
           if (fields_modified != null && !fields_modified.isEmpty()) {
             UpdateSchema updateSchemaCommit = table.updateSchema();
-            fields.forEach(field -> updateSchemaCommit
-                    .addColumn(
-                            field.get(flagConfig.getFieldName()).toString() + "_pending_type_update",
-                            SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
-                                    .orElse(Types.StringType.get())
-                    )
-            );
+            fields_modified.forEach(field -> {
+              LOG.debug("{} Modified, value {}, inferred type: {}",
+                  field.get(flagConfig.getFieldName()).toString(),
+                      field.get(flagConfig.getTypeValue()),
+                  SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config).orElse(Types.BinaryType.get())
+              );
+              updateSchemaCommit.addColumn(
+                      field.get(flagConfig.getFieldName()).toString() + "_pending_type_update",
+                      SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
+                              .orElse(Types.StringType.get())
+              );
+            });
 
             updateSchemaCommit.commit();
           }
