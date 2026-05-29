@@ -71,6 +71,8 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final String snapshotOffsetsProp;
   private final ExecutorService exec;
   private final CommitState commitState;
+  private final Collection<MemberDescription> members;
+  private final Map<String, Integer> tableTopicPartitions = Maps.newHashMap();
   private final Map<TableIdentifier, Map<String, Set<Integer>>> pendingFlagVotes = Maps.newHashMap();
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
@@ -90,6 +92,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         String.format(OFFSETS_SNAPSHOT_PROP_FMT, config.controlTopic(), config.controlGroupId());
     this.exec = ThreadPools.newWorkerPool("iceberg-committer", config.commitThreads());
     this.commitState = new CommitState(config);
+    this.members = members;
 
     // initial poll with longer duration so the consumer will initialize...
     consumeAvailable(Duration.ofMillis(1000), this::receive);
@@ -237,6 +240,15 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
+    this.tableTopicPartitions.put(
+            tableIdentifier.toString(),
+            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
+                    .stream()
+                    .filter(tp ->
+                            tp.topic().equals(Deduplicated.extractTopic(filteredEnvelopeList)))
+                    .count())
+                    .sum()
+    );
     accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
@@ -342,7 +354,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       accumulated.addAll(newPartitions);
       data.putIfAbsent(type, dataThisCycle.get(type));
       LOG.info("Flag '{}' for table {}: accumulated {}/{} unique partition votes (partitions: {})",
-              type, tableIdentifier, accumulated.size(), totalPartitionCount, accumulated);
+              type, tableIdentifier, accumulated.size(), tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3) , accumulated);
     });
   }
 
@@ -354,7 +366,7 @@ public class Coordinator extends Channel implements AutoCloseable {
             pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
     List<String> readyTypes = votes.entrySet().stream()
-            .filter(e -> e.getValue().size() >= totalPartitionCount)
+            .filter(e -> e.getValue().size() >= tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3))
             .map(Map.Entry::getKey)
             .collect(toList());
 
@@ -367,7 +379,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       ready.put(type, data.remove(type));
       votes.remove(type);
       LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
-              type, tableIdentifier, totalPartitionCount);
+              type, tableIdentifier, tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3));
     });
     return ready;
   }

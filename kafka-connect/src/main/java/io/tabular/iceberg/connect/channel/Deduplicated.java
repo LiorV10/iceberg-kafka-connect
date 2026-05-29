@@ -25,6 +25,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -161,6 +162,40 @@ class Deduplicated {
                             Collectors.mapping(
                                     Deduplicated::extractSourcePartition, Collectors.toSet())));
   }
+
+    public static String extractTopic(
+            List<Envelope> envelopes
+    ) {
+      AtomicReference<String> topic = new AtomicReference<>();
+
+      envelopes
+        .stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+            List<DataFile> dataFiles = dataWritten.dataFiles();
+
+            if (dataFiles == null || dataFiles.isEmpty()) {
+                return false;
+            }
+
+            return dataFiles.stream()
+                    .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+        })
+        .findFirst()
+        .ifPresent(dataWritten -> {
+            String recordJson =
+                    dataWritten
+                            .dataFiles()
+                            .get(0)
+                            .path()
+                            .toString()
+                            .substring(FlagWriterResult.FLAG_PREFIX.length());
+            Map<String, Object> record = parseRecordJson(recordJson);
+            topic.set(record.get("topic").toString());
+        });
+
+      return topic.get();
+    }
 
   @SuppressWarnings("unchecked")
   private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
