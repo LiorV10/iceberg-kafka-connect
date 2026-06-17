@@ -30,6 +30,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.io.BaseTaskWriter;
 import org.apache.iceberg.io.FileAppenderFactory;
 import org.apache.iceberg.io.FileIO;
@@ -83,7 +84,12 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
     KeyAndWriter mapKey = new KeyAndWriter(writer, Key.copyOf(keyProjection.wrap(row)));
     PendingChange pending = pendingChanges.get(mapKey);
     if (pending == null) {
-      pending = new PendingChange(writer, mapKey.key(), op, op == Operation.DELETE ? null : row.copy());
+      pending =
+          new PendingChange(
+              writer,
+              GenericRecord.copy(deleteSchema.asStruct(), mapKey.key().asRecord()),
+              op,
+              op == Operation.DELETE ? null : row.copy());
       pendingChanges.put(mapKey, pending);
       return;
     }
@@ -122,13 +128,14 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
 
   private static class PendingChange {
     private final RowDataDeltaWriter writer;
-    private final Key key;
+    private final Record deleteKeyRecord;
     private boolean requiresDelete;
     private Record rowToWrite;
 
-    private PendingChange(RowDataDeltaWriter writer, Key key, Operation op, Record rowToWrite) {
+    private PendingChange(
+        RowDataDeltaWriter writer, Record deleteKeyRecord, Operation op, Record rowToWrite) {
       this.writer = writer;
-      this.key = key;
+      this.deleteKeyRecord = deleteKeyRecord;
       this.requiresDelete = op == Operation.UPDATE || op == Operation.DELETE;
       this.rowToWrite = rowToWrite;
     }
@@ -153,7 +160,7 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
 
     private void apply() throws IOException {
       if (requiresDelete) {
-        writer.deleteKey(key);
+        writer.deleteKey(deleteKeyRecord);
       }
       if (rowToWrite != null) {
         writer.write(rowToWrite);
@@ -192,7 +199,7 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
     }
   }
 
-  private static class Key implements StructLike {
+  private static class Key {
     private final Object[] values;
 
     private Key(Object[] values) {
@@ -207,20 +214,12 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
       return new Key(values);
     }
 
-    @Override
-    public int size() {
-      return values.length;
-    }
-
-    @Override
-    @SuppressWarnings("unchecked")
-    public <T> T get(int pos, Class<T> javaClass) {
-      return (T) values[pos];
-    }
-
-    @Override
-    public <T> void set(int pos, T value) {
-      values[pos] = value;
+    private Record asRecord() {
+      GenericRecord record = GenericRecord.create(deleteSchemaForSize(values.length));
+      for (int i = 0; i < values.length; i += 1) {
+        record.set(i, values[i]);
+      }
+      return record;
     }
 
     @Override
@@ -261,6 +260,10 @@ abstract class BaseDeltaTaskWriter extends BaseTaskWriter<Record> {
         return copy;
       }
       return value;
+    }
+
+    private static Schema deleteSchemaForSize(int size) {
+      throw new UnsupportedOperationException("Key.asRecord should not be used without an explicit delete schema");
     }
   }
 }
