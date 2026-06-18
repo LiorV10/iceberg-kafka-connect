@@ -28,6 +28,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
@@ -465,6 +468,9 @@ public class Coordinator extends Channel implements AutoCloseable {
 
             updateSchemaCommit.commit();
           }
+
+          table.updateProperties().set("lakers.last-schema-change", ZonedDateTime.now(ZoneOffset.UTC)
+                  .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))).commit();
 
           break;
         default:
