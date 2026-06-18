@@ -59,4 +59,31 @@ public class UnpartitionedDeltaWriterTest extends BaseWriterTest {
     assertThat(result.deleteFiles())
         .allMatch(file -> file.format() == FileFormat.fromString(format));
   }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"parquet", "orc"})
+  public void testUnpartitionedDeltaWriterDeduplicatesSameKeyInBatch(String format) {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.upsertModeEnabled()).thenReturn(true);
+    when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
+    when(config.writeProps()).thenReturn(ImmutableMap.of("write.format.default", format));
+
+    // Two upserts for the same primary key (id, id2) in a single commit. The latest record should
+    // win and the batch should collapse to a single data row, instead of inserting both versions.
+    Record row1 = GenericRecord.create(SCHEMA);
+    row1.setField("id", 123L);
+    row1.setField("data", "v1");
+    row1.setField("id2", 123L);
+
+    Record row2 = GenericRecord.create(SCHEMA);
+    row2.setField("id", 123L);
+    row2.setField("data", "v2");
+    row2.setField("id2", 123L);
+
+    WriteResult result =
+        writeTest(ImmutableList.of(row1, row2), config, UnpartitionedDeltaWriter.class);
+
+    // Exactly one logical row should survive for the key.
+    assertThat(totalRecordCount(ImmutableList.copyOf(result.dataFiles()))).isEqualTo(1);
+  }
 }

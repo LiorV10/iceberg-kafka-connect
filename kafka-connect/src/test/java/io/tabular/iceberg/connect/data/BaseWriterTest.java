@@ -26,6 +26,7 @@ import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.LocationProviders;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -74,7 +75,9 @@ public class BaseWriterTest {
   protected WriteResult writeTest(
       List<Record> rows, IcebergSinkConfig config, Class<?> expectedWriterClass) {
     try (TaskWriter<Record> writer = Utilities.createTableWriter(table, "name", config)) {
-      assertThat(writer.getClass()).isEqualTo(expectedWriterClass);
+      // createTableWriter wraps the underlying writer in a DeduplicatedTaskWriter; assert on the
+      // wrapped delegate so existing expectations about the concrete writer type still hold.
+      assertThat(unwrap(writer)).isInstanceOf(expectedWriterClass);
 
       rows.forEach(
           row -> {
@@ -89,5 +92,25 @@ public class BaseWriterTest {
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
+  }
+
+  /**
+   * Unwraps the {@link DeduplicatedTaskWriter} decorator added by {@link
+   * Utilities#createTableWriter} so tests can assert on the underlying writer implementation.
+   */
+  private static TaskWriter<Record> unwrap(TaskWriter<Record> writer) {
+    if (writer instanceof DeduplicatedTaskWriter) {
+      return ((DeduplicatedTaskWriter) writer).delegate();
+    }
+    return writer;
+  }
+
+  /** Sum of the record counts across the given data files. */
+  protected static long totalRecordCount(Iterable<DataFile> dataFiles) {
+    long total = 0;
+    for (DataFile dataFile : dataFiles) {
+      total += dataFile.recordCount();
+    }
+    return total;
   }
 }
