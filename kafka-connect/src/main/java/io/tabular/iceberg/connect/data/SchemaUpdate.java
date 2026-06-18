@@ -51,7 +51,7 @@ public class SchemaUpdate {
     }
 
     public boolean empty() {
-      return addColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
+      return addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
     }
 
     public void addColumn(String parentName, String name, Type type) {
