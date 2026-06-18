@@ -80,6 +80,9 @@ public class PartitionedDeltaWriter extends BaseDeltaTaskWriter {
   @Override
   public void close() {
     try {
+      // Flush the per-key deduplicated batch before closing the underlying writers.
+      flushRowBuffer();
+
       Tasks.foreach(writers.values())
           .throwFailureWhenFinished()
           .noRetry()

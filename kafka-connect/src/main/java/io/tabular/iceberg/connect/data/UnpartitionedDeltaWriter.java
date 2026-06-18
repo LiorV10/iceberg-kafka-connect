@@ -61,6 +61,8 @@ public class UnpartitionedDeltaWriter extends BaseDeltaTaskWriter {
 
   @Override
   public void close() throws IOException {
+    // Flush the per-key deduplicated batch before closing the underlying writer.
+    flushRowBuffer();
     writer.close();
   }
 }
