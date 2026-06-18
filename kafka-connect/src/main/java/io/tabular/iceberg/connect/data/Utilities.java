@@ -252,7 +252,16 @@ public class Utilities {
                 config.upsertModeEnabled());
       }
     }
-    return writer;
+
+    // In upsert / CDC-update mode the underlying delta writer can emit duplicate rows for the same
+    // primary key when the same key is written more than once within a single commit and the writer
+    // rolls to a new data file in between (the positional-delete that would normally suppress the
+    // earlier insert is lost, and both occurrences degrade to same-sequence-number equality deletes
+    // that cannot remove same-commit data). Wrapping the delta writers with a per-key deduplicating
+    // writer collapses repeated keys to their latest record before any file is written, so each key
+    // reaches the delta writer at most once per commit. Plain append writers have no identifier
+    // fields, so the wrapper passes records through unchanged.
+    return new DeduplicatedTaskWriter(writer, table.schema(), identifierFieldIds);
   }
 
   /**
