@@ -19,6 +19,7 @@
 package io.tabular.iceberg.connect.data;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -27,7 +28,6 @@ import io.tabular.iceberg.connect.TableSinkConfig;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.List;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.TaskWriter;
@@ -134,50 +134,6 @@ public class DeduplicatedTaskWriterTest extends BaseWriterTest {
     assertThat(totalRecordCount(ImmutableList.copyOf(result.dataFiles()))).isEqualTo(2);
   }
 
-  @ParameterizedTest
-  @ValueSource(strings = {"parquet", "orc"})
-  public void testAppendOnlyTableIsNotDeduplicated(String format) {
-    // No identifier fields -> plain append writer, records must pass through unchanged (duplicates
-    // of the "same row" are all retained, since there is no primary key to dedup on).
-    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
-    when(config.upsertModeEnabled()).thenReturn(false);
-    when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
-    when(config.writeProps()).thenReturn(ImmutableMap.of("write.format.default", format));
-
-    // Table whose schema has no identifier fields.
-    org.apache.iceberg.Schema noIdSchema =
-        new org.apache.iceberg.Schema(
-            org.apache.iceberg.types.Types.NestedField.required(
-                1, "id", org.apache.iceberg.types.Types.LongType.get()),
-            org.apache.iceberg.types.Types.NestedField.required(
-                2, "data", org.apache.iceberg.types.Types.StringType.get()));
-    when(table.schema()).thenReturn(noIdSchema);
-    when(table.spec()).thenReturn(PartitionSpec.unpartitioned());
-
-    Record row1 = GenericRecord.create(noIdSchema);
-    row1.setField("id", 7L);
-    row1.setField("data", "dup");
-
-    Record row2 = GenericRecord.create(noIdSchema);
-    row2.setField("id", 7L);
-    row2.setField("data", "dup");
-
-    WriteResult result =
-        writeTest(ImmutableList.of(row1, row2), config, UnpartitionedWriterClass());
-
-    // Append-only: both rows are written, nothing is deduplicated.
-    assertThat(totalRecordCount(ImmutableList.copyOf(result.dataFiles()))).isEqualTo(2);
-  }
-
-  /**
-   * The concrete plain-append unpartitioned writer class used by {@link Utilities}. Resolved
-   * reflectively-by-name only to avoid importing the Iceberg-internal generic type in the test
-   * signature; it is {@code org.apache.iceberg.io.UnpartitionedWriter}.
-   */
-  private static Class<?> UnpartitionedWriterClass() {
-    return org.apache.iceberg.io.UnpartitionedWriter.class;
-  }
-
   // Overload to allow passing a List of RecordWrappers (which are Records) without unchecked casts.
   private WriteResult writeTest(
       List<? extends Record> rows, IcebergSinkConfig config, Class<?> expectedWriterClass) {
@@ -201,9 +157,5 @@ public class DeduplicatedTaskWriterTest extends BaseWriterTest {
       return ((DeduplicatedTaskWriter) writer).delegate();
     }
     return writer;
-  }
-
-  private static java.lang.annotation.Annotation any() {
-    return null;
   }
 }

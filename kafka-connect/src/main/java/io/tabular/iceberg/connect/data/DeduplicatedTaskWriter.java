@@ -30,6 +30,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.StructLikeMap;
 import org.apache.iceberg.util.StructProjection;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * A {@link TaskWriter} decorator that collapses records sharing the same identifier (primary key)
@@ -55,12 +57,20 @@ import org.apache.iceberg.util.StructProjection;
  * second same-key row to suppress, so the rolling-file race cannot reintroduce duplicates and the
  * latest value always wins. This does not rely on, or change, sequence-number semantics, so a
  * normal single upsert (one occurrence of a key) is unaffected, and deletes that target rows from
- * earlier commits continue to work exactly as before.
+ * earlier commits continue to work exactly as before. The original record object (including any
+ * {@link RecordWrapper} carrying the CDC operation) is buffered and replayed as-is, so the
+ * operation is preserved.
  *
  * <p>When the table has no identifier fields (append-only / non-upsert), records are passed through
  * to the delegate unchanged.
+ *
+ * <p>Debug logging: enable {@code DEBUG} on this class
+ * ({@code io.tabular.iceberg.connect.data.DeduplicatedTaskWriter}) to trace per-record keys/ops,
+ * whether each write collapsed a duplicate, and the input-vs-unique counts at completion.
  */
 class DeduplicatedTaskWriter implements TaskWriter<Record> {
+
+  private static final Logger LOG = LoggerFactory.getLogger(DeduplicatedTaskWriter.class);
 
   private final TaskWriter<Record> delegate;
   private final InternalRecordWrapper wrapper;
@@ -70,6 +80,9 @@ class DeduplicatedTaskWriter implements TaskWriter<Record> {
   // StructLikeMap provides type-aware key equality over the identifier struct and materializes a
   // stable key copy on put(), so two records with the same logical key collapse to one entry.
   private final StructLikeMap<Record> buffer;
+
+  // Number of records accepted by write() since the last completion/abort, for debug accounting.
+  private long bufferedRecordCount;
 
   DeduplicatedTaskWriter(
       TaskWriter<Record> delegate, Schema schema, Set<Integer> identifierFieldIds) {
@@ -85,11 +98,25 @@ class DeduplicatedTaskWriter implements TaskWriter<Record> {
       this.keyProjection = null;
       this.buffer = null;
     }
+
+    LOG.debug(
+        "Initialized DeduplicatedTaskWriter (dedupEnabled={}, identifierFieldIds={}, delegate={})",
+        dedupEnabled,
+        identifierFieldIds,
+        delegate.getClass().getSimpleName());
+  }
+
+  /** The wrapped writer. Exposed for tests that need to assert on the underlying writer type. */
+  TaskWriter<Record> delegate() {
+    return delegate;
   }
 
   @Override
   public void write(Record row) throws IOException {
     if (!dedupEnabled) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Dedup disabled, passing record through to delegate: op={}", opOf(row));
+      }
       delegate.write(row);
       return;
     }
@@ -97,17 +124,48 @@ class DeduplicatedTaskWriter implements TaskWriter<Record> {
     // Project the identifier fields to form the key. StructLikeMap#put copies the key internally
     // (via StructLikeWrapper#copyFor), so reusing the projection wrapper across rows is safe.
     StructLike key = keyProjection.wrap(wrapper.wrap(row));
-    // Last write wins: a later record for the same key replaces the earlier buffered record.
-    buffer.put(key, row);
+    // Last write wins: a later record for the same key replaces the earlier buffered record. The
+    // original record object is stored, preserving any RecordWrapper operation for replay.
+    Record previous = buffer.put(key, row);
+    bufferedRecordCount += 1;
+
+    if (LOG.isDebugEnabled()) {
+      if (previous == null) {
+        LOG.debug(
+            "Buffered new key {} (op={}); buffer now holds {} unique key(s) from {} record(s)",
+            keyToString(key),
+            opOf(row),
+            buffer.size(),
+            bufferedRecordCount);
+      } else {
+        LOG.debug(
+            "Collapsed duplicate for key {} (op={} replaces op={}); buffer still holds {} unique "
+                + "key(s) from {} record(s)",
+            keyToString(key),
+            opOf(row),
+            opOf(previous),
+            buffer.size(),
+            bufferedRecordCount);
+      }
+    }
   }
 
   @Override
   public WriteResult complete() throws IOException {
     if (dedupEnabled) {
+      int uniqueKeys = buffer.size();
+      LOG.debug(
+          "Completing: replaying {} unique key(s) to delegate (deduplicated from {} record(s), "
+              + "{} duplicate(s) collapsed)",
+          uniqueKeys,
+          bufferedRecordCount,
+          bufferedRecordCount - uniqueKeys);
+
       for (Record row : buffer.values()) {
         delegate.write(row);
       }
       buffer.clear();
+      bufferedRecordCount = 0;
     }
     return delegate.complete();
   }
@@ -115,7 +173,12 @@ class DeduplicatedTaskWriter implements TaskWriter<Record> {
   @Override
   public void abort() throws IOException {
     if (dedupEnabled) {
+      LOG.debug(
+          "Aborting: discarding {} buffered record(s) ({} unique key(s))",
+          bufferedRecordCount,
+          buffer.size());
       buffer.clear();
+      bufferedRecordCount = 0;
     }
     delegate.abort();
   }
@@ -123,5 +186,25 @@ class DeduplicatedTaskWriter implements TaskWriter<Record> {
   @Override
   public void close() throws IOException {
     delegate.close();
+  }
+
+  private static Operation opOf(Record row) {
+    return row instanceof RecordWrapper ? ((RecordWrapper) row).op() : null;
+  }
+
+  /**
+   * Renders the identifier key for logging. The key is a {@link StructProjection} view; read each
+   * projected position generically so this works for any identifier schema. Guarded by {@code
+   * LOG.isDebugEnabled()} at call sites so it is only built when debug logging is on.
+   */
+  private static String keyToString(StructLike key) {
+    StringBuilder sb = new StringBuilder("[");
+    for (int i = 0; i < key.size(); i += 1) {
+      if (i > 0) {
+        sb.append(", ");
+      }
+      sb.append(key.get(i, Object.class));
+    }
+    return sb.append("]").toString();
   }
 }
