@@ -29,17 +29,17 @@ import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.StructLike;
-import org.apache.iceberg.avro.Avro;
+import org.apache.iceberg.data.GenericAppenderFactory;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.avro.DataReader;
 import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
+import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.deletes.PositionDelete;
 import org.apache.iceberg.deletes.PositionDeleteWriter;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptionUtil;
 import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -111,18 +111,18 @@ class RowLevelDeduplicated {
     List<Integer> sortedIds = Lists.newArrayList(identifierFieldIds);
     sortedIds.sort(Integer::compareTo);
 
-    Schema keySchema = TypeUtil.select(schema, Sets.newHashSet(identifierFieldIds));
     // projection = identifier columns + _pos so we can build position deletes
     Schema projection =
-        TypeUtil.join(keySchema, new Schema(MetadataColumns.ROW_POSITION));
+        TypeUtil.select(
+            schema, Sets.union(Sets.newHashSet(identifierFieldIds), Sets.newHashSet(MetadataColumns.ROW_POSITION.fieldId())));
 
-    // key -> the occurrence we keep, plus the list of occurrences we must delete
+    // key -> the occurrence we keep
     Map<List<Object>, Occurrence> winners = Maps.newHashMap();
     List<Occurrence> losers = Lists.newArrayList();
 
     for (DataFile dataFile : dataFiles) {
       long fileOffset = fileOffsets.getOrDefault(dataFile.path().toString(), Long.MIN_VALUE);
-      try (CloseableIterable<Record> records = openFile(dataFile, projection, schema, io)) {
+      try (CloseableIterable<Record> records = openFile(dataFile, projection, io)) {
         for (Record record : records) {
           long pos = (Long) record.getField(MetadataColumns.ROW_POSITION.name());
           List<Object> key = keyOf(record, sortedIds, schema);
@@ -156,7 +156,7 @@ class RowLevelDeduplicated {
         losers.size(),
         dataFiles.size());
 
-    return writePositionDeletes(losers, spec, io, fileFactory);
+    return writePositionDeletes(losers, schema, spec, fileFactory);
   }
 
   private static List<Object> keyOf(Record record, List<Integer> sortedIds, Schema schema) {
@@ -169,31 +169,27 @@ class RowLevelDeduplicated {
   }
 
   private static List<DeleteFile> writePositionDeletes(
-      List<Occurrence> losers, PartitionSpec spec, FileIO io, OutputFileFactory fileFactory) {
-    // The connector's data files are written against the unpartitioned/default spec from the
-    // worker, and the coordinator commits them with their own specId. Position deletes here are
-    // emitted against the table's current spec with a null partition (unpartitioned), which is
-    // valid because deletes reference files by path.
-    OutputFile outputFile = fileFactory.newOutputFile().encryptingOutputFile();
+      List<Occurrence> losers, Schema schema, PartitionSpec spec, OutputFileFactory fileFactory) {
+    // Position deletes are emitted against the table's spec with a null partition (the connector's
+    // data files are written unpartitioned/with the default spec from the worker). Deletes
+    // reference data files by path, so an unpartitioned position-delete file is valid here.
+    EncryptedOutputFile outputFile = fileFactory.newOutputFile();
 
-    PositionDeleteWriter<Record> writer;
-    try {
-      FileFormat format = FileFormat.fromFileName(outputFile.location());
-      FileFormat resolved = format == null ? FileFormat.PARQUET : format;
-      writer =
-          newPositionDeleteWriter(resolved, outputFile, spec, io);
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to create position delete writer", e);
-    }
+    // posDeleteRowSchema == null -> path+pos only, no row data embedded.
+    GenericAppenderFactory appenderFactory =
+        new GenericAppenderFactory(schema, spec, null, null, null);
+
+    PositionDeleteWriter<Record> writer =
+        appenderFactory.newPosDeleteWriter(outputFile, FileFormat.PARQUET, null);
 
     PositionDelete<Record> posDelete = PositionDelete.create();
+    // sort by path then pos for well-formed position delete files
+    losers.sort(
+        (a, b) -> {
+          int c = a.path.compareTo(b.path);
+          return c != 0 ? c : Long.compare(a.pos, b.pos);
+        });
     try (PositionDeleteWriter<Record> closeableWriter = writer) {
-      // sort by path then pos for well-formed position delete files
-      losers.sort(
-          (a, b) -> {
-            int c = a.path.compareTo(b.path);
-            return c != 0 ? c : Long.compare(a.pos, b.pos);
-          });
       for (Occurrence loser : losers) {
         closeableWriter.write(posDelete.set(loser.path, loser.pos, null));
       }
@@ -204,26 +200,8 @@ class RowLevelDeduplicated {
     return Lists.newArrayList(writer.toDeleteFile());
   }
 
-  private static PositionDeleteWriter<Record> newPositionDeleteWriter(
-      FileFormat format, OutputFile outputFile, PartitionSpec spec, FileIO io) throws IOException {
-    Schema posDeleteSchema = DeleteSchemaUtil.pathPosSchema();
-    switch (format) {
-      case PARQUET:
-        return Parquet.writeDeletes(outputFile)
-            .forTable(null)
-            .rowSchema(null)
-            .withSpec(spec)
-            .createWriterFunc(GenericParquetWriterShim::create)
-            .overwrite()
-            .buildPositionWriter();
-      default:
-        throw new UnsupportedOperationException(
-            "Position delete format not supported for PK dedup: " + format);
-    }
-  }
-
   private static CloseableIterable<Record> openFile(
-      DataFile dataFile, Schema projection, Schema tableSchema, FileIO io) {
+      DataFile dataFile, Schema projection, FileIO io) {
     InputFile input = io.newInputFile(dataFile.path().toString());
     switch (dataFile.format()) {
       case PARQUET:
@@ -240,10 +218,8 @@ class RowLevelDeduplicated {
                 avroSchema -> DataReader.create(projection, avroSchema, Maps.newHashMap()))
             .build();
       case ORC:
-        Schema projectionWithoutMeta =
-            TypeUtil.selectNot(projection, MetadataColumns.metadataFieldIds());
         return ORC.read(input)
-            .project(projectionWithoutMeta)
+            .project(projection)
             .createReaderFunc(
                 fileSchema ->
                     GenericOrcReader.buildReader(projection, fileSchema, Maps.newHashMap()))
