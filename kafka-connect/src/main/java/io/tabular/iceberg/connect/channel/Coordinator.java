@@ -55,6 +55,7 @@ import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
 import org.apache.iceberg.util.ThreadPools;
 import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -80,12 +81,13 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
   public Coordinator(
-      Catalog catalog,
-      IcebergSinkConfig config,
-      Collection<MemberDescription> members,
-      KafkaClientFactory clientFactory) {
+          Catalog catalog,
+          IcebergSinkConfig config,
+          Collection<MemberDescription> members,
+          KafkaClientFactory clientFactory,
+          SinkTaskContext context) {
     // pass consumer group ID to which we commit low watermark offsets
-    super("coordinator", config.controlGroupId() + "-coord", config, clientFactory);
+    super("coordinator", config.controlGroupId() + "-coord", config, clientFactory, context);
 
     this.catalog = catalog;
     this.config = config;

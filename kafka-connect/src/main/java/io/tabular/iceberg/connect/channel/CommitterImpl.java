@@ -79,7 +79,9 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
         "committer",
         IcebergSinkConfig.DEFAULT_CONTROL_GROUP_PREFIX + UUID.randomUUID(),
         config,
-        clientFactory);
+        clientFactory,
+        context
+    );
 
     this.context = context;
     this.config = config;

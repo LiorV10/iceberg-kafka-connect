@@ -297,7 +297,7 @@ public class CoordinatorTest extends ChannelTestBase {
               new MemberAssignment(ImmutableSet.of(new TopicPartition(SRC_TOPIC_NAME, i)))));
     }
 
-    final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory);
+    final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory, null);
     initConsumer();
 
     // start a new commit immediately and wait for all workers to respond infinitely
@@ -456,7 +456,7 @@ public class CoordinatorTest extends ChannelTestBase {
     when(config.commitIntervalMs()).thenReturn(0);
     when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
 
-    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory, null);
 
     // init consumer after subscribe()
     initConsumer();

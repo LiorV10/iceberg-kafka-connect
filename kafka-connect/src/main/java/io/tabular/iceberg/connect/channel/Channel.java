@@ -27,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 import org.apache.iceberg.connect.events.AvroUtil;
 import org.apache.iceberg.connect.events.Event;
@@ -44,6 +45,7 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -62,17 +64,22 @@ public abstract class Channel {
   private final EventDecoder eventDecoder;
 
   public Channel(
-      String name,
-      String consumerGroupId,
-      IcebergSinkConfig config,
-      KafkaClientFactory clientFactory) {
+          String name,
+          String consumerGroupId,
+          IcebergSinkConfig config,
+          KafkaClientFactory clientFactory,
+          SinkTaskContext context) {
     this.controlTopic = config.controlTopic();
     this.groupId = config.controlGroupId();
 
     // Use a deterministic transactional ID scoped to this connector role so that
     // Kafka's epoch-bump mechanism fences any zombie producer left by a previous
     // task instance with the same configuration.
-    String transactionalId = config.transactionalIdFor(name);
+    String assignedTasks = context.assignment()
+            .stream()
+            .map(tp -> String.valueOf(tp.partition()))
+            .collect(Collectors.joining("-"));
+    String transactionalId = config.transactionalIdFor(name, assignedTasks);
     Pair<UUID, Producer<String, byte[]>> pair = clientFactory.createProducer(transactionalId);
     this.producer = pair.second();
     this.consumer = clientFactory.createConsumer(consumerGroupId);
