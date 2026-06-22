@@ -415,7 +415,7 @@ public class IcebergSinkConfig extends AbstractConfig {
    * @return a deterministic transactional ID
    */
   public String transactionalIdFor(String role) {
-    return controlTopic() + "-" + controlGroupId() + "-" + role;
+    return role + "-" + controlTopic() + "-" + controlGroupId();
   }
 
   /**
