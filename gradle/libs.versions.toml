@@ -10,6 +10,7 @@ iceberg-ver = "1.5.2"
 jackson-ver = "2.14.2"
 junit-ver = "5.10.0"
 kafka-ver = "3.5.1"
+parquet-ver = "1.13.1"
 slf4j-ver = "1.7.36"
 testcontainers-ver = "1.17.6"
 
@@ -43,6 +44,9 @@ kafka-clients = { module = "org.apache.kafka:kafka-clients", version.ref = "kafk
 kafka-connect-api = { module = "org.apache.kafka:connect-api", version.ref = "kafka-ver" }
 kafka-connect-json = { module = "org.apache.kafka:connect-json", version.ref = "kafka-ver" }
 kafka-connect-transforms = { module = "org.apache.kafka:connect-transforms", version.ref = "kafka-ver" }
+parquet-avro = { module = "org.apache.parquet:parquet-avro", version.ref = "parquet-ver" }
+parquet-column = { module = "org.apache.parquet:parquet-column", version.ref = "parquet-ver" }
+parquet-hadoop = { module = "org.apache.parquet:parquet-hadoop", version.ref = "parquet-ver" }
 slf4j = { module = "org.slf4j:slf4j-api", version.ref = "slf4j-ver" }
 
 # test dependencies
@@ -65,6 +69,7 @@ iceberg = ["iceberg-api", "iceberg-common", "iceberg-core", "iceberg-data", "ice
 iceberg-ext = ["iceberg-aws", "iceberg-aws-bundle", "iceberg-azure", "iceberg-azure-bundle", "iceberg-gcp","iceberg-gcp-bundle", "iceberg-nessie"]
 jackson = ["jackson-core", "jackson-databind"]
 kafka-connect = ["kafka-clients", "kafka-connect-api", "kafka-connect-json", "kafka-connect-transforms"]
+parquet = ["parquet-avro", "parquet-column", "parquet-hadoop"]
 
 
 [plugins]
