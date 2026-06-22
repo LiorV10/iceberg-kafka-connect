@@ -125,6 +125,15 @@ public class IcebergSinkConfig extends AbstractConfig {
   public static final String FLAG_TYPE_FIELD = "iceberg.flags.type-field";
   public static final String FLAGS_CONFIG_PROP = "iceberg.flags.config";
 
+  // When enabled, the coordinator reads the identifier (primary key) columns of the data files in
+  // each commit batch and emits position deletes for primary keys that appear in more than one
+  // data file within the same commit. This guards against task restarts (often triggered by an
+  // unstable REST catalog) re-writing already-committed source records into brand-new data files,
+  // which the path-based deduplication cannot catch and which would otherwise surface as duplicate
+  // rows. Disabled by default because it reads the just-written data files in the coordinator.
+  private static final String COMMIT_PK_DEDUP_ENABLED_PROP =
+          "iceberg.tables.commit-pk-dedup-enabled";
+
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
   public static final ConfigDef CONFIG_DEF = newConfigDef();
@@ -320,6 +329,16 @@ public class IcebergSinkConfig extends AbstractConfig {
             null,
             Importance.MEDIUM,
             "JSON object grouping all flag-message settings: key-prefix, type-field, field-name, and any additional variables"
+    );
+    configDef.define(
+            COMMIT_PK_DEDUP_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to deduplicate primary keys across data files within a commit by emitting "
+                + "position deletes for stale duplicates (guards against task-restart re-writes). "
+                + "Requires identifier columns (table property 'lakers.id-cols' or schema identifier "
+                + "fields). Disabled by default."
     );
   }
 
@@ -601,6 +620,16 @@ public class IcebergSinkConfig extends AbstractConfig {
   public String flagTypeField() { return getString(FLAG_TYPE_FIELD); }
 
   public FlagConfig flagConfig() { return this.flagConfig; }
+
+  /**
+   * Whether commit-time primary-key deduplication is enabled. When true, the coordinator detects
+   * primary keys that appear in more than one data file within a single commit and emits position
+   * deletes for the stale occurrences. See {@code RowLevelDeduplicated} for details. Disabled by
+   * default.
+   */
+  public boolean commitPkDedupEnabled() {
+    return getBoolean(COMMIT_PK_DEDUP_ENABLED_PROP);
+  }
 
 
   public JsonConverter jsonConverter() {
