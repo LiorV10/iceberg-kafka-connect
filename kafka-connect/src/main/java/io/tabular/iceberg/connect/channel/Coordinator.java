@@ -33,6 +33,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import io.tabular.iceberg.connect.TableContext;
@@ -48,6 +49,7 @@ import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -71,6 +73,9 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final String ID_COLS_TABLE_PROP = "lakers.id-cols";
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
   static final UUID FLAG_PROCESSED_SENTINEL_ID = new UUID(0L, 0L);
+
+  // monotonically increasing partition id used to name position-delete output files uniquely
+  private final AtomicInteger deleteFilePartitionId = new AtomicInteger(0);
 
   private final Catalog catalog;
   private final IcebergSinkConfig config;
@@ -241,23 +246,39 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(dataFile -> dataFile.recordCount() > 0)
             .collect(toList());
 
-    // Drop data files that carry the same primary key(s) as another file in this batch. This
-    // protects against task restarts (e.g. caused by an unstable REST catalog) re-writing
-    // already-committed records into new data files, which would otherwise land the same PK in
-    // two data files within a single snapshot and surface as duplicates on read.
-    dataFiles =
-        PrimaryKeyDeduplicated.dataFiles(
-            dataFiles,
-            dataFileOffsets(filteredEnvelopeList),
-            table.schema(),
-            identifierFieldIds(table, tableIdentifier));
-
     List<DeleteFile> deleteFiles =
         Deduplicated.deleteFiles(
                 commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
+
+    // Commit-time primary-key deduplication. Task restarts (often caused by an unstable REST
+    // catalog) can re-write already-committed source records into brand-new data files, landing the
+    // same primary key in two data files within a single snapshot. The path-based Deduplicated
+    // above cannot detect this, and equality deletes never apply within the same snapshot. When
+    // enabled, RowLevelDeduplicated reads the identifier columns of the data files in this batch and
+    // emits position deletes for the stale duplicates, keeping the row from the file reported on the
+    // highest control-topic offset. This works for data files containing any number of primary keys.
+    List<DeleteFile> pkDedupDeletes = Collections.emptyList();
+    if (config.commitPkDedupEnabled() && dataFiles.size() > 1) {
+      Set<Integer> identifierFieldIds = identifierFieldIds(table, tableIdentifier);
+      if (!identifierFieldIds.isEmpty()) {
+        OutputFileFactory fileFactory =
+            OutputFileFactory.builderFor(table, 1, deleteFilePartitionId.incrementAndGet())
+                .format(FileFormat.PARQUET)
+                .build();
+        pkDedupDeletes =
+            RowLevelDeduplicated.positionDeletes(
+                dataFiles,
+                dataFileOffsets(filteredEnvelopeList),
+                table.schema(),
+                table.spec(),
+                identifierFieldIds,
+                table.io(),
+                fileFactory);
+      }
+    }
 
     this.tableTopicPartitions.put(
             tableIdentifier.toString(),
@@ -270,10 +291,15 @@ public class Coordinator extends Channel implements AutoCloseable {
     );
     accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
-    if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
+    // Position deletes from PK dedup force the RowDelta path even when there are no equality deletes,
+    // since AppendFiles cannot carry delete files.
+    List<DeleteFile> allDeleteFiles = Lists.newArrayList(deleteFiles);
+    allDeleteFiles.addAll(pkDedupDeletes);
+
+    if (dataFiles.isEmpty() && allDeleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
-      if (deleteFiles.isEmpty()) {
+      if (allDeleteFiles.isEmpty()) {
         Transaction transaction = table.newTransaction();
 
         Map<Integer, List<DataFile>> filesBySpec =
@@ -307,8 +333,9 @@ public class Coordinator extends Channel implements AutoCloseable {
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
         }
+        // data files may span multiple specs; RowDelta.addRows handles each file's own specId.
         dataFiles.forEach(deltaOp::addRows);
-        deleteFiles.forEach(deltaOp::addDeletes);
+        allDeleteFiles.forEach(deltaOp::addDeletes);
         deltaOp.commit();
       }
 
@@ -352,9 +379,9 @@ public class Coordinator extends Channel implements AutoCloseable {
   /**
    * Builds a map from data-file path to the control-topic offset of the envelope that reported it.
    * When the same path appears in multiple envelopes the highest offset is kept. This is used by
-   * {@link PrimaryKeyDeduplicated} to decide which of two colliding files is the most recent.
+   * {@link RowLevelDeduplicated} to decide which of two colliding files is the most recent.
    */
-  private Map<String, Long> dataFileOffsets(List<Envelope> envelopes) {
+  Map<String, Long> dataFileOffsets(List<Envelope> envelopes) {
     Map<String, Long> offsets = Maps.newHashMap();
     for (Envelope envelope : envelopes) {
       DataWritten payload = (DataWritten) envelope.event().payload();
@@ -371,21 +398,26 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
-   * Resolves the identifier (primary key) field ids for the table. Prefers the explicit per-table
-   * {@code id-columns} sink config, then the {@code lakers.id-cols} table property maintained by the
-   * DDL flag handler, and finally the schema's own identifier fields. Returns an empty set when no
-   * primary key can be determined, which makes PK dedup a no-op for append-only tables.
+   * Resolves the identifier (primary key) field ids for the table. The source of truth is the
+   * {@code lakers.id-cols} table property maintained by the DDL flag handler. As a fallback it also
+   * honors the explicit per-table {@code id-columns} sink config and finally the schema's own
+   * identifier fields. Returns an empty set when no primary key can be determined, which makes PK
+   * dedup a no-op for append-only tables.
    */
-  private Set<Integer> identifierFieldIds(Table table, TableIdentifier tableIdentifier) {
+  Set<Integer> identifierFieldIds(Table table, TableIdentifier tableIdentifier) {
     Schema schema = table.schema();
 
-    List<String> idCols = config.tableConfig(tableIdentifier.toString()).idColumns();
+    // Primary source of truth: the lakers.id-cols table property.
+    List<String> idCols = Collections.emptyList();
+    String prop = table.properties().get(ID_COLS_TABLE_PROP);
+    if (prop != null && !prop.isEmpty()) {
+      idCols =
+          Arrays.stream(prop.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(toList());
+    }
+
+    // Fallback: explicit per-table id-columns sink config.
     if (idCols.isEmpty()) {
-      String prop = table.properties().get(ID_COLS_TABLE_PROP);
-      if (prop != null && !prop.isEmpty()) {
-        idCols =
-            Arrays.stream(prop.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(toList());
-      }
+      idCols = config.tableConfig(tableIdentifier.toString()).idColumns();
     }
 
     if (!idCols.isEmpty()) {
