@@ -57,6 +57,8 @@ public class SchemaUpdate {
     public void addColumn(String parentName, String name, Type type) {
       AddColumn addCol = new AddColumn(parentName, name, type);
       addColumns.put(addCol.key(), addCol);
+
+      LOG.debug("{} is about to be added.", name);
     }
 
     public void dropColumn(String name) {
@@ -68,10 +70,14 @@ public class SchemaUpdate {
 
     public void updateType(String name, PrimitiveType type) {
       updateTypes.put(name, new UpdateType(name, type));
+
+      LOG.debug("{} is about to be updated.", name);
     }
 
     public void makeOptional(String name) {
       makeOptionals.put(name, new MakeOptional(name));
+
+      LOG.debug("{} is about to become optional.", name);
     }
   }
 

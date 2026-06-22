@@ -56,6 +56,8 @@ public class IcebergWriter implements RecordWriter {
   }
 
   private void initNewWriter() {
+    LOG.debug("A new writer is initializing for {}", tableName);
+
     this.writer = Utilities.createTableWriter(table, tableName, config);
     this.recordConverter = new RecordConverter(table, config);
   }

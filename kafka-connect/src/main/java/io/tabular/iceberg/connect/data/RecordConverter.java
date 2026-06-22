@@ -213,6 +213,7 @@ public class RecordConverter {
     if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
       Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
       incomingFieldNames.addAll(pendingColumns);
+      incomingFieldNames.addAll(config.excludeFields());
 
       List<NestedField> columnsToDrop = tableSchema.columns().stream()
               .filter(col -> !incomingFieldNames.contains(col.name()))

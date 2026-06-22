@@ -36,6 +36,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.UpdateSchema;
@@ -128,14 +130,16 @@ public class SchemaUtils {
       return;
     }
 
+    LOG.info("Adding columns: {}", addColumns.stream().map(AddColumn::name).collect(Collectors.joining(",")));
+    LOG.info("Dropping columns: {}", dropColumns.stream().map(DropColumn::name).collect(Collectors.joining(",")));
+    LOG.info("Updating types for columns: {}", updateTypes.stream().map(UpdateType::name).collect(Collectors.joining(",")));
+    LOG.info("Making optional columns: {}", makeOptionals.stream().map(MakeOptional::name).collect(Collectors.joining(",")));
+
     // apply the updates
     UpdateSchema updateSchema = table.updateSchema();
     addColumns.forEach(
         update -> updateSchema.addColumn(update.parentName(), update.name(), update.type()));
-    dropColumns.forEach(update -> {
-      LOG.debug("Dropping column \"{}\"", update.name());
-      updateSchema.deleteColumn(update.name());
-    });
+    dropColumns.forEach(update -> updateSchema.deleteColumn(update.name()));
     updateTypes.forEach(update -> updateSchema.updateColumn(update.name(), update.type()));
     makeOptionals.forEach(update -> updateSchema.makeColumnOptional(update.name()));
     updateSchema.commit();
