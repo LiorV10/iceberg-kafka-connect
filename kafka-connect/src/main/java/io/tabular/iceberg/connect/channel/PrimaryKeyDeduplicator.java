@@ -41,22 +41,20 @@ import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.data.DataReader;
 import org.apache.iceberg.data.GenericAppenderFactory;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.avro.DataReader;
 import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.EqualityDeleteWriter;
 import org.apache.iceberg.io.FileAppenderFactory;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
 import org.apache.iceberg.types.TypeUtil;
@@ -337,12 +335,7 @@ class PrimaryKeyDeduplicator {
 
       FileFormat format = FileFormat.PARQUET;
       FileAppenderFactory<Record> appenderFactory =
-          new GenericAppenderFactory(
-                  table.schema(),
-                  spec,
-                  equalityFieldIds,
-                  pkSchema,
-                  null)
+          new GenericAppenderFactory(table.schema(), spec, equalityFieldIds, pkSchema, null)
               .setAll(table.properties());
 
       OutputFileFactory fileFactory =
@@ -353,17 +346,15 @@ class PrimaryKeyDeduplicator {
               .build();
 
       StructLike partition = partitionKey.partition;
-      OutputFile outputFile =
+      // OutputFileFactory#newOutputFile already returns an EncryptedOutputFile, which is exactly
+      // what EqualityDeleteWriter expects; no manual re-wrapping is required.
+      EncryptedOutputFile outputFile =
           spec.isUnpartitioned()
-              ? fileFactory.newOutputFile().encryptingOutputFile()
-              : fileFactory.newOutputFile(partition).encryptingOutputFile();
+              ? fileFactory.newOutputFile()
+              : fileFactory.newOutputFile(partition);
 
       EqualityDeleteWriter<Record> writer =
-          appenderFactory.newEqDeleteWriter(
-              org.apache.iceberg.encryption.EncryptedFiles.encryptedOutput(
-                  outputFile, org.apache.iceberg.encryption.EncryptionKeyMetadata.empty()),
-              format,
-              partition);
+          appenderFactory.newEqDeleteWriter(outputFile, format, partition);
 
       try (EqualityDeleteWriter<Record> eqWriter = writer) {
         eqWriter.write(losers);
