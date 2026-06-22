@@ -42,6 +42,7 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
@@ -50,6 +51,7 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Pair;
 import org.apache.iceberg.util.Tasks;
@@ -66,6 +68,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final String OFFSETS_SNAPSHOT_PROP_FMT = "kafka.connect.offsets.%s.%s";
   private static final String COMMIT_ID_SNAPSHOT_PROP = "kafka.connect.commit-id";
   private static final String VTTS_SNAPSHOT_PROP = "kafka.connect.vtts";
+  private static final String ID_COLS_TABLE_PROP = "lakers.id-cols";
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
   static final UUID FLAG_PROCESSED_SENTINEL_ID = new UUID(0L, 0L);
 
@@ -238,6 +241,17 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(dataFile -> dataFile.recordCount() > 0)
             .collect(toList());
 
+    // Drop data files that carry the same primary key(s) as another file in this batch. This
+    // protects against task restarts (e.g. caused by an unstable REST catalog) re-writing
+    // already-committed records into new data files, which would otherwise land the same PK in
+    // two data files within a single snapshot and surface as duplicates on read.
+    dataFiles =
+        PrimaryKeyDeduplicated.dataFiles(
+            dataFiles,
+            dataFileOffsets(filteredEnvelopeList),
+            table.schema(),
+            identifierFieldIds(table, tableIdentifier));
+
     List<DeleteFile> deleteFiles =
         Deduplicated.deleteFiles(
                 commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
@@ -333,6 +347,65 @@ public class Coordinator extends Channel implements AutoCloseable {
                               null));
       send(flagSentinel);
     }
+  }
+
+  /**
+   * Builds a map from data-file path to the control-topic offset of the envelope that reported it.
+   * When the same path appears in multiple envelopes the highest offset is kept. This is used by
+   * {@link PrimaryKeyDeduplicated} to decide which of two colliding files is the most recent.
+   */
+  private Map<String, Long> dataFileOffsets(List<Envelope> envelopes) {
+    Map<String, Long> offsets = Maps.newHashMap();
+    for (Envelope envelope : envelopes) {
+      DataWritten payload = (DataWritten) envelope.event().payload();
+      List<DataFile> files = payload.dataFiles();
+      if (files == null) {
+        continue;
+      }
+      long offset = envelope.offset();
+      for (DataFile file : files) {
+        offsets.merge(file.path().toString(), offset, Math::max);
+      }
+    }
+    return offsets;
+  }
+
+  /**
+   * Resolves the identifier (primary key) field ids for the table. Prefers the explicit per-table
+   * {@code id-columns} sink config, then the {@code lakers.id-cols} table property maintained by the
+   * DDL flag handler, and finally the schema's own identifier fields. Returns an empty set when no
+   * primary key can be determined, which makes PK dedup a no-op for append-only tables.
+   */
+  private Set<Integer> identifierFieldIds(Table table, TableIdentifier tableIdentifier) {
+    Schema schema = table.schema();
+
+    List<String> idCols = config.tableConfig(tableIdentifier.toString()).idColumns();
+    if (idCols.isEmpty()) {
+      String prop = table.properties().get(ID_COLS_TABLE_PROP);
+      if (prop != null && !prop.isEmpty()) {
+        idCols =
+            Arrays.stream(prop.split(",")).map(String::trim).filter(s -> !s.isEmpty()).collect(toList());
+      }
+    }
+
+    if (!idCols.isEmpty()) {
+      Set<Integer> ids = Sets.newHashSet();
+      for (String col : idCols) {
+        Types.NestedField field = schema.findField(col);
+        if (field != null) {
+          ids.add(field.fieldId());
+        } else {
+          LOG.warn(
+              "Configured id-column '{}' not found in schema for table {}, ignoring for PK dedup",
+              col,
+              tableIdentifier);
+        }
+      }
+      return ids;
+    }
+
+    Set<Integer> schemaIds = schema.identifierFieldIds();
+    return schemaIds == null ? Collections.emptySet() : schemaIds;
   }
 
   private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
