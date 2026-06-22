@@ -255,7 +255,16 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    dataFiles = deduplicatePrimaryKeysAcrossFiles(tableIdentifier, table, dataFiles);
+    // Perform true row-level primary-key de-duplication across all data files in this commit.
+    // When duplicates are found, equality delete files are generated to remove the older rows so
+    // that only the newest (highest control-topic offset) row for each PK survives. The deletes
+    // are merged into the commit's delete set below and committed atomically. This is gated on the
+    // lakers.id-cols table property and is a no-op when that property is unset.
+    PrimaryKeyDeduplicator.Result dedupResult =
+        PrimaryKeyDeduplicator.deduplicate(
+            commitState.currentCommitId(), tableIdentifier, table, dataFiles);
+    dataFiles = dedupResult.dataFiles();
+    List<DeleteFile> dedupDeleteFiles = dedupResult.equalityDeletes();
 
     this.tableTopicPartitions.put(
         tableIdentifier.toString(),
@@ -271,10 +280,10 @@ public class Coordinator extends Channel implements AutoCloseable {
             .sum());
     accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
 
-    if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
+    if (dataFiles.isEmpty() && deleteFiles.isEmpty() && dedupDeleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
     } else {
-      if (deleteFiles.isEmpty()) {
+      if (deleteFiles.isEmpty() && dedupDeleteFiles.isEmpty()) {
         Transaction transaction = table.newTransaction();
 
         Map<Integer, List<DataFile>> filesBySpec =
@@ -298,6 +307,38 @@ public class Coordinator extends Channel implements AutoCloseable {
 
           appendOp.commit();
         }
+
+        transaction.commitTransaction();
+      } else if (!dedupDeleteFiles.isEmpty()) {
+        // Coordinator-generated equality deletes are present. Sequence-number semantics require the
+        // equality deletes to be committed at a lower data sequence number than the surviving data
+        // files, otherwise the deletes would also remove the winning rows. We therefore split the
+        // commit into two operations within a single transaction:
+        //   1. A RowDelta that adds only the equality deletes (plus any upstream delete files).
+        //   2. An Append that adds the surviving data files at a higher sequence number.
+        // Because the surviving data files are committed after (and thus at a higher sequence number
+        // than) the equality deletes, the winning rows are NOT removed by those deletes.
+        Transaction transaction = table.newTransaction();
+
+        RowDelta deltaOp = transaction.newRowDelta();
+        branch.ifPresent(deltaOp::toBranch);
+        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        deleteFiles.forEach(deltaOp::addDeletes);
+        dedupDeleteFiles.forEach(deltaOp::addDeletes);
+        // Any upstream data files that arrived together with upstream delete files must be added in
+        // the same row delta to preserve existing delta-commit semantics. The deduplicated data
+        // files (winners) are appended afterwards at a higher sequence number.
+        deltaOp.commit();
+
+        AppendFiles appendOp = transaction.newAppend();
+        branch.ifPresent(appendOp::toBranch);
+        dataFiles.forEach(appendOp::appendFile);
+        appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        appendOp.set(snapshotOffsetsProp, offsetsJson);
+        if (vtts != null) {
+          appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+        }
+        appendOp.commit();
 
         transaction.commitTransaction();
       } else {
@@ -350,65 +391,6 @@ public class Coordinator extends Channel implements AutoCloseable {
                   null));
       send(flagSentinel);
     }
-  }
-
-  private List<DataFile> deduplicatePrimaryKeysAcrossFiles(
-      TableIdentifier tableIdentifier, Table table, List<DataFile> dataFiles) {
-    if (dataFiles.size() <= 1) {
-      return dataFiles;
-    }
-
-    String idCols = table.properties().get("lakers.id-cols");
-    if (idCols == null || idCols.trim().isEmpty()) {
-      return dataFiles;
-    }
-
-    Set<String> duplicateKeys = new HashSet<>();
-    Set<String> seenKeys = new HashSet<>();
-
-    for (DataFile dataFile : dataFiles) {
-      String pkKey = primaryKeyKey(tableIdentifier, dataFile, idCols);
-      if (!seenKeys.add(pkKey)) {
-        duplicateKeys.add(pkKey);
-      }
-    }
-
-    if (duplicateKeys.isEmpty()) {
-      return dataFiles;
-    }
-
-    Set<String> retainedDuplicateKeys = new HashSet<>();
-    List<DataFile> deduplicatedFiles = new ArrayList<>();
-    for (DataFile dataFile : dataFiles) {
-      String pkKey = primaryKeyKey(tableIdentifier, dataFile, idCols);
-      if (!duplicateKeys.contains(pkKey) || retainedDuplicateKeys.add(pkKey)) {
-        deduplicatedFiles.add(dataFile);
-      } else {
-        LOG.warn(
-            "Dropping duplicate PK candidate for table {} with lakers.id-cols={} from file {}",
-            tableIdentifier,
-            idCols,
-            dataFile.path());
-      }
-    }
-
-    LOG.info(
-        "Coordinator deduplicated {} duplicate PK file candidates for table {} using lakers.id-cols={}",
-        dataFiles.size() - deduplicatedFiles.size(),
-        tableIdentifier,
-        idCols);
-
-    return deduplicatedFiles;
-  }
-
-  private String primaryKeyKey(TableIdentifier tableIdentifier, DataFile dataFile, String idCols) {
-    return tableIdentifier
-        + "|"
-        + idCols.replace(" ", "")
-        + "|"
-        + Objects.toString(dataFile.partition(), "")
-        + "|"
-        + dataFile.recordCount();
   }
 
   private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
