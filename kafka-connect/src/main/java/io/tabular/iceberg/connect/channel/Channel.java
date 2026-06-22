@@ -42,6 +42,8 @@ import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.errors.ProducerFencedException;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -67,7 +69,10 @@ public abstract class Channel {
     this.controlTopic = config.controlTopic();
     this.groupId = config.controlGroupId();
 
-    String transactionalId = name + config.transactionalSuffix();
+    // Use a deterministic transactional ID scoped to this connector role so that
+    // Kafka's epoch-bump mechanism fences any zombie producer left by a previous
+    // task instance with the same configuration.
+    String transactionalId = config.transactionalIdFor(name);
     Pair<UUID, Producer<String, byte[]>> pair = clientFactory.createProducer(transactionalId);
     this.producer = pair.second();
     this.consumer = clientFactory.createConsumer(consumerGroupId);
@@ -108,6 +113,16 @@ public abstract class Channel {
           producer.sendOffsetsToTransaction(offsetsToCommit, consumerGroupMetadata);
         }
         producer.commitTransaction();
+      } catch (ProducerFencedException e) {
+        // This instance has been fenced by a newer producer with the same transactional ID,
+        // meaning a new task has taken over. Log and propagate as a ConnectException so
+        // Kafka Connect can restart/reassign this task cleanly.
+        LOG.warn(
+            "Producer fenced — this task instance is a zombie and has been superseded "
+                + "by a newer instance. Triggering task restart.",
+            e);
+        throw new ConnectException(
+            "This producer has been fenced by a newer instance – restarting task", e);
       } catch (Exception e) {
         try {
           producer.abortTransaction();

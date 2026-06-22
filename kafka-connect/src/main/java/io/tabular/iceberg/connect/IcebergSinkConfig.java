@@ -397,6 +397,33 @@ public class IcebergSinkConfig extends AbstractConfig {
     return originalProps.get(NAME_PROP);
   }
 
+  /**
+   * Returns a <strong>deterministic</strong> Kafka transactional ID scoped to the given logical
+   * role (e.g. {@code "committer"} or {@code "coordinator"}).
+   *
+   * <p>A deterministic, per-connector ID is required for Kafka's zombie-fencing mechanism to work.
+   * When a new task instance calls {@code KafkaProducer.initTransactions()} with the same
+   * transactional ID as a lingering zombie, Kafka increments the producer epoch and any subsequent
+   * transactional operation by the zombie will throw a
+   * {@link org.apache.kafka.common.errors.ProducerFencedException}, cleanly terminating it.
+   *
+   * <p>The ID is of the form: {@code "<controlTopic>-<controlGroupId>-<role>"}, which ensures
+   * uniqueness per connector instance while remaining stable across task restarts.
+   *
+   * @param role the logical name of the producer (e.g. {@code "committer"} or
+   *     {@code "coordinator"})
+   * @return a deterministic transactional ID
+   */
+  public String transactionalIdFor(String role) {
+    return controlTopic() + "-" + controlGroupId() + "-" + role;
+  }
+
+  /**
+   * @deprecated Use {@link #transactionalIdFor(String)} instead. This method returned a random or
+   *     null suffix, which prevented Kafka's epoch-bump zombie-fencing from working correctly
+   *     across connector restarts.
+   */
+  @Deprecated
   public String transactionalSuffix() {
     // this is for internal use and is not part of the config definition...
     return originalProps.get(INTERNAL_TRANSACTIONAL_SUFFIX_PROP);
