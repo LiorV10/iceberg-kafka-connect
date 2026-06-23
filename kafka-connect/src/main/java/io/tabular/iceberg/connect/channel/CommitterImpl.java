@@ -188,8 +188,21 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
     events.add(commitReady);
 
     Map<TopicPartition, Offset> offsets = committable.offsetsByTopicPartition();
+    // Atomicity fix: publish the DataWritten/DataComplete events AND commit the source-topic
+    // offsets in a SINGLE Kafka transaction, to the same consumer group that recovery rewinds
+    // to (controlGroupId, see fetchStableConsumerOffsets above). Previously this method issued
+    // two separate transactions -- one committing offsets to controlGroupId and a second one
+    // committing the same offsets to connectGroupId. Because those two commits were not atomic,
+    // a task crash (or any divergence between the two groups) could leave a published data file
+    // whose source offsets were not durably advanced for the group used at recovery. The
+    // restarted task would then reprocess the same records and write a duplicate data file;
+    // both the replayed file and the reprocessed file have distinct paths (random operationId
+    // UUID) so the path-based Deduplicated check keeps both, and the coordinator's control-topic
+    // offset filter cannot detect two distinct above-watermark events carrying the same source
+    // rows -- resulting in duplicate rows within a single Iceberg snapshot. Committing the
+    // events and offsets together in one transaction restores the invariant that
+    // "data file published" implies "source offset advanced for the recovery group".
     send(events, offsets, new ConsumerGroupMetadata(config.controlGroupId()));
-    send(ImmutableList.of(), offsets, new ConsumerGroupMetadata(config.connectGroupId()));
   }
 
   @Override
