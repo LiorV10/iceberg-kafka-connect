@@ -149,7 +149,7 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   private void doCommit(boolean partialCommit) {
-    Map<TableIdentifier, List<Envelope>> commitMap = commitState.tableCommitMap();
+    Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap = commitState.tableCommitMap();
 
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
@@ -159,7 +159,23 @@ public class Coordinator extends Channel implements AutoCloseable {
         .stopOnFailure()
         .run(
             entry -> {
-              commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts);
+              // Commit each commit-id as its own Iceberg snapshot, in first-seen (chronological)
+              // order, so equality deletes from a later commit land in a later snapshot (higher
+              // sequence number) than the data they must remove. Only the LAST commit-id for the
+              // table records the offsets/vtts watermark, so recovery never reads a watermark from
+              // an intermediate snapshot that does not yet reflect all data committed in this batch.
+              List<UUID> commitIdsInOrder = new ArrayList<>(entry.getValue().keySet());
+              int lastIdx = commitIdsInOrder.size() - 1;
+              for (int i = 0; i <= lastIdx; i++) {
+                UUID commitId = commitIdsInOrder.get(i);
+                List<Envelope> envelopes = entry.getValue().get(commitId);
+                commitToTable(
+                    entry.getKey(),
+                    commitId,
+                    envelopes,
+                    i == lastIdx ? offsetsJson : null,
+                    i == lastIdx ? vtts : null);
+              }
             });
 
     // we should only get here if all tables committed successfully...
@@ -187,6 +203,7 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   private void commitToTable(
       TableIdentifier paramTableIdentifier,
+      UUID commitId,
       List<Envelope> envelopeList,
       String offsetsJson,
       OffsetDateTime vtts) {
@@ -233,14 +250,14 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     List<DataFile> dataFiles =
-        Deduplicated.dataFiles(commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
+        Deduplicated.dataFiles(commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(dataFile -> dataFile.recordCount() > 0)
             .collect(toList());
 
     List<DeleteFile> deleteFiles =
         Deduplicated.deleteFiles(
-                commitState.currentCommitId(), tableIdentifier, filteredEnvelopeList)
+                commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
@@ -254,7 +271,7 @@ public class Coordinator extends Channel implements AutoCloseable {
                     .count())
                     .sum()
     );
-    accumulateFlagVotes(tableIdentifier, filteredEnvelopeList);
+    accumulateFlagVotes(commitId, tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
@@ -273,9 +290,11 @@ public class Coordinator extends Channel implements AutoCloseable {
           branch.ifPresent(appendOp::toBranch);
 
           list.get(i).forEach(appendOp::appendFile);
-          appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+          appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
           if (i == lastIdx) {
-            appendOp.set(snapshotOffsetsProp, offsetsJson);
+            if (offsetsJson != null) {
+              appendOp.set(snapshotOffsetsProp, offsetsJson);
+            }
             if (vtts != null) {
               appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
             }
@@ -288,8 +307,10 @@ public class Coordinator extends Channel implements AutoCloseable {
       } else {
         RowDelta deltaOp = table.newRowDelta();
         branch.ifPresent(deltaOp::toBranch);
-        deltaOp.set(snapshotOffsetsProp, offsetsJson);
-        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitState.currentCommitId().toString());
+        if (offsetsJson != null) {
+          deltaOp.set(snapshotOffsetsProp, offsetsJson);
+        }
+        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
         if (vtts != null) {
           deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
         }
@@ -303,7 +324,7 @@ public class Coordinator extends Channel implements AutoCloseable {
           new Event(
               config.controlGroupId(),
               new CommitToTable(
-                  commitState.currentCommitId(),
+                  commitId,
                   TableReference.of(config.catalogName(), tableIdentifier),
                   snapshotId,
                   vtts));
@@ -313,7 +334,7 @@ public class Coordinator extends Channel implements AutoCloseable {
           "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
           tableIdentifier,
           snapshotId,
-          commitState.currentCommitId(),
+          commitId,
           vtts);
     }
 
@@ -322,7 +343,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       processFlagMessages(table, readyFlags);
       LOG.info(
               "Flags processed for table {} in commit {}, sending per-table resume signal",
-              paramTableIdentifier, commitState.currentCommitId());
+              paramTableIdentifier, commitId);
       Event flagSentinel =
               new Event(
                       config.controlGroupId(),
@@ -335,7 +356,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
-  private void accumulateFlagVotes(TableIdentifier tableIdentifier, List<Envelope> envelopes) {
+  private void accumulateFlagVotes(UUID commitId, TableIdentifier tableIdentifier, List<Envelope> envelopes) {
     Map<String, Set<Integer>> partitionsThisCycle =
             Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
     LOG.debug("Accumulating {} flags", partitionsThisCycle.size());
@@ -345,7 +366,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     Map<String, Pair<TableContext, Map<String, Object>>> dataThisCycle =
-            Deduplicated.flagMessages(commitState.currentCommitId(), tableIdentifier,
+            Deduplicated.flagMessages(commitId, tableIdentifier,
                     envelopes, this.config.branchesDelimiter(), this.config.flagTypeField());
 
     Map<String, Set<Integer>> votes =
