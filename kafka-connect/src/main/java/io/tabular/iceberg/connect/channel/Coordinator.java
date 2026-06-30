@@ -151,6 +151,12 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void doCommit(boolean partialCommit) {
     Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap = commitState.tableCommitMap();
 
+    LOG.info("Commiting the following commits:");
+
+    commitMap.forEach((t, m) -> m.forEach((id, events) -> {
+      LOG.info("Commiting {} events at id {} for table {}", events.size(), id, t.toString());
+    }));
+
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
 
