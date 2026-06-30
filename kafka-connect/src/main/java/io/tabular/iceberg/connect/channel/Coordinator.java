@@ -157,26 +157,7 @@ public class Coordinator extends Channel implements AutoCloseable {
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
         .stopOnFailure()
-        .run(
-            entry -> {
-              // Commit each commit-id as its own Iceberg snapshot, in first-seen (chronological)
-              // order, so equality deletes from a later commit land in a later snapshot (higher
-              // sequence number) than the data they must remove. Only the LAST commit-id for the
-              // table records the offsets/vtts watermark, so recovery never reads a watermark from
-              // an intermediate snapshot that does not yet reflect all data committed in this batch.
-              List<UUID> commitIdsInOrder = new ArrayList<>(entry.getValue().keySet());
-              int lastIdx = commitIdsInOrder.size() - 1;
-              for (int i = 0; i <= lastIdx; i++) {
-                UUID commitId = commitIdsInOrder.get(i);
-                List<Envelope> envelopes = entry.getValue().get(commitId);
-                commitToTable(
-                    entry.getKey(),
-                    commitId,
-                    envelopes,
-                    i == lastIdx ? offsetsJson : null,
-                    i == lastIdx ? vtts : null);
-              }
-            });
+        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts));
 
     // we should only get here if all tables committed successfully...
     commitConsumerOffsets();
@@ -201,10 +182,33 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
+  /**
+   * Commits all buffered work for a single table.
+   *
+   * <p>The {@code commitsById} map holds, per commit-id, the envelopes for that commit-id in
+   * first-seen (chronological) order (see {@link CommitState#tableCommitMap()}). Each commit-id is
+   * committed as its OWN Iceberg snapshot, oldest first, so that equality deletes from a later
+   * commit land in a later snapshot (with a higher sequence number) than the data files they must
+   * remove. Only the LAST (newest) commit-id records the offsets/vtts watermark.
+   *
+   * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
+   * this batch have been committed:
+   *
+   * <ul>
+   *   <li>A single flag broadcast (e.g. END-LOAD / DDL) arrives as one DataWritten per source
+   *       partition, and those partitions may be spread across multiple commit-ids. So flag votes
+   *       are accumulated across ALL commit-ids first, and only then drained.
+   *   <li>Flag processing (branch switch via setCurrentSnapshot/removeBranch, schema updates) must
+   *       run after the data it relates to is committed; draining flags inside the per-commit-id
+   *       loop could switch the branch before later commit-ids' data is appended.
+   * </ul>
+   *
+   * To make the vote threshold correct, {@code tableTopicPartitions} is computed ONCE from the
+   * union of all this table's envelopes (across every commit-id), not per commit-id.
+   */
   private void commitToTable(
       TableIdentifier paramTableIdentifier,
-      UUID commitId,
-      List<Envelope> envelopeList,
+      Map<UUID, List<Envelope>> commitsById,
       String offsetsJson,
       OffsetDateTime vtts) {
     Table table;
@@ -238,6 +242,72 @@ public class Coordinator extends Channel implements AutoCloseable {
       }
     }
 
+    // The full set of envelopes for this table across every commit-id. Used for the flag-vote
+    // denominator (tableTopicPartitions) so it is independent of how envelopes happen to be split
+    // across commit-ids.
+    List<Envelope> allEnvelopesForTable =
+        commitsById.values().stream().flatMap(List::stream).collect(toList());
+
+    this.tableTopicPartitions.put(
+            tableIdentifier.toString(),
+            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
+                    .stream()
+                    .filter(tp ->
+                            tp.topic().equals(Deduplicated.extractTopic(allEnvelopesForTable)))
+                    .count())
+                    .sum()
+    );
+
+    // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
+    // NOT draining them until all data snapshots for this table are committed.
+    List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
+    int lastIdx = commitIdsInOrder.size() - 1;
+    for (int i = 0; i <= lastIdx; i++) {
+      UUID commitId = commitIdsInOrder.get(i);
+      List<Envelope> envelopes = commitsById.get(commitId);
+      commitDataForCommitId(
+          table,
+          tableIdentifier,
+          branch,
+          commitId,
+          envelopes,
+          i == lastIdx ? offsetsJson : null,
+          i == lastIdx ? vtts : null);
+    }
+
+    // Now that all data is committed, process any flags that became ready, exactly once.
+    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
+    if (!readyFlags.isEmpty()) {
+      processFlagMessages(table, readyFlags);
+      LOG.info(
+              "Flags processed for table {} in commit {}, sending per-table resume signal",
+              paramTableIdentifier, commitState.currentCommitId());
+      Event flagSentinel =
+              new Event(
+                      config.controlGroupId(),
+                      new CommitToTable(
+                              FLAG_PROCESSED_SENTINEL_ID,
+                              TableReference.of(config.catalogName(), paramTableIdentifier),
+                              0L,
+                              null));
+      send(flagSentinel);
+    }
+  }
+
+  /**
+   * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
+   * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes. The
+   * offsets/vtts watermark is written on this snapshot only when {@code offsetsJson}/{@code vtts}
+   * are non-null, which the caller arranges for the last (newest) commit-id only.
+   */
+  private void commitDataForCommitId(
+      Table table,
+      TableIdentifier tableIdentifier,
+      Optional<String> branch,
+      UUID commitId,
+      List<Envelope> envelopeList,
+      String offsetsJson,
+      OffsetDateTime vtts) {
     Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
 
     List<Envelope> filteredEnvelopeList =
@@ -262,98 +332,75 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    this.tableTopicPartitions.put(
-            tableIdentifier.toString(),
-            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
-                    .stream()
-                    .filter(tp ->
-                            tp.topic().equals(Deduplicated.extractTopic(filteredEnvelopeList)))
-                    .count())
-                    .sum()
-    );
+    // Accumulate flag votes for this commit-id; draining/processing happens once in commitToTable
+    // after all commit-ids' data has been committed.
     accumulateFlagVotes(commitId, tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
-      LOG.info("Nothing to commit to table {}, skipping", tableIdentifier);
-    } else {
-      if (deleteFiles.isEmpty()) {
-        Transaction transaction = table.newTransaction();
+      LOG.info("Nothing to commit to table {} for commit-id {}, skipping", tableIdentifier, commitId);
+      return;
+    }
 
-        Map<Integer, List<DataFile>> filesBySpec =
-            dataFiles.stream()
-                .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
+    if (deleteFiles.isEmpty()) {
+      Transaction transaction = table.newTransaction();
 
-        List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
-        int lastIdx = list.size() - 1;
-        for (int i = 0; i <= lastIdx; i++) {
-          AppendFiles appendOp = transaction.newAppend();
-          branch.ifPresent(appendOp::toBranch);
+      Map<Integer, List<DataFile>> filesBySpec =
+          dataFiles.stream()
+              .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
 
-          list.get(i).forEach(appendOp::appendFile);
-          appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
-          if (i == lastIdx) {
-            if (offsetsJson != null) {
-              appendOp.set(snapshotOffsetsProp, offsetsJson);
-            }
-            if (vtts != null) {
-              appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-            }
+      List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
+      int lastIdx = list.size() - 1;
+      for (int i = 0; i <= lastIdx; i++) {
+        AppendFiles appendOp = transaction.newAppend();
+        branch.ifPresent(appendOp::toBranch);
+
+        list.get(i).forEach(appendOp::appendFile);
+        appendOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
+        if (i == lastIdx) {
+          if (offsetsJson != null) {
+            appendOp.set(snapshotOffsetsProp, offsetsJson);
           }
-
-          appendOp.commit();
+          if (vtts != null) {
+            appendOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+          }
         }
 
-        transaction.commitTransaction();
-      } else {
-        RowDelta deltaOp = table.newRowDelta();
-        branch.ifPresent(deltaOp::toBranch);
-        if (offsetsJson != null) {
-          deltaOp.set(snapshotOffsetsProp, offsetsJson);
-        }
-        deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
-        if (vtts != null) {
-          deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
-        }
-        dataFiles.forEach(deltaOp::addRows);
-        deleteFiles.forEach(deltaOp::addDeletes);
-        deltaOp.commit();
+        appendOp.commit();
       }
 
-      Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
-      Event event =
-          new Event(
-              config.controlGroupId(),
-              new CommitToTable(
-                  commitId,
-                  TableReference.of(config.catalogName(), tableIdentifier),
-                  snapshotId,
-                  vtts));
-      send(event);
-
-      LOG.info(
-          "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
-          tableIdentifier,
-          snapshotId,
-          commitId,
-          vtts);
+      transaction.commitTransaction();
+    } else {
+      RowDelta deltaOp = table.newRowDelta();
+      branch.ifPresent(deltaOp::toBranch);
+      if (offsetsJson != null) {
+        deltaOp.set(snapshotOffsetsProp, offsetsJson);
+      }
+      deltaOp.set(COMMIT_ID_SNAPSHOT_PROP, commitId.toString());
+      if (vtts != null) {
+        deltaOp.set(VTTS_SNAPSHOT_PROP, Long.toString(vtts.toInstant().toEpochMilli()));
+      }
+      dataFiles.forEach(deltaOp::addRows);
+      deleteFiles.forEach(deltaOp::addDeletes);
+      deltaOp.commit();
     }
 
-    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
-    if (!readyFlags.isEmpty()) {
-      processFlagMessages(table, readyFlags);
-      LOG.info(
-              "Flags processed for table {} in commit {}, sending per-table resume signal",
-              paramTableIdentifier, commitId);
-      Event flagSentinel =
-              new Event(
-                      config.controlGroupId(),
-                      new CommitToTable(
-                              FLAG_PROCESSED_SENTINEL_ID,
-                              TableReference.of(config.catalogName(), paramTableIdentifier),
-                              0L,
-                              null));
-      send(flagSentinel);
-    }
+    Long snapshotId = latestSnapshot(table, branch.orElse(null)).snapshotId();
+    Event event =
+        new Event(
+            config.controlGroupId(),
+            new CommitToTable(
+                commitId,
+                TableReference.of(config.catalogName(), tableIdentifier),
+                snapshotId,
+                vtts));
+    send(event);
+
+    LOG.info(
+        "Commit complete to table {}, snapshot {}, commit ID {}, vtts {}",
+        tableIdentifier,
+        snapshotId,
+        commitId,
+        vtts);
   }
 
   private void accumulateFlagVotes(UUID commitId, TableIdentifier tableIdentifier, List<Envelope> envelopes) {
