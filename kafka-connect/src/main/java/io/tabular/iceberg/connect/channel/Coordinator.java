@@ -69,6 +69,13 @@ public class Coordinator extends Channel implements AutoCloseable {
   private static final Duration POLL_DURATION = Duration.ofMillis(1000);
   static final UUID FLAG_PROCESSED_SENTINEL_ID = new UUID(0L, 0L);
 
+  // Iceberg table property holding a JSON array of flag-identity markers that have already been
+  // applied by processFlagMessages. Used to make flag application idempotent across a coordinator
+  // crash/rebalance: if a coordinator dies after applying a flag but before offsets are durably
+  // advanced, the next coordinator can see the marker and skip re-applying the (non-idempotent)
+  // branch switch / schema mutation.
+  private static final String APPLIED_FLAGS_PROP = "lakers.applied-flags";
+
   private final Catalog catalog;
   private final IcebergSinkConfig config;
   private final int totalPartitionCount;
@@ -76,9 +83,10 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final ExecutorService exec;
   private final CommitState commitState;
   private final Collection<MemberDescription> members;
-  private final Map<String, Integer> tableTopicPartitions = Maps.newHashMap();
-  private final Map<TableIdentifier, Map<String, Set<Integer>>> pendingFlagVotes = Maps.newHashMap();
-  private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
+  // Durable, rebalance-safe replacement for the former in-memory pendingFlagVotes / pendingFlagData
+  // / tableTopicPartitions maps. Persists to Iceberg table properties so a coordinator elected
+  // after a rebalance recovers in-progress flag votes instead of starting empty.
+  private final FlagState flagState = new FlagState();
 
   public Coordinator(
           Catalog catalog,
@@ -189,6 +197,36 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
+   * A small adapter exposing an Iceberg {@link Table}'s properties to {@link FlagState} through the
+   * {@link FlagState.PropertyStore} interface. Writes are committed individually via
+   * {@code updateProperties()} so the pending-flag document is durable the moment a vote is
+   * accumulated, matching how offsets/watermarks are made durable elsewhere.
+   */
+  private static final class TablePropertyStore implements FlagState.PropertyStore {
+    private final Table table;
+
+    TablePropertyStore(Table table) {
+      this.table = table;
+    }
+
+    @Override
+    public String get(String key) {
+      table.refresh();
+      return table.properties().get(key);
+    }
+
+    @Override
+    public void set(String key, String value) {
+      table.updateProperties().set(key, value).commit();
+    }
+
+    @Override
+    public void remove(String key) {
+      table.updateProperties().remove(key).commit();
+    }
+  }
+
+  /**
    * Commits all buffered work for a single table.
    *
    * <p>The {@code commitsById} map holds, per commit-id, the envelopes for that commit-id in
@@ -209,8 +247,10 @@ public class Coordinator extends Channel implements AutoCloseable {
    *       loop could switch the branch before later commit-ids' data is appended.
    * </ul>
    *
-   * To make the vote threshold correct, {@code tableTopicPartitions} is computed ONCE from the
-   * union of all this table's envelopes (across every commit-id), not per commit-id.
+   * <p>Flag vote/payload state and the vote denominator are accumulated through {@link #flagState},
+   * which persists them to this table's Iceberg properties. This means a coordinator elected after
+   * a rebalance recovers any partial votes for the table instead of starting empty, so multi-cycle
+   * flag broadcasts are never lost mid-flight.
    */
   private void commitToTable(
       TableIdentifier paramTableIdentifier,
@@ -248,21 +288,33 @@ public class Coordinator extends Channel implements AutoCloseable {
       }
     }
 
+    // Durable store backed by this table's Iceberg properties, used for both flag-vote persistence
+    // (via FlagState) and the applied-flag idempotency markers.
+    FlagState.PropertyStore flagStore = new TablePropertyStore(table);
+
     // The full set of envelopes for this table across every commit-id. Used for the flag-vote
     // denominator (tableTopicPartitions) so it is independent of how envelopes happen to be split
     // across commit-ids.
     List<Envelope> allEnvelopesForTable =
         commitsById.values().stream().flatMap(List::stream).collect(toList());
 
-    this.tableTopicPartitions.put(
-            tableIdentifier.toString(),
-            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
-                    .stream()
-                    .filter(tp ->
-                            tp.topic().equals(Deduplicated.extractTopic(allEnvelopesForTable)))
-                    .count())
-                    .sum()
-    );
+    int sourcePartitionCount =
+        this.members.stream()
+            .mapToInt(
+                desc ->
+                    (int)
+                        desc.assignment().topicPartitions().stream()
+                            .filter(
+                                tp ->
+                                    tp.topic()
+                                        .equals(Deduplicated.extractTopic(allEnvelopesForTable)))
+                            .count())
+            .sum();
+    // Persist the vote denominator so a coordinator elected after a rebalance uses the same
+    // threshold the in-flight votes were being counted against (never a hard-coded fallback).
+    if (sourcePartitionCount > 0) {
+      flagState.setTableTopicPartitions(flagStore, tableIdentifier, sourcePartitionCount);
+    }
 
     // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
     // NOT draining them until all data snapshots for this table are committed.
@@ -273,6 +325,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       List<Envelope> envelopes = commitsById.get(commitId);
       commitDataForCommitId(
           table,
+          flagStore,
           tableIdentifier,
           branch,
           commitId,
@@ -282,9 +335,10 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     // Now that all data is committed, process any flags that became ready, exactly once.
-    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
+    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags =
+        flagState.drainReady(flagStore, tableIdentifier);
     if (!readyFlags.isEmpty()) {
-      processFlagMessages(table, readyFlags);
+      processFlagMessages(table, flagStore, readyFlags);
       LOG.info(
               "Flags processed for table {} in commit {}, sending per-table resume signal",
               paramTableIdentifier, commitState.currentCommitId());
@@ -308,6 +362,7 @@ public class Coordinator extends Channel implements AutoCloseable {
    */
   private void commitDataForCommitId(
       Table table,
+      FlagState.PropertyStore flagStore,
       TableIdentifier tableIdentifier,
       Optional<String> branch,
       UUID commitId,
@@ -339,8 +394,9 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     // Accumulate flag votes for this commit-id; draining/processing happens once in commitToTable
-    // after all commit-ids' data has been committed.
-    accumulateFlagVotes(commitId, tableIdentifier, filteredEnvelopeList);
+    // after all commit-ids' data has been committed. Persisted via flagStore so votes survive a
+    // rebalance.
+    accumulateFlagVotes(flagStore, commitId, tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
       LOG.info("Nothing to commit to table {} for commit-id {}, skipping", tableIdentifier, commitId);
@@ -409,7 +465,11 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  private void accumulateFlagVotes(UUID commitId, TableIdentifier tableIdentifier, List<Envelope> envelopes) {
+  private void accumulateFlagVotes(
+      FlagState.PropertyStore flagStore,
+      UUID commitId,
+      TableIdentifier tableIdentifier,
+      List<Envelope> envelopes) {
     Map<String, Set<Integer>> partitionsThisCycle =
             Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
     LOG.debug("Accumulating {} flags", partitionsThisCycle.size());
@@ -422,48 +482,31 @@ public class Coordinator extends Channel implements AutoCloseable {
             Deduplicated.flagMessages(commitId, tableIdentifier,
                     envelopes, this.config.branchesDelimiter(), this.config.flagTypeField());
 
-    Map<String, Set<Integer>> votes =
-            pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
-    Map<String, Pair<TableContext, Map<String, Object>>> data =
-            pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
+    flagState.accumulate(flagStore, tableIdentifier, partitionsThisCycle, dataThisCycle);
 
-    partitionsThisCycle.forEach((type, newPartitions) -> {
-      Set<Integer> accumulated =
-              votes.computeIfAbsent(type, k -> new HashSet<>());
-      accumulated.addAll(newPartitions);
-      data.putIfAbsent(type, dataThisCycle.get(type));
-      LOG.info("Flag '{}' for table {}: accumulated {}/{} unique partition votes (partitions: {})",
-              type, tableIdentifier, accumulated.size(), tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3) , accumulated);
-    });
+    partitionsThisCycle.forEach((type, newPartitions) ->
+        LOG.info("Flag '{}' for table {}: accumulated partition votes {} this cycle",
+            type, tableIdentifier, newPartitions));
   }
 
-  private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
-          TableIdentifier tableIdentifier) {
-    Map<String, Set<Integer>> votes =
-            pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
-    Map<String, Pair<TableContext, Map<String, Object>>> data =
-            pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
-
-    List<String> readyTypes = votes.entrySet().stream()
-            .filter(e -> e.getValue().size() >= tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3))
-            .map(Map.Entry::getKey)
-            .collect(toList());
-
-    if (readyTypes.isEmpty()) {
-      return Collections.emptyMap();
-    }
-
-    Map<String, Pair<TableContext, Map<String, Object>>> ready = Maps.newHashMap();
-    readyTypes.forEach(type -> {
-      ready.put(type, data.remove(type));
-      votes.remove(type);
-      LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
-              type, tableIdentifier, tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3));
-    });
-    return ready;
-  }
-
-  private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
+  /**
+   * Applies the given ready flags to the table. Each side effect is guarded so that reprocessing an
+   * already-applied flag after a crash/rebalance is a safe no-op:
+   *
+   * <ul>
+   *   <li>a durable per-flag marker in {@link #APPLIED_FLAGS_PROP} short-circuits an entire re-apply;
+   *   <li>the branch switch only runs if the target branch still exists;
+   *   <li>the pending column rewrite only runs if the {@code _pending_type_update} columns are still
+   *       present.
+   * </ul>
+   *
+   * Because applying a flag and durably advancing Kafka offsets are not atomic, this targets
+   * at-least-once delivery with an idempotency guard rather than exactly-once.
+   */
+  private void processFlagMessages(
+      Table table,
+      FlagState.PropertyStore flagStore,
+      Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
     flagMessages.forEach((type, flagEntry) -> {
       TableContext flagMessage = flagEntry.first();
       Map<String, Object> flagEnvelope = flagEntry.second();
@@ -471,6 +514,15 @@ public class Coordinator extends Channel implements AutoCloseable {
       Map<String, Object> flagRecord = flagEnvelope.get("value") instanceof Map
               ? (Map<String, Object>) flagEnvelope.get("value")
               : flagEnvelope;
+
+      String appliedMarker = flagAppliedMarker(type, flagMessage, flagEnvelope);
+      if (isFlagAlreadyApplied(flagStore, appliedMarker)) {
+        LOG.info(
+            "Flag of type {} for table {} already applied (marker {}), skipping",
+            type, flagMessage.tableIdentifier(), appliedMarker);
+        return;
+      }
+
       LOG.debug("About to process flag of type {} for: {}", type, flagMessage.tableIdentifier().toString());
 
       switch (type) {
@@ -501,16 +553,28 @@ public class Coordinator extends Channel implements AutoCloseable {
               } catch (Exception e) {
                 LOG.error("Failed to update types for table {}. {}", table.name(), e.getMessage());
               }
+            } else {
+              LOG.info(
+                  "No pending type updates for table {}, skipping schema rewrite (already applied?)",
+                  table.name());
             }
 
-            try {
-              // Forward the branch: set current snapshot to the branch's snapshot
-              // and clear the branch for further use
-              table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
-              table.manageSnapshots().removeBranch(targetBranch).commit();
-              LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
-            } catch (Exception e) {
-              LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
+            // Only switch the branch if it still exists; a previous (crashed) coordinator may have
+            // already removed it, in which case the switch was already applied.
+            if (table.snapshot(targetBranch) != null) {
+              try {
+                // Forward the branch: set current snapshot to the branch's snapshot
+                // and clear the branch for further use
+                table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
+                table.manageSnapshots().removeBranch(targetBranch).commit();
+                LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
+              } catch (Exception e) {
+                LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
+              }
+            } else {
+              LOG.info(
+                  "Branch {} no longer exists for table {}, skipping branch switch (already applied?)",
+                  targetBranch, table.name());
             }
           }
           break;
@@ -551,8 +615,61 @@ public class Coordinator extends Channel implements AutoCloseable {
           break;
         default:
           LOG.error("Couldn't process flag of type {}", type);
+          return;
       }
+
+      // Record the durable applied-marker only after the mutations above have been committed, so a
+      // crash mid-apply leaves the marker absent and the guarded, idempotent re-apply can complete.
+      markFlagApplied(flagStore, appliedMarker);
     });
+  }
+
+  /**
+   * Builds a stable identity string for an applied flag, derived from the flag type, table/branch,
+   * and the source record's topic/partition/offset (when available). Two invocations for the same
+   * logical flag broadcast produce the same marker, so the applied-marker check is deterministic
+   * across coordinator instances.
+   */
+  private String flagAppliedMarker(
+      String type, TableContext flagMessage, Map<String, Object> flagEnvelope) {
+    Object topic = flagEnvelope.get("topic");
+    Object partition = flagEnvelope.get("partition");
+    Object offset = flagEnvelope.get("offset");
+    return String.join(
+        "|",
+        type,
+        String.valueOf(flagMessage.tableIdentifier()),
+        String.valueOf(flagMessage.branch()),
+        String.valueOf(topic),
+        String.valueOf(partition),
+        String.valueOf(offset));
+  }
+
+  private boolean isFlagAlreadyApplied(FlagState.PropertyStore flagStore, String marker) {
+    return readAppliedFlags(flagStore).contains(marker);
+  }
+
+  private void markFlagApplied(FlagState.PropertyStore flagStore, String marker) {
+    Set<String> applied = new LinkedHashSet<>(readAppliedFlags(flagStore));
+    if (applied.add(marker)) {
+      try {
+        flagStore.set(APPLIED_FLAGS_PROP, MAPPER.writeValueAsString(new ArrayList<>(applied)));
+      } catch (IOException e) {
+        throw new UncheckedIOException(e);
+      }
+    }
+  }
+
+  private List<String> readAppliedFlags(FlagState.PropertyStore flagStore) {
+    String json = flagStore.get(APPLIED_FLAGS_PROP);
+    if (json == null || json.isEmpty()) {
+      return Collections.emptyList();
+    }
+    try {
+      return MAPPER.readValue(json, new TypeReference<List<String>>() {});
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private Snapshot latestSnapshot(Table table, String branch) {
