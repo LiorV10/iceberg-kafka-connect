@@ -195,7 +195,20 @@ public class Coordinator extends Channel implements AutoCloseable {
    * first-seen (chronological) order (see {@link CommitState#tableCommitMap()}). Each commit-id is
    * committed as its OWN Iceberg snapshot, oldest first, so that equality deletes from a later
    * commit land in a later snapshot (with a higher sequence number) than the data files they must
-   * remove. Only the LAST (newest) commit-id records the offsets/vtts watermark.
+   * remove.
+   *
+   * <p><b>Offsets/vtts watermark:</b> the offsets watermark ({@code offsetsJson}) and {@code vtts}
+   * are the finalized high-watermark for the ENTIRE batch (computed once in {@link #doCommit}
+   * before this loop runs). They are written on the summary of EVERY per-commit-id snapshot, not
+   * just the last one. This is required for correctness: each per-commit-id snapshot becomes
+   * durable in Iceberg as soon as it is committed, so if the coordinator crashes / rebalances
+   * after an earlier snapshot but before the final one, that earlier snapshot must already carry a
+   * watermark that covers its data. Otherwise, on restart the source consumer would rewind to
+   * before the batch (the control-group offsets were never committed) and re-write the
+   * already-committed records, producing identical rows with the same Kafka offset. Because the
+   * watermark is the batch high-watermark, any committed snapshot in the batch carries a watermark
+   * &gt;= all offsets in the batch, so {@link #lastCommittedOffsetsForTable} on restart causes
+   * {@link #commitDataForCommitId} to filter out every already-committed record.
    *
    * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
    * this batch have been committed:
@@ -266,6 +279,10 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
     // NOT draining them until all data snapshots for this table are committed.
+    //
+    // The offsets/vtts watermark is written on EVERY snapshot (not just the last). See the method
+    // javadoc: this closes the crash window that otherwise leaves an earlier snapshot durable
+    // without a covering watermark, which caused same-offset duplicate rows on restart.
     List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
     int lastIdx = commitIdsInOrder.size() - 1;
     for (int i = 0; i <= lastIdx; i++) {
@@ -277,8 +294,8 @@ public class Coordinator extends Channel implements AutoCloseable {
           branch,
           commitId,
           envelopes,
-          i == lastIdx ? offsetsJson : null,
-          i == lastIdx ? vtts : null);
+          offsetsJson,
+          vtts);
     }
 
     // Now that all data is committed, process any flags that became ready, exactly once.
@@ -302,9 +319,12 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   /**
    * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
-   * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes. The
-   * offsets/vtts watermark is written on this snapshot only when {@code offsetsJson}/{@code vtts}
-   * are non-null, which the caller arranges for the last (newest) commit-id only.
+   * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes.
+   *
+   * <p>The offsets/vtts watermark is always written on this snapshot's summary (when non-null),
+   * because every per-commit-id snapshot in a batch must carry a covering watermark so that a
+   * crash/rebalance after this snapshot cannot lead to the same records being re-written on
+   * restart. See {@link #commitToTable} for the full rationale.
    */
   private void commitDataForCommitId(
       Table table,
