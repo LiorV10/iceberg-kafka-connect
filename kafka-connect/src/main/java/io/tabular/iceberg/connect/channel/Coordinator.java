@@ -189,13 +189,47 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
+   * Serializes an explicit control-topic offset watermark (partition -&gt; next-offset) to JSON so it
+   * can be stored as a snapshot summary property.
+   */
+  private String offsetsJson(Map<Integer, Long> offsets) {
+    try {
+      return MAPPER.writeValueAsString(offsets);
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  /**
+   * Computes the per-commit-id control-topic offset watermark from the envelopes that are actually
+   * included in this commit-id's snapshot. The watermark for a partition is the highest control-topic
+   * offset seen among those envelopes plus one (the offset of the next record to consume), matching
+   * the semantics of {@link Channel#controlTopicOffsets()}.
+   *
+   * <p>Because this watermark is derived solely from the envelopes that are durably written in the
+   * same Iceberg snapshot, it is never ahead of the data it accompanies. Recording it on every
+   * per-commit-id snapshot (rather than only the last) means that if the catalog crashes mid-batch,
+   * the snapshots that DID commit carry a correct watermark, so on recovery {@code
+   * lastCommittedOffsetsForTable} filters those already-committed envelopes out and they are not
+   * appended a second time.
+   */
+  private Map<Integer, Long> commitIdOffsets(List<Envelope> envelopeList) {
+    Map<Integer, Long> offsets = Maps.newHashMap();
+    for (Envelope envelope : envelopeList) {
+      offsets.merge(envelope.partition(), envelope.offset() + 1, Math::max);
+    }
+    return offsets;
+  }
+
+  /**
    * Commits all buffered work for a single table.
    *
    * <p>The {@code commitsById} map holds, per commit-id, the envelopes for that commit-id in
    * first-seen (chronological) order (see {@link CommitState#tableCommitMap()}). Each commit-id is
    * committed as its OWN Iceberg snapshot, oldest first, so that equality deletes from a later
    * commit land in a later snapshot (with a higher sequence number) than the data files they must
-   * remove. Only the LAST (newest) commit-id records the offsets/vtts watermark.
+   * remove. Every commit-id records an offsets watermark (see {@link #commitIdOffsets(List)}); only
+   * the LAST (newest) commit-id additionally records the full-batch offsets/vtts watermark.
    *
    * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
    * this batch have been committed:
@@ -264,6 +298,13 @@ public class Coordinator extends Channel implements AutoCloseable {
                     .sum()
     );
 
+    // Commit-ids that already have a durable snapshot in this branch's history. This happens when a
+    // previous batch crashed after committing some commit-ids but before advancing the Kafka
+    // consumer offsets, so the same commit-ids are re-delivered. Re-committing them would duplicate
+    // data, so we skip them (both their data and their flag votes).
+    Set<String> alreadyCommittedCommitIds =
+        committedCommitIdsForTable(table, branch.orElse(null));
+
     // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
     // NOT draining them until all data snapshots for this table are committed.
     List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
@@ -271,13 +312,21 @@ public class Coordinator extends Channel implements AutoCloseable {
     for (int i = 0; i <= lastIdx; i++) {
       UUID commitId = commitIdsInOrder.get(i);
       List<Envelope> envelopes = commitsById.get(commitId);
+
+      if (alreadyCommittedCommitIds.contains(commitId.toString())) {
+        LOG.info(
+            "Commit-id {} already committed to table {}, skipping to avoid duplicates",
+            commitId, tableIdentifier);
+        continue;
+      }
+
       commitDataForCommitId(
           table,
           tableIdentifier,
           branch,
           commitId,
           envelopes,
-          i == lastIdx ? offsetsJson : null,
+          i == lastIdx ? offsetsJson : offsetsJson(commitIdOffsets(envelopes)),
           i == lastIdx ? vtts : null);
     }
 
@@ -303,8 +352,9 @@ public class Coordinator extends Channel implements AutoCloseable {
   /**
    * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
    * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes. The
-   * offsets/vtts watermark is written on this snapshot only when {@code offsetsJson}/{@code vtts}
-   * are non-null, which the caller arranges for the last (newest) commit-id only.
+   * {@code offsetsJson} watermark is always recorded (the caller supplies a per-commit-id watermark
+   * for intermediate commit-ids and the full-batch watermark for the last one); {@code vtts} is only
+   * recorded for the last (newest) commit-id.
    */
   private void commitDataForCommitId(
       Table table,
@@ -579,6 +629,27 @@ public class Coordinator extends Channel implements AutoCloseable {
       snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
     }
     return ImmutableMap.of();
+  }
+
+  /**
+   * Walks the branch's snapshot history (following {@code parentId}) and collects the set of
+   * commit-id values already recorded in the {@code kafka.connect.commit-id} snapshot summary
+   * property. Used to skip re-committing commit-ids whose data is already durably present, which can
+   * happen when a previous batch crashed after committing some commit-ids but before advancing the
+   * Kafka consumer offsets.
+   */
+  private Set<String> committedCommitIdsForTable(Table table, String branch) {
+    Set<String> commitIds = new HashSet<>();
+    Snapshot snapshot = latestSnapshot(table, branch);
+    while (snapshot != null) {
+      String value = snapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP);
+      if (value != null) {
+        commitIds.add(value);
+      }
+      Long parentSnapshotId = snapshot.parentId();
+      snapshot = parentSnapshotId != null ? table.snapshot(parentSnapshotId) : null;
+    }
+    return commitIds;
   }
 
   @Override
