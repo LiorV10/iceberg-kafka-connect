@@ -24,6 +24,8 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.FlagConfig;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.SchemaUtils;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.time.Duration;
@@ -34,17 +36,16 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
-
-import io.tabular.iceberg.connect.TableContext;
-import io.tabular.iceberg.connect.data.SchemaUtils;
 import org.apache.iceberg.*;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
+import org.apache.iceberg.connect.events.TopicPartitionOffset;
 import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -81,11 +82,11 @@ public class Coordinator extends Channel implements AutoCloseable {
   private final Map<TableIdentifier, Map<String, Pair<TableContext, Map<String, Object>>>> pendingFlagData = Maps.newHashMap();
 
   public Coordinator(
-          Catalog catalog,
-          IcebergSinkConfig config,
-          Collection<MemberDescription> members,
-          KafkaClientFactory clientFactory,
-          SinkTaskContext context) {
+      Catalog catalog,
+      IcebergSinkConfig config,
+      Collection<MemberDescription> members,
+      KafkaClientFactory clientFactory,
+      SinkTaskContext context) {
     // pass consumer group ID to which we commit low watermark offsets
     super("coordinator", config.controlGroupId() + "-coord", config, clientFactory, context);
 
@@ -111,8 +112,8 @@ public class Coordinator extends Channel implements AutoCloseable {
       Event event =
           new Event(config.controlGroupId(), new StartCommit(commitState.currentCommitId()));
       send(event);
-      LOG.info("Sent workers commit trigger with commit-id={}", commitState.currentCommitId().toString());
-
+      LOG.info(
+          "Sent workers commit trigger with commit-id={}", commitState.currentCommitId().toString());
     }
 
     consumeAvailable(POLL_DURATION, this::receive);
@@ -139,7 +140,10 @@ public class Coordinator extends Channel implements AutoCloseable {
 
   private void commit(boolean partialCommit) {
     try {
-      LOG.info("Processing commit after responses for {}, isPartialCommit {}",commitState.currentCommitId(), partialCommit);
+      LOG.info(
+          "Processing commit after responses for {}, isPartialCommit {}",
+          commitState.currentCommitId(),
+          partialCommit);
       doCommit(partialCommit);
     } catch (Exception e) {
       LOG.warn("Commit failed, will try again next cycle", e);
@@ -153,9 +157,12 @@ public class Coordinator extends Channel implements AutoCloseable {
 
     LOG.info("Commiting the following commits:");
 
-    commitMap.forEach((t, m) -> m.forEach((id, events) -> {
-      LOG.info("Commiting {} events at id {} for table {}", events.size(), id, t.toString());
-    }));
+    commitMap.forEach(
+        (t, m) ->
+            m.forEach(
+                (id, events) -> {
+                  LOG.info("Commiting {} events at id {} for table {}", events.size(), id, t.toString());
+                }));
 
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
@@ -197,18 +204,13 @@ public class Coordinator extends Channel implements AutoCloseable {
    * commit land in a later snapshot (with a higher sequence number) than the data files they must
    * remove.
    *
-   * <p><b>Offsets/vtts watermark:</b> the offsets watermark ({@code offsetsJson}) and {@code vtts}
-   * are the finalized high-watermark for the ENTIRE batch (computed once in {@link #doCommit}
-   * before this loop runs). They are written on the summary of EVERY per-commit-id snapshot, not
-   * just the last one. This is required for correctness: each per-commit-id snapshot becomes
-   * durable in Iceberg as soon as it is committed, so if the coordinator crashes / rebalances
-   * after an earlier snapshot but before the final one, that earlier snapshot must already carry a
-   * watermark that covers its data. Otherwise, on restart the source consumer would rewind to
-   * before the batch (the control-group offsets were never committed) and re-write the
-   * already-committed records, producing identical rows with the same Kafka offset. Because the
-   * watermark is the batch high-watermark, any committed snapshot in the batch carries a watermark
-   * &gt;= all offsets in the batch, so {@link #lastCommittedOffsetsForTable} on restart causes
-   * {@link #commitDataForCommitId} to filter out every already-committed record.
+   * <p>Recovery watermark semantics:
+   *
+   * <ul>
+   *   <li>{@code vtts} is the recovery boundary and is written per-snapshot as a cumulative
+   *       boundary up to and including that snapshot's commit-id.
+   *   <li>{@code offsetsJson} is snapshot metadata for observability/debugging.
+   * </ul>
    *
    * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
    * this batch have been committed:
@@ -229,7 +231,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       TableIdentifier paramTableIdentifier,
       Map<UUID, List<Envelope>> commitsById,
       String offsetsJson,
-      OffsetDateTime vtts) {
+      OffsetDateTime ignoredBatchVtts) {
     Table table;
     TableIdentifier tableIdentifier = paramTableIdentifier;
     Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
@@ -251,43 +253,43 @@ public class Coordinator extends Channel implements AutoCloseable {
       try {
         table.manageSnapshots().createBranch(branch.get(), table.history().get(0).snapshotId()).commit();
 
-        table.newDelete()
-                .toBranch(branch.get())
-                .deleteFromRowFilter(Expressions.alwaysTrue())
-                .commit();
+        table.newDelete().toBranch(branch.get()).deleteFromRowFilter(Expressions.alwaysTrue()).commit();
 
       } catch (IllegalArgumentException ignored) {
         // branch already exists
       }
     }
 
-    // The full set of envelopes for this table across every commit-id. Used for the flag-vote
-    // denominator (tableTopicPartitions) so it is independent of how envelopes happen to be split
-    // across commit-ids.
     List<Envelope> allEnvelopesForTable =
         commitsById.values().stream().flatMap(List::stream).collect(toList());
 
     this.tableTopicPartitions.put(
-            tableIdentifier.toString(),
-            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
-                    .stream()
-                    .filter(tp ->
-                            tp.topic().equals(Deduplicated.extractTopic(allEnvelopesForTable)))
-                    .count())
-                    .sum()
-    );
+        tableIdentifier.toString(),
+        this.members.stream()
+            .mapToInt(
+                desc ->
+                    (int)
+                        desc.assignment().topicPartitions().stream()
+                            .filter(
+                                tp ->
+                                    tp.topic().equals(Deduplicated.extractTopic(allEnvelopesForTable)))
+                            .count())
+            .sum());
 
-    // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
-    // NOT draining them until all data snapshots for this table are committed.
-    //
-    // The offsets/vtts watermark is written on EVERY snapshot (not just the last). See the method
-    // javadoc: this closes the crash window that otherwise leaves an earlier snapshot durable
-    // without a covering watermark, which caused same-offset duplicate rows on restart.
     List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
     int lastIdx = commitIdsInOrder.size() - 1;
+    OffsetDateTime cumulativeVtts = null;
+
     for (int i = 0; i <= lastIdx; i++) {
       UUID commitId = commitIdsInOrder.get(i);
       List<Envelope> envelopes = commitsById.get(commitId);
+
+      OffsetDateTime commitVtts = maxVttsFromEnvelopes(envelopes);
+      if (commitVtts != null) {
+        cumulativeVtts =
+            cumulativeVtts == null || commitVtts.isAfter(cumulativeVtts) ? commitVtts : cumulativeVtts;
+      }
+
       commitDataForCommitId(
           table,
           tableIdentifier,
@@ -295,24 +297,24 @@ public class Coordinator extends Channel implements AutoCloseable {
           commitId,
           envelopes,
           offsetsJson,
-          vtts);
+          cumulativeVtts);
     }
 
-    // Now that all data is committed, process any flags that became ready, exactly once.
     Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
     if (!readyFlags.isEmpty()) {
       processFlagMessages(table, readyFlags);
       LOG.info(
-              "Flags processed for table {} in commit {}, sending per-table resume signal",
-              paramTableIdentifier, commitState.currentCommitId());
+          "Flags processed for table {} in commit {}, sending per-table resume signal",
+          paramTableIdentifier,
+          commitState.currentCommitId());
       Event flagSentinel =
-              new Event(
-                      config.controlGroupId(),
-                      new CommitToTable(
-                              FLAG_PROCESSED_SENTINEL_ID,
-                              TableReference.of(config.catalogName(), paramTableIdentifier),
-                              0L,
-                              null));
+          new Event(
+              config.controlGroupId(),
+              new CommitToTable(
+                  FLAG_PROCESSED_SENTINEL_ID,
+                  TableReference.of(config.catalogName(), paramTableIdentifier),
+                  0L,
+                  null));
       send(flagSentinel);
     }
   }
@@ -321,10 +323,9 @@ public class Coordinator extends Channel implements AutoCloseable {
    * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
    * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes.
    *
-   * <p>The offsets/vtts watermark is always written on this snapshot's summary (when non-null),
-   * because every per-commit-id snapshot in a batch must carry a covering watermark so that a
-   * crash/rebalance after this snapshot cannot lead to the same records being re-written on
-   * restart. See {@link #commitToTable} for the full rationale.
+   * <p>{@code offsetsJson} is snapshot metadata for observability/debugging.
+   *
+   * <p>{@code vtts} is the recovery watermark and should be cumulative up to this commit-id.
    */
   private void commitDataForCommitId(
       Table table,
@@ -346,20 +347,15 @@ public class Coordinator extends Channel implements AutoCloseable {
             .collect(toList());
 
     List<DataFile> dataFiles =
-        Deduplicated.dataFiles(commitId, tableIdentifier, filteredEnvelopeList)
-            .stream()
+        Deduplicated.dataFiles(commitId, tableIdentifier, filteredEnvelopeList).stream()
             .filter(dataFile -> dataFile.recordCount() > 0)
             .collect(toList());
 
     List<DeleteFile> deleteFiles =
-        Deduplicated.deleteFiles(
-                commitId, tableIdentifier, filteredEnvelopeList)
-            .stream()
+        Deduplicated.deleteFiles(commitId, tableIdentifier, filteredEnvelopeList).stream()
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    // Accumulate flag votes for this commit-id; draining/processing happens once in commitToTable
-    // after all commit-ids' data has been committed.
     accumulateFlagVotes(commitId, tableIdentifier, filteredEnvelopeList);
 
     if (dataFiles.isEmpty() && deleteFiles.isEmpty()) {
@@ -371,8 +367,7 @@ public class Coordinator extends Channel implements AutoCloseable {
       Transaction transaction = table.newTransaction();
 
       Map<Integer, List<DataFile>> filesBySpec =
-          dataFiles.stream()
-              .collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
+          dataFiles.stream().collect(Collectors.groupingBy(DataFile::specId, Collectors.toList()));
 
       List<List<DataFile>> list = Lists.newArrayList(filesBySpec.values());
       int lastIdx = list.size() - 1;
@@ -415,10 +410,7 @@ public class Coordinator extends Channel implements AutoCloseable {
         new Event(
             config.controlGroupId(),
             new CommitToTable(
-                commitId,
-                TableReference.of(config.catalogName(), tableIdentifier),
-                snapshotId,
-                vtts));
+                commitId, TableReference.of(config.catalogName(), tableIdentifier), snapshotId, vtts));
     send(event);
 
     LOG.info(
@@ -429,9 +421,32 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  private void accumulateFlagVotes(UUID commitId, TableIdentifier tableIdentifier, List<Envelope> envelopes) {
+  private OffsetDateTime maxVttsFromEnvelopes(List<Envelope> envelopes) {
+    OffsetDateTime max = null;
+    for (Envelope envelope : envelopes) {
+      if (envelope.event().type() != org.apache.iceberg.connect.events.PayloadType.DATA_COMPLETE) {
+        continue;
+      }
+
+      if (!(envelope.event().payload() instanceof DataComplete)) {
+        continue;
+      }
+
+      DataComplete complete = (DataComplete) envelope.event().payload();
+      for (TopicPartitionOffset tpo : complete.assignments()) {
+        OffsetDateTime ts = tpo.timestamp();
+        if (ts != null && (max == null || ts.isAfter(max))) {
+          max = ts;
+        }
+      }
+    }
+    return max;
+  }
+
+  private void accumulateFlagVotes(
+      UUID commitId, TableIdentifier tableIdentifier, List<Envelope> envelopes) {
     Map<String, Set<Integer>> partitionsThisCycle =
-            Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
+        Deduplicated.flagMessageSourcePartitions(envelopes, this.config.flagTypeField());
     LOG.debug("Accumulating {} flags", partitionsThisCycle.size());
 
     if (partitionsThisCycle.isEmpty()) {
@@ -439,33 +454,46 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     Map<String, Pair<TableContext, Map<String, Object>>> dataThisCycle =
-            Deduplicated.flagMessages(commitId, tableIdentifier,
-                    envelopes, this.config.branchesDelimiter(), this.config.flagTypeField());
+        Deduplicated.flagMessages(
+            commitId,
+            tableIdentifier,
+            envelopes,
+            this.config.branchesDelimiter(),
+            this.config.flagTypeField());
 
     Map<String, Set<Integer>> votes =
-            pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
+        pendingFlagVotes.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
     Map<String, Pair<TableContext, Map<String, Object>>> data =
-            pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
+        pendingFlagData.computeIfAbsent(tableIdentifier, k -> Maps.newHashMap());
 
-    partitionsThisCycle.forEach((type, newPartitions) -> {
-      Set<Integer> accumulated =
-              votes.computeIfAbsent(type, k -> new HashSet<>());
-      accumulated.addAll(newPartitions);
-      data.putIfAbsent(type, dataThisCycle.get(type));
-      LOG.info("Flag '{}' for table {}: accumulated {}/{} unique partition votes (partitions: {})",
-              type, tableIdentifier, accumulated.size(), tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3) , accumulated);
-    });
+    partitionsThisCycle.forEach(
+        (type, newPartitions) -> {
+          Set<Integer> accumulated = votes.computeIfAbsent(type, k -> new HashSet<>());
+          accumulated.addAll(newPartitions);
+          data.putIfAbsent(type, dataThisCycle.get(type));
+          LOG.info(
+              "Flag '{}' for table {}: accumulated {}/{} unique partition votes (partitions: {})",
+              type,
+              tableIdentifier,
+              accumulated.size(),
+              tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3),
+              accumulated);
+        });
   }
 
   private Map<String, Pair<TableContext, Map<String, Object>>> drainReadyFlags(
-          TableIdentifier tableIdentifier) {
+      TableIdentifier tableIdentifier) {
     Map<String, Set<Integer>> votes =
-            pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
+        pendingFlagVotes.getOrDefault(tableIdentifier, Maps.newHashMap());
     Map<String, Pair<TableContext, Map<String, Object>>> data =
-            pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
+        pendingFlagData.getOrDefault(tableIdentifier, Maps.newHashMap());
 
-    List<String> readyTypes = votes.entrySet().stream()
-            .filter(e -> e.getValue().size() >= tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3))
+    List<String> readyTypes =
+        votes.entrySet().stream()
+            .filter(
+                e ->
+                    e.getValue().size()
+                        >= tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3))
             .map(Map.Entry::getKey)
             .collect(toList());
 
@@ -474,105 +502,131 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
 
     Map<String, Pair<TableContext, Map<String, Object>>> ready = Maps.newHashMap();
-    readyTypes.forEach(type -> {
-      ready.put(type, data.remove(type));
-      votes.remove(type);
-      LOG.info("Flag '{}' for table {} ready: all {} source partitions have reported it",
-              type, tableIdentifier, tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3));
-    });
+    readyTypes.forEach(
+        type -> {
+          ready.put(type, data.remove(type));
+          votes.remove(type);
+          LOG.info(
+              "Flag '{}' for table {} ready: all {} source partitions have reported it",
+              type,
+              tableIdentifier,
+              tableTopicPartitions.getOrDefault(tableIdentifier.toString(), 3));
+        });
     return ready;
   }
 
-  private void processFlagMessages(Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
-    flagMessages.forEach((type, flagEntry) -> {
-      TableContext flagMessage = flagEntry.first();
-      Map<String, Object> flagEnvelope = flagEntry.second();
-      @SuppressWarnings("unchecked")
-      Map<String, Object> flagRecord = flagEnvelope.get("value") instanceof Map
-              ? (Map<String, Object>) flagEnvelope.get("value")
-              : flagEnvelope;
-      LOG.debug("About to process flag of type {} for: {}", type, flagMessage.tableIdentifier().toString());
+  private void processFlagMessages(
+      Table table, Map<String, Pair<TableContext, Map<String, Object>>> flagMessages) {
+    flagMessages.forEach(
+        (type, flagEntry) -> {
+          TableContext flagMessage = flagEntry.first();
+          Map<String, Object> flagEnvelope = flagEntry.second();
+          @SuppressWarnings("unchecked")
+          Map<String, Object> flagRecord =
+              flagEnvelope.get("value") instanceof Map
+                  ? (Map<String, Object>) flagEnvelope.get("value")
+                  : flagEnvelope;
+          LOG.debug(
+              "About to process flag of type {} for: {}",
+              type,
+              flagMessage.tableIdentifier().toString());
 
-      switch (type) {
-        case "END-LOAD":
-          String targetBranch = flagMessage.branch();
-          if (targetBranch != null) {
-            LOG.info("Processing flag message for table {}, switching to branch {}",
-                    table.name(), targetBranch);
+          switch (type) {
+            case "END-LOAD":
+              String targetBranch = flagMessage.branch();
+              if (targetBranch != null) {
+                LOG.info(
+                    "Processing flag message for table {}, switching to branch {}",
+                    table.name(),
+                    targetBranch);
 
+                List<Types.NestedField> pending =
+                    table.schema().columns().stream()
+                        .filter(field -> field.name().endsWith("_pending_type_update"))
+                        .collect(toList());
 
-            List<Types.NestedField> pending = table.schema().columns()
-                    .stream()
-                    .filter(field -> field.name().endsWith("_pending_type_update"))
-                    .collect(toList());
+                if (!pending.isEmpty()) {
+                  UpdateSchema updateSchemaCommit = table.updateSchema();
 
-            if (!pending.isEmpty()) {
-              UpdateSchema updateSchemaCommit = table.updateSchema();
+                  pending.forEach(
+                      field -> {
+                        String original = field.name().split("_pending_type_update")[0];
 
-              pending.forEach(field -> {
-                String original = field.name().split("_pending_type_update")[0];
+                        updateSchemaCommit.deleteColumn(original).renameColumn(field.name(), original);
+                      });
 
-                updateSchemaCommit.deleteColumn(original).renameColumn(field.name(), original);
-              });
+                  try {
+                    updateSchemaCommit.commit();
+                    LOG.info("Successfully updated types for table {}", table.name());
+                  } catch (Exception e) {
+                    LOG.error(
+                        "Failed to update types for table {}. {}", table.name(), e.getMessage());
+                  }
+                }
 
-              try {
-                updateSchemaCommit.commit();
-                LOG.info("Successfully updated types for table {}", table.name());
-              } catch (Exception e) {
-                LOG.error("Failed to update types for table {}. {}", table.name(), e.getMessage());
+                try {
+                  table
+                      .manageSnapshots()
+                      .setCurrentSnapshot(table.snapshot(targetBranch).snapshotId())
+                      .commit();
+                  table.manageSnapshots().removeBranch(targetBranch).commit();
+                  LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
+                } catch (Exception e) {
+                  LOG.error(
+                      "Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
+                }
               }
-            }
+              break;
+            case "DDL":
+              FlagConfig flagConfig = this.config.flagConfig();
 
-            try {
-              // Forward the branch: set current snapshot to the branch's snapshot
-              // and clear the branch for further use
-              table.manageSnapshots().setCurrentSnapshot(table.snapshot(targetBranch).snapshotId()).commit();
-              table.manageSnapshots().removeBranch(targetBranch).commit();
-              LOG.info("Successfully switched branch for table {} to {}", table.name(), targetBranch);
-            } catch (Exception e) {
-              LOG.error("Failed to switch branch for table {} to {}", table.name(), targetBranch, e);
-            }
+              List<Map<String, Object>> fields =
+                  (List<Map<String, Object>>) flagRecord.get(flagConfig.getFields());
+              List<String> pks =
+                  fields.stream()
+                      .filter(field -> field.get(flagConfig.getKeyFlag()).equals("X"))
+                      .map(field -> field.get(flagConfig.getFieldName()).toString().toLowerCase())
+                      .collect(toList());
+
+              table.updateProperties().set("lakers.id-cols", String.join(",", pks)).commit();
+
+              List<Map<String, Object>> fields_modified =
+                  (List<Map<String, Object>>) flagRecord.get(flagConfig.getFieldsModified());
+
+              if (fields_modified != null && !fields_modified.isEmpty()) {
+                UpdateSchema updateSchemaCommit = table.updateSchema();
+                fields_modified.forEach(
+                    field -> {
+                      LOG.debug(
+                          "{} Modified, value {}, inferred type: {}",
+                          field.get(flagConfig.getFieldName()).toString(),
+                          field.get(flagConfig.getTypeValue()),
+                          SchemaUtils
+                              .inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
+                              .orElse(Types.BinaryType.get()));
+                      updateSchemaCommit.addColumn(
+                          field.get(flagConfig.getFieldName()).toString() + "_pending_type_update",
+                          SchemaUtils
+                              .inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
+                              .orElse(Types.StringType.get()));
+                    });
+
+                updateSchemaCommit.commit();
+              }
+
+              table
+                  .updateProperties()
+                  .set(
+                      "lakers.last-schema-change",
+                      ZonedDateTime.now(ZoneOffset.UTC)
+                          .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS")))
+                  .commit();
+
+              break;
+            default:
+              LOG.error("Couldn't process flag of type {}", type);
           }
-          break;
-        case "DDL":
-          FlagConfig flagConfig = this.config.flagConfig();
-
-          List<Map<String, Object>> fields = (List<Map<String, Object>>) flagRecord.get(flagConfig.getFields());
-          List<String> pks = fields.stream()
-                  .filter(field -> field.get(flagConfig.getKeyFlag()).equals("X"))
-                  .map(field -> field.get(flagConfig.getFieldName()).toString().toLowerCase())
-                  .collect(toList());
-
-          table.updateProperties().set("lakers.id-cols", String.join(",", pks)).commit();
-
-          List<Map<String, Object>> fields_modified = (List<Map<String, Object>>) flagRecord.get(flagConfig.getFieldsModified());
-
-          if (fields_modified != null && !fields_modified.isEmpty()) {
-            UpdateSchema updateSchemaCommit = table.updateSchema();
-            fields_modified.forEach(field -> {
-              LOG.debug("{} Modified, value {}, inferred type: {}",
-                  field.get(flagConfig.getFieldName()).toString(),
-                      field.get(flagConfig.getTypeValue()),
-                  SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config).orElse(Types.BinaryType.get())
-              );
-              updateSchemaCommit.addColumn(
-                      field.get(flagConfig.getFieldName()).toString() + "_pending_type_update",
-                      SchemaUtils.inferIcebergType(field.get(flagConfig.getTypeValue()), this.config)
-                              .orElse(Types.StringType.get())
-              );
-            });
-
-            updateSchemaCommit.commit();
-          }
-
-          table.updateProperties().set("lakers.last-schema-change", ZonedDateTime.now(ZoneOffset.UTC)
-                  .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS"))).commit();
-
-          break;
-        default:
-          LOG.error("Couldn't process flag of type {}", type);
-      }
-    });
+        });
   }
 
   private Snapshot latestSnapshot(Table table, String branch) {

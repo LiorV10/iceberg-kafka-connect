@@ -141,7 +141,6 @@ public class CoordinatorTest extends ChannelTestBase {
 
   @Test
   public void testCommitError() {
-    // this spec isn't registered with the table
     PartitionSpec badPartitionSpec =
         PartitionSpec.builderFor(SCHEMA).withSpecId(1).identity("id").build();
     DataFile badDataFile =
@@ -157,7 +156,6 @@ public class CoordinatorTest extends ChannelTestBase {
         ImmutableList.of(),
         OffsetDateTime.ofInstant(Instant.ofEpochMilli(0L), ZoneOffset.UTC));
 
-    // no commit messages sent
     assertThat(producer.history()).hasSize(1);
     assertThat(consumer.committed(ImmutableSet.of(CTL_TOPIC_PARTITION)))
         .isEqualTo(ImmutableMap.of());
@@ -181,12 +179,12 @@ public class CoordinatorTest extends ChannelTestBase {
                           StructType.of(),
                           currentCommitId,
                           new TableReference("catalog", ImmutableList.of("db"), "tbl"),
-                          ImmutableList.of(dataFile, dataFile), // duplicated data files
+                          ImmutableList.of(dataFile, dataFile),
                           ImmutableList.of()));
 
               return ImmutableList.of(
                   commitResponse,
-                  commitResponse, // duplicate commit response
+                  commitResponse,
                   new Event(
                       config.controlGroupId(),
                       new DataComplete(
@@ -222,11 +220,11 @@ public class CoordinatorTest extends ChannelTestBase {
                           currentCommitId,
                           new TableReference("catalog", ImmutableList.of("db"), "tbl"),
                           ImmutableList.of(),
-                          ImmutableList.of(deleteFile, deleteFile))); // duplicate delete files
+                          ImmutableList.of(deleteFile, deleteFile)));
 
               return ImmutableList.of(
                   duplicateCommitResponse,
-                  duplicateCommitResponse, // duplicate commit response
+                  duplicateCommitResponse,
                   new Event(
                       config.controlGroupId(),
                       new DataComplete(
@@ -263,30 +261,16 @@ public class CoordinatorTest extends ChannelTestBase {
             .collect(Collectors.toSet()));
   }
 
-  /**
-   *
-   *
-   * <ul>
-   *   <li>Sets up an empty table with 2 partition specs
-   *   <li>Starts a coordinator with 2 worker assignment each handling a different topic-partition
-   *   <li>Sends a commit request to workers
-   *   <li>Each worker writes datafiles with a different partition spec
-   *   <li>The coordinator receives datafiles from both workers eventually and commits them to the
-   *       table
-   * </ul>
-   */
   @Test
   public void testCommitMultiPartitionSpecAppendDataFiles() {
     final PartitionSpec spec1 = table.spec();
     assert spec1.isUnpartitioned();
 
-    // evolve spec to partition by date
     final PartitionSpec partitionByDate = PartitionSpec.builderFor(SCHEMA).identity("date").build();
     table.updateSpec().addField(partitionByDate.fields().get(0).name()).commit();
     final PartitionSpec spec2 = table.spec();
     assert spec2.isPartitioned();
 
-    // pretend we have two workers each handling 1 topic partition
     final List<MemberDescription> members = Lists.newArrayList();
     for (int i : ImmutableList.of(0, 1)) {
       members.add(
@@ -300,23 +284,19 @@ public class CoordinatorTest extends ChannelTestBase {
     final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory, null);
     initConsumer();
 
-    // start a new commit immediately and wait for all workers to respond infinitely
     when(config.commitIntervalMs()).thenReturn(0);
     when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
     coordinator.process();
 
-    // retrieve commitId from commit request produced by coordinator
     final byte[] bytes = producer.history().get(0).value();
     final Event commitRequest = AvroUtil.decode(bytes);
     assert commitRequest.type().equals(PayloadType.START_COMMIT);
     final UUID commitId = ((StartCommit) commitRequest.payload()).commitId();
 
-    // each worker sends its responses for the commit request
     Map<Integer, PartitionSpec> workerIdToSpecMap =
         ImmutableMap.of(
-            1, spec1, // worker 1 produces datafiles with the old partition spec
-            2, spec2 // worker 2 produces datafiles with the new partition spec
-            );
+            1, spec1,
+            2, spec2);
 
     int currentControlTopicOffset = 1;
     for (Map.Entry<Integer, PartitionSpec> entry : workerIdToSpecMap.entrySet()) {
@@ -368,10 +348,8 @@ public class CoordinatorTest extends ChannelTestBase {
       currentControlTopicOffset += 1;
     }
 
-    // all workers have responded so coordinator can process responses now
     coordinator.process();
 
-    // assertions
     table.refresh();
     final List<Snapshot> snapshots = ImmutableList.copyOf(table.snapshots());
     Assertions.assertEquals(2, snapshots.size(), "Expected 2 snapshots, one for each spec.");
@@ -386,12 +364,14 @@ public class CoordinatorTest extends ChannelTestBase {
         commitId.toString(),
         firstSnapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP),
         "All snapshots should be tagged with a commit-id");
-    Assertions.assertNull(
-        firstSnapshot.summary().getOrDefault(OFFSETS_SNAPSHOT_PROP, null),
-        "Earlier snapshots should not include control-topic-offsets in their summary");
-    Assertions.assertNull(
-        firstSnapshot.summary().getOrDefault(VTTS_SNAPSHOT_PROP, null),
-        "Earlier snapshots should not include vtts in their summary");
+    Assertions.assertEquals(
+        "{\"0\":5}",
+        firstSnapshot.summary().get(OFFSETS_SNAPSHOT_PROP),
+        "Offsets metadata should be present on each snapshot");
+    Assertions.assertEquals(
+        "100",
+        firstSnapshot.summary().get(VTTS_SNAPSHOT_PROP),
+        "Each snapshot should carry cumulative VTTS recovery watermark");
 
     Assertions.assertEquals(
         commitId.toString(),
@@ -400,11 +380,11 @@ public class CoordinatorTest extends ChannelTestBase {
     Assertions.assertEquals(
         "{\"0\":5}",
         secondSnapshot.summary().get(OFFSETS_SNAPSHOT_PROP),
-        "Only the most recent snapshot should include control-topic-offsets in it's summary");
+        "Offsets metadata should be present on each snapshot");
     Assertions.assertEquals(
         "100",
         secondSnapshot.summary().get(VTTS_SNAPSHOT_PROP),
-        "Only the most recent snapshot should include vtts in it's summary");
+        "Each snapshot should carry cumulative VTTS recovery watermark");
   }
 
   private void assertCommitTable(int idx, UUID commitId, OffsetDateTime ts) {
@@ -427,8 +407,7 @@ public class CoordinatorTest extends ChannelTestBase {
     assertThat(commitCompletePayload.validThroughTs()).isEqualTo(ts);
   }
 
-  private UUID coordinatorTest(
-      List<DataFile> dataFiles, List<DeleteFile> deleteFiles, OffsetDateTime ts) {
+  private UUID coordinatorTest(List<DataFile> dataFiles, List<DeleteFile> deleteFiles, OffsetDateTime ts) {
     return coordinatorTest(
         currentCommitId -> {
           Event commitResponse =
@@ -458,7 +437,6 @@ public class CoordinatorTest extends ChannelTestBase {
 
     Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory, null);
 
-    // init consumer after subscribe()
     initConsumer();
 
     coordinator.process();
