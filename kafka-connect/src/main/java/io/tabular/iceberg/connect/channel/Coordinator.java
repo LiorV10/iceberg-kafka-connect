@@ -165,13 +165,12 @@ public class Coordinator extends Channel implements AutoCloseable {
       LOG.info("Commiting {} events at id {} for table {}", events.size(), id, t.toString());
     }));
 
-    String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
 
     Tasks.foreach(commitMap.entrySet())
         .executeWith(exec)
         .stopOnFailure()
-        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts));
+        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), vtts));
 
     // we should only get here if all tables committed successfully...
     commitConsumerOffsets();
@@ -188,9 +187,9 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
-  private String offsetsJson() {
+  private String offsetsJson(Map<Integer, Long> offsets) {
     try {
-      return MAPPER.writeValueAsString(controlTopicOffsets());
+      return MAPPER.writeValueAsString(offsets);
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }
@@ -233,7 +232,10 @@ public class Coordinator extends Channel implements AutoCloseable {
    * first-seen (chronological) order (see {@link CommitState#tableCommitMap()}). Each commit-id is
    * committed as its OWN Iceberg snapshot, oldest first, so that equality deletes from a later
    * commit land in a later snapshot (with a higher sequence number) than the data files they must
-   * remove. Only the LAST (newest) commit-id records the offsets/vtts watermark.
+   * remove. Each commit-id's snapshot records the offsets watermark accumulated up to (and
+   * including) that commit-id, so a mid-batch failure leaves every already-committed snapshot with a
+   * correct watermark for recovery. The vtts watermark stays batch-wide and is written on the last
+   * snapshot only.
    *
    * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
    * this batch have been committed:
@@ -255,7 +257,6 @@ public class Coordinator extends Channel implements AutoCloseable {
   private void commitToTable(
       TableIdentifier paramTableIdentifier,
       Map<UUID, List<Envelope>> commitsById,
-      String offsetsJson,
       OffsetDateTime vtts) {
     Table table;
     TableIdentifier tableIdentifier = paramTableIdentifier;
@@ -319,10 +320,20 @@ public class Coordinator extends Channel implements AutoCloseable {
     // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
     // NOT draining them until all data snapshots for this table are committed.
     List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
+    // Control-topic offsets accumulated across the commit-ids in this batch, folded in as we iterate
+    // oldest first. Each snapshot records the watermark up to (and including) its commit-id.
+    Map<Integer, Long> accumulatedOffsets = Maps.newHashMap();
     int lastIdx = commitIdsInOrder.size() - 1;
     for (int i = 0; i <= lastIdx; i++) {
       UUID commitId = commitIdsInOrder.get(i);
       List<Envelope> envelopes = commitsById.get(commitId);
+
+      // Fold this commit-id's control-topic offsets into the running watermark. The consumer stores
+      // the offset of the NEXT record to consume, so use offset + 1 (see Channel.consumeAvailable).
+      for (Envelope envelope : envelopes) {
+        accumulatedOffsets.merge(envelope.partition(), envelope.offset() + 1, Math::max);
+      }
+
       commitDataForCommitId(
           table,
           flagStore,
@@ -330,7 +341,7 @@ public class Coordinator extends Channel implements AutoCloseable {
           branch,
           commitId,
           envelopes,
-          i == lastIdx ? offsetsJson : null,
+          offsetsJson(accumulatedOffsets),
           i == lastIdx ? vtts : null);
     }
 
@@ -357,8 +368,9 @@ public class Coordinator extends Channel implements AutoCloseable {
   /**
    * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
    * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes. The
-   * offsets/vtts watermark is written on this snapshot only when {@code offsetsJson}/{@code vtts}
-   * are non-null, which the caller arranges for the last (newest) commit-id only.
+   * offsets watermark is written on this snapshot whenever {@code offsetsJson} is non-null (the
+   * caller passes the accumulative watermark up to this commit-id for every commit-id); {@code vtts}
+   * is only non-null for the last (newest) commit-id.
    */
   private void commitDataForCommitId(
       Table table,
