@@ -169,11 +169,29 @@ public abstract class Channel {
   }
 
   protected void commitConsumerOffsets() {
+    commitConsumerOffsets(controlTopicOffsets());
+  }
+
+  /**
+   * Commits the supplied control-topic consumer offsets.
+   *
+   * <p>The map is keyed by control-topic partition and the value is the offset of the NEXT record
+   * to consume for that partition (i.e. already {@code record.offset() + 1}, consistent with how
+   * {@link #controlTopicOffsets()} is populated in {@link #consumeAvailable}). Committing a subset
+   * of partitions/offsets lets the coordinator advance the consumer position incrementally, e.g.
+   * once per commit-id, so that a crash midway through a multi-commit-id cycle does not force
+   * already-committed commit-ids to be reprocessed on restart.
+   *
+   * @param offsets control-topic partition to next-offset map to commit; a no-op if empty
+   */
+  protected void commitConsumerOffsets(Map<Integer, Long> offsets) {
+    if (offsets.isEmpty()) {
+      return;
+    }
     Map<TopicPartition, OffsetAndMetadata> offsetsToCommit = Maps.newHashMap();
-    controlTopicOffsets()
-        .forEach(
-            (k, v) ->
-                offsetsToCommit.put(new TopicPartition(controlTopic, k), new OffsetAndMetadata(v)));
+    offsets.forEach(
+        (k, v) ->
+            offsetsToCommit.put(new TopicPartition(controlTopic, k), new OffsetAndMetadata(v)));
     consumer.commitSync(offsetsToCommit);
   }
 
