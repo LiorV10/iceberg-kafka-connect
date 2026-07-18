@@ -326,10 +326,10 @@ public class Coordinator extends Channel implements AutoCloseable {
     // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
     // NOT draining them until all data snapshots for this table are committed. Each commit-id's
     // snapshot records an ACCUMULATIVE offsets/vtts watermark up to (and including) that commit-id.
-List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
-// Running control-topic offset watermark, folded across commit-ids as we iterate oldest first.
-Map<Integer, Long> accumulatedOffsets =
-    Maps.newHashMap(lastCommittedOffsetsForTable(table, branch.orElse(null)));
+    List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
+    // Running control-topic offset watermark, folded across commit-ids as we iterate oldest first.
+    Map<Integer, Long> accumulatedOffsets =
+        Maps.newHashMap(lastCommittedOffsetsForTable(table, branch.orElse(null)));
     int lastIdx = commitIdsInOrder.size() - 1;
     for (int i = 0; i <= lastIdx; i++) {
       UUID commitId = commitIdsInOrder.get(i);
