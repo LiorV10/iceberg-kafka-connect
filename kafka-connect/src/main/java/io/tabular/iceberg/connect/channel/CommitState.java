@@ -20,14 +20,18 @@ package io.tabular.iceberg.connect.channel;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import java.time.OffsetDateTime;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.DataComplete;
 import org.apache.iceberg.connect.events.DataWritten;
@@ -174,16 +178,39 @@ public class CommitState {
   }
 
   public OffsetDateTime vtts(boolean partialCommit) {
+    return vttsForReady(readyBuffer, partialCommit);
+  }
+
+  /**
+   * Computes the vtts (valid-through timestamp) watermark accumulatively up to and including the
+   * given commit-ids, i.e. over the subset of buffered {@link DataComplete} payloads whose commit-id
+   * is contained in {@code commitIds}.
+   *
+   * <p>This is used so that each per-commit-id snapshot records a vtts that reflects only the data
+   * committed so far (this commit-id and all earlier ones in the batch), rather than the batch-wide
+   * vtts. As with {@link #vtts(boolean)}, if any partition in the considered subset reports a null
+   * timestamp the vtts is null.
+   */
+  public OffsetDateTime vttsUpTo(Collection<UUID> commitIds, boolean partialCommit) {
+    Set<UUID> ids = new HashSet<>(commitIds);
+    List<DataComplete> subset =
+        readyBuffer.stream()
+            .filter(payload -> ids.contains(payload.commitId()))
+            .collect(Collectors.toList());
+    return vttsForReady(subset, partialCommit);
+  }
+
+  private OffsetDateTime vttsForReady(List<DataComplete> ready, boolean partialCommit) {
     boolean validVtts =
         !partialCommit
-            && readyBuffer.stream()
+            && ready.stream()
                 .flatMap(event -> event.assignments().stream())
                 .allMatch(offset -> offset.timestamp() != null);
 
       OffsetDateTime result;
       if (validVtts) {
           Optional<OffsetDateTime> maybeResult =
-                  readyBuffer.stream()
+                  ready.stream()
                           .flatMap(event -> event.assignments().stream())
                           .map(TopicPartitionOffset::timestamp)
                           .min(dateTimeComparator);
