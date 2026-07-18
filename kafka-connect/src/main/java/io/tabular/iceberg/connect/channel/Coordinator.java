@@ -148,6 +148,28 @@ public class Coordinator extends Channel implements AutoCloseable {
     }
   }
 
+  /**
+   * Commits all buffered work for this cycle.
+   *
+   * <p>The commit map holds, per table, the envelopes for each commit-id in first-seen
+   * (chronological) order (see {@link CommitState#tableCommitMap()}). This method iterates
+   * <b>commit-id</b> as the OUTER loop, oldest-first. For each commit-id it commits that commit-id's
+   * snapshot to <b>every</b> relevant table (in parallel on the worker pool), and only once that
+   * commit-id is durably committed everywhere does it advance the control-topic consumer offsets up
+   * to that commit-id's watermark.
+   *
+   * <p>Consumer offsets are committed on the coordinator thread here (NOT from the worker threads):
+   * {@link org.apache.kafka.clients.consumer.KafkaConsumer} is not thread-safe, so it must only be
+   * touched from the single thread that drives {@link #process()}. Advancing offsets only after a
+   * commit-id is durable across ALL tables also means the (global, per control-topic-partition)
+   * offset watermark never runs ahead of any table's uncommitted data, so a crash cannot skip
+   * records (no data loss). And because offsets advance incrementally per commit-id, a crash midway
+   * through a multi-commit-id cycle resumes just past the last fully-committed commit-id, so
+   * already-committed data is not re-committed (which would otherwise surface as duplicate rows).
+   *
+   * <p>Flags are still processed exactly once per table, AFTER all commit-ids' data has been
+   * committed, since a flag broadcast's votes may be spread across multiple commit-ids.
+   */
   private void doCommit(boolean partialCommit) {
     Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap = commitState.tableCommitMap();
 
@@ -160,12 +182,80 @@ public class Coordinator extends Channel implements AutoCloseable {
     String offsetsJson = offsetsJson();
     OffsetDateTime vtts = commitState.vtts(partialCommit);
 
-    Tasks.foreach(commitMap.entrySet())
-        .executeWith(exec)
-        .stopOnFailure()
-        .run(entry -> commitToTable(entry.getKey(), entry.getValue(), offsetsJson, vtts));
+    // Resolve per-table state (branch, table load, branch auto-create, flag-vote denominator) once
+    // up front so the per-commit-id loop below only has to commit data.
+    Map<TableIdentifier, TableCommitContext> contexts = prepareTableContexts(commitMap);
 
-    // we should only get here if all tables committed successfully...
+    // Global chronological order of commit-ids across all tables (union preserving first-seen
+    // order). Committing (and advancing offsets) in this order keeps oldest-first semantics.
+    List<UUID> commitIdsInOrder = orderedCommitIds(commitMap);
+    int lastIdx = commitIdsInOrder.size() - 1;
+
+    for (int i = 0; i <= lastIdx; i++) {
+      UUID commitId = commitIdsInOrder.get(i);
+      boolean isLast = i == lastIdx;
+
+      // Only the last (newest) commit-id records the offsets/vtts watermark as an Iceberg snapshot
+      // property (matching prior behavior); the consumer-offset watermark is advanced after EVERY
+      // commit-id below.
+      String commitOffsetsJson = isLast ? offsetsJson : null;
+      OffsetDateTime commitVtts = isLast ? vtts : null;
+
+      // Commit this commit-id's data to every table that has data for it, in parallel. Worker
+      // threads only touch Iceberg here -- never the Kafka consumer.
+      List<TableCommitContext> tablesForCommitId =
+          contexts.values().stream()
+              .filter(ctx -> ctx.commitsById.containsKey(commitId))
+              .collect(toList());
+
+      Tasks.foreach(tablesForCommitId)
+          .executeWith(exec)
+          .stopOnFailure()
+          .run(
+              ctx ->
+                  commitDataForCommitId(
+                      ctx.table,
+                      ctx.tableIdentifier,
+                      ctx.branch,
+                      commitId,
+                      ctx.commitsById.get(commitId),
+                      commitOffsetsJson,
+                      commitVtts));
+
+      // We only reach here if this commit-id committed successfully to every relevant table, so it
+      // is now durable in Iceberg. Advance the control-topic consumer offsets up to this commit-id's
+      // global watermark. This runs on the coordinator thread (thread-safe consumer access) and only
+      // for a fully-committed commit-id (no skip/data-loss). A crash after this point resumes past
+      // this commit-id and will not re-drive it.
+      Map<Integer, Long> commitIdOffsets = controlTopicOffsetsForCommitId(commitMap, commitId);
+      commitConsumerOffsets(commitIdOffsets);
+      LOG.info("Committed consumer offsets {} after commit-id {}", commitIdOffsets, commitId);
+    }
+
+    // Now that all data is committed, process any flags that became ready, exactly once per table.
+    contexts.forEach(
+        (tableIdentifier, ctx) -> {
+          Map<String, Pair<TableContext, Map<String, Object>>> readyFlags =
+              drainReadyFlags(tableIdentifier);
+          if (!readyFlags.isEmpty()) {
+            processFlagMessages(ctx.table, readyFlags);
+            LOG.info(
+                "Flags processed for table {} in commit {}, sending per-table resume signal",
+                ctx.paramTableIdentifier, commitState.currentCommitId());
+            Event flagSentinel =
+                new Event(
+                    config.controlGroupId(),
+                    new CommitToTable(
+                        FLAG_PROCESSED_SENTINEL_ID,
+                        TableReference.of(config.catalogName(), ctx.paramTableIdentifier),
+                        0L,
+                        null));
+            send(flagSentinel);
+          }
+        });
+
+    // Final high-watermark commit so control records that carried no committable data (e.g. the
+    // StartCommit / DataComplete control events themselves) are also acknowledged.
     commitConsumerOffsets();
     commitState.clearResponses();
 
@@ -180,6 +270,132 @@ public class Coordinator extends Channel implements AutoCloseable {
         vtts);
   }
 
+  /**
+   * Resolves the global chronological order of commit-ids across all tables. Each table's inner map
+   * preserves first-seen (chronological) order; unioning while preserving encounter order (via a
+   * {@link LinkedHashSet}) yields a stable oldest-first ordering.
+   */
+  private List<UUID> orderedCommitIds(Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap) {
+    Set<UUID> ordered = new LinkedHashSet<>();
+    commitMap.values().forEach(byId -> ordered.addAll(byId.keySet()));
+    return new ArrayList<>(ordered);
+  }
+
+  /**
+   * Computes the control-topic consumer offset watermark (per control-topic partition) for a single
+   * commit-id, as the max {@code envelope.offset() + 1} across EVERY table's envelopes for that
+   * commit-id. The {@code +1} matches the "next offset to consume" semantics used when populating
+   * {@link #controlTopicOffsets()} in {@link #consumeAvailable}.
+   */
+  private Map<Integer, Long> controlTopicOffsetsForCommitId(
+      Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap, UUID commitId) {
+    Map<Integer, Long> offsets = Maps.newHashMap();
+    commitMap
+        .values()
+        .forEach(
+            byId -> {
+              List<Envelope> envelopes = byId.get(commitId);
+              if (envelopes != null) {
+                envelopes.forEach(
+                    envelope ->
+                        offsets.merge(envelope.partition(), envelope.offset() + 1, Math::max));
+              }
+            });
+    return offsets;
+  }
+
+  private Map<TableIdentifier, TableCommitContext> prepareTableContexts(
+      Map<TableIdentifier, Map<UUID, List<Envelope>>> commitMap) {
+    Map<TableIdentifier, TableCommitContext> contexts = new LinkedHashMap<>();
+    commitMap.forEach(
+        (paramTableIdentifier, commitsById) -> {
+          TableIdentifier tableIdentifier = paramTableIdentifier;
+          Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
+
+          if (this.config.dynamicBranchesEnabled()) {
+            TableContext tableContext =
+                TableContext.parse(tableIdentifier, this.config.branchesDelimiter());
+            tableIdentifier = tableContext.tableIdentifier();
+            branch = Optional.ofNullable(tableContext.branch());
+          }
+
+          Table table;
+          try {
+            table = catalog.loadTable(tableIdentifier);
+          } catch (NoSuchTableException e) {
+            LOG.warn("Table not found, skipping commit: {}", tableIdentifier);
+            return;
+          }
+
+          if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
+            try {
+              table
+                  .manageSnapshots()
+                  .createBranch(branch.get(), table.history().get(0).snapshotId())
+                  .commit();
+
+              table
+                  .newDelete()
+                  .toBranch(branch.get())
+                  .deleteFromRowFilter(Expressions.alwaysTrue())
+                  .commit();
+
+            } catch (IllegalArgumentException ignored) {
+              // branch already exists
+            }
+          }
+
+          // The full set of envelopes for this table across every commit-id. Used for the
+          // flag-vote denominator (tableTopicPartitions) so it is independent of how envelopes
+          // happen to be split across commit-ids.
+          List<Envelope> allEnvelopesForTable =
+              commitsById.values().stream().flatMap(List::stream).collect(toList());
+
+          this.tableTopicPartitions.put(
+              tableIdentifier.toString(),
+              this.members.stream()
+                  .mapToInt(
+                      desc ->
+                          (int)
+                              desc.assignment().topicPartitions().stream()
+                                  .filter(
+                                      tp ->
+                                          tp.topic()
+                                              .equals(
+                                                  Deduplicated.extractTopic(allEnvelopesForTable)))
+                                  .count())
+                  .sum());
+
+          contexts.put(
+              tableIdentifier,
+              new TableCommitContext(
+                  paramTableIdentifier, tableIdentifier, table, branch, commitsById));
+        });
+    return contexts;
+  }
+
+  /** Per-table state resolved once up-front and reused across the per-commit-id loop. */
+  private static final class TableCommitContext {
+    private final TableIdentifier paramTableIdentifier;
+    private final TableIdentifier tableIdentifier;
+    private final Table table;
+    private final Optional<String> branch;
+    private final Map<UUID, List<Envelope>> commitsById;
+
+    private TableCommitContext(
+        TableIdentifier paramTableIdentifier,
+        TableIdentifier tableIdentifier,
+        Table table,
+        Optional<String> branch,
+        Map<UUID, List<Envelope>> commitsById) {
+      this.paramTableIdentifier = paramTableIdentifier;
+      this.tableIdentifier = tableIdentifier;
+      this.table = table;
+      this.branch = branch;
+      this.commitsById = commitsById;
+    }
+  }
+
   private String offsetsJson() {
     try {
       return MAPPER.writeValueAsString(controlTopicOffsets());
@@ -189,122 +405,14 @@ public class Coordinator extends Channel implements AutoCloseable {
   }
 
   /**
-   * Commits all buffered work for a single table.
-   *
-   * <p>The {@code commitsById} map holds, per commit-id, the envelopes for that commit-id in
-   * first-seen (chronological) order (see {@link CommitState#tableCommitMap()}). Each commit-id is
-   * committed as its OWN Iceberg snapshot, oldest first, so that equality deletes from a later
-   * commit land in a later snapshot (with a higher sequence number) than the data files they must
-   * remove. Only the LAST (newest) commit-id records the offsets/vtts watermark.
-   *
-   * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
-   * this batch have been committed:
-   *
-   * <ul>
-   *   <li>A single flag broadcast (e.g. END-LOAD / DDL) arrives as one DataWritten per source
-   *       partition, and those partitions may be spread across multiple commit-ids. So flag votes
-   *       are accumulated across ALL commit-ids first, and only then drained.
-   *   <li>Flag processing (branch switch via setCurrentSnapshot/removeBranch, schema updates) must
-   *       run after the data it relates to is committed; draining flags inside the per-commit-id
-   *       loop could switch the branch before later commit-ids' data is appended.
-   * </ul>
-   *
-   * To make the vote threshold correct, {@code tableTopicPartitions} is computed ONCE from the
-   * union of all this table's envelopes (across every commit-id), not per commit-id.
-   */
-  private void commitToTable(
-      TableIdentifier paramTableIdentifier,
-      Map<UUID, List<Envelope>> commitsById,
-      String offsetsJson,
-      OffsetDateTime vtts) {
-    Table table;
-    TableIdentifier tableIdentifier = paramTableIdentifier;
-    Optional<String> branch = config.tableConfig(tableIdentifier.toString()).commitBranch();
-
-    if (this.config.dynamicBranchesEnabled()) {
-      TableContext tableContext = TableContext.parse(tableIdentifier, this.config.branchesDelimiter());
-      tableIdentifier = tableContext.tableIdentifier();
-      branch = Optional.ofNullable(tableContext.branch());
-    }
-
-    try {
-      table = catalog.loadTable(tableIdentifier);
-    } catch (NoSuchTableException e) {
-      LOG.warn("Table not found, skipping commit: {}", tableIdentifier);
-      return;
-    }
-
-    if (branch.isPresent() && this.config.branchAutoCreateEnabled()) {
-      try {
-        table.manageSnapshots().createBranch(branch.get(), table.history().get(0).snapshotId()).commit();
-
-        table.newDelete()
-                .toBranch(branch.get())
-                .deleteFromRowFilter(Expressions.alwaysTrue())
-                .commit();
-
-      } catch (IllegalArgumentException ignored) {
-        // branch already exists
-      }
-    }
-
-    // The full set of envelopes for this table across every commit-id. Used for the flag-vote
-    // denominator (tableTopicPartitions) so it is independent of how envelopes happen to be split
-    // across commit-ids.
-    List<Envelope> allEnvelopesForTable =
-        commitsById.values().stream().flatMap(List::stream).collect(toList());
-
-    this.tableTopicPartitions.put(
-            tableIdentifier.toString(),
-            this.members.stream().mapToInt(desc -> (int) desc.assignment().topicPartitions()
-                    .stream()
-                    .filter(tp ->
-                            tp.topic().equals(Deduplicated.extractTopic(allEnvelopesForTable)))
-                    .count())
-                    .sum()
-    );
-
-    // Commit each commit-id as its own snapshot, oldest first, accumulating flag votes as we go but
-    // NOT draining them until all data snapshots for this table are committed.
-    List<UUID> commitIdsInOrder = new ArrayList<>(commitsById.keySet());
-    int lastIdx = commitIdsInOrder.size() - 1;
-    for (int i = 0; i <= lastIdx; i++) {
-      UUID commitId = commitIdsInOrder.get(i);
-      List<Envelope> envelopes = commitsById.get(commitId);
-      commitDataForCommitId(
-          table,
-          tableIdentifier,
-          branch,
-          commitId,
-          envelopes,
-          i == lastIdx ? offsetsJson : null,
-          i == lastIdx ? vtts : null);
-    }
-
-    // Now that all data is committed, process any flags that became ready, exactly once.
-    Map<String, Pair<TableContext, Map<String, Object>>> readyFlags = drainReadyFlags(tableIdentifier);
-    if (!readyFlags.isEmpty()) {
-      processFlagMessages(table, readyFlags);
-      LOG.info(
-              "Flags processed for table {} in commit {}, sending per-table resume signal",
-              paramTableIdentifier, commitState.currentCommitId());
-      Event flagSentinel =
-              new Event(
-                      config.controlGroupId(),
-                      new CommitToTable(
-                              FLAG_PROCESSED_SENTINEL_ID,
-                              TableReference.of(config.catalogName(), paramTableIdentifier),
-                              0L,
-                              null));
-      send(flagSentinel);
-    }
-  }
-
-  /**
    * Commits the data and equality-delete files for a single commit-id to a single Iceberg snapshot.
    * Also accumulates (but does not drain) flag votes carried by this commit-id's envelopes. The
    * offsets/vtts watermark is written on this snapshot only when {@code offsetsJson}/{@code vtts}
    * are non-null, which the caller arranges for the last (newest) commit-id only.
+   *
+   * <p>This runs on the worker pool and MUST NOT touch the Kafka consumer; consumer offsets are
+   * advanced by the caller ({@link #doCommit}) on the coordinator thread after this commit-id is
+   * durable across all tables.
    */
   private void commitDataForCommitId(
       Table table,
@@ -338,7 +446,7 @@ public class Coordinator extends Channel implements AutoCloseable {
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
-    // Accumulate flag votes for this commit-id; draining/processing happens once in commitToTable
+    // Accumulate flag votes for this commit-id; draining/processing happens once in doCommit
     // after all commit-ids' data has been committed.
     accumulateFlagVotes(commitId, tableIdentifier, filteredEnvelopeList);
 
