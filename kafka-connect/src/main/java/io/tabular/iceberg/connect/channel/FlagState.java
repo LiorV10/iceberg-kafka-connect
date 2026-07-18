@@ -113,23 +113,6 @@ public class FlagState {
   }
 
   /**
-   * Returns the recovered/known source-partition count for a table.
-   *
-   * @throws IllegalStateException if the count is unknown -- callers must not silently fall back to
-   *     a magic default, since an incorrect denominator would trip the quorum check early or never.
-   */
-  public int tableTopicPartitions(TableIdentifier tableIdentifier) {
-    Integer count = tableTopicPartitions.get(tableIdentifier.toString());
-    if (count == null) {
-      throw new IllegalStateException(
-          "No known source-partition count for table "
-              + tableIdentifier
-              + "; cannot evaluate flag quorum");
-    }
-    return count;
-  }
-
-  /**
    * Accumulates this cycle's votes/payloads for a table and persists the merged state.
    *
    * @param newVotes flag type -> newly-voting source partitions observed this cycle
@@ -177,7 +160,11 @@ public class FlagState {
     Map<String, Pair<TableContext, Map<String, Object>>> data =
         pendingFlagData.getOrDefault(tableIdentifier, Collections.emptyMap());
 
-    int threshold = tableTopicPartitions(tableIdentifier);
+    Integer threshold = tableTopicPartitions.get(tableIdentifier.toString());
+
+    if (threshold == null) {
+      return Collections.emptyMap();
+    }
 
     List<String> readyTypes =
         votes.entrySet().stream()
