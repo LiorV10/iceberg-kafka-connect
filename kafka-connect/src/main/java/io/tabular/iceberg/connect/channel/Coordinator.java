@@ -237,6 +237,14 @@ public class Coordinator extends Channel implements AutoCloseable {
    * correct watermark for recovery. The vtts watermark stays batch-wide and is written on the last
    * snapshot only.
    *
+   * <p>Because a failed commit cycle resets the current commit (via {@link
+   * CommitState#endCurrentCommit()}) WITHOUT clearing the buffer, the same data/delete file can be
+   * present under more than one commit-id in {@code commitsById}. {@link Deduplicated} only
+   * de-duplicates within a single commit-id's envelope list, so the {@code committedDataPaths} /
+   * {@code committedDeletePaths} sets below track file paths ALREADY committed by an earlier
+   * commit-id in this batch and drop repeats, preventing the same file (hence identical rows) from
+   * being appended to two snapshots.
+   *
    * <p>Flags, by contrast, must be processed exactly ONCE per table, AFTER all data snapshots for
    * this batch have been committed:
    *
@@ -323,6 +331,11 @@ public class Coordinator extends Channel implements AutoCloseable {
     // Control-topic offsets accumulated across the commit-ids in this batch, folded in as we iterate
     // oldest first. Each snapshot records the watermark up to (and including) its commit-id.
     Map<Integer, Long> accumulatedOffsets = Maps.newHashMap();
+    // Paths of data/delete files already committed by an earlier commit-id in this batch. Since the
+    // buffer can carry the same file under two commit-ids (failed-then-retried commit), this dedups
+    // across commit-ids so a file is appended to at most one snapshot.
+    Set<String> committedDataPaths = new HashSet<>();
+    Set<String> committedDeletePaths = new HashSet<>();
     int lastIdx = commitIdsInOrder.size() - 1;
     for (int i = 0; i <= lastIdx; i++) {
       UUID commitId = commitIdsInOrder.get(i);
@@ -341,6 +354,8 @@ public class Coordinator extends Channel implements AutoCloseable {
           branch,
           commitId,
           envelopes,
+          committedDataPaths,
+          committedDeletePaths,
           offsetsJson(accumulatedOffsets),
           i == lastIdx ? vtts : null);
     }
@@ -371,6 +386,11 @@ public class Coordinator extends Channel implements AutoCloseable {
    * offsets watermark is written on this snapshot whenever {@code offsetsJson} is non-null (the
    * caller passes the accumulative watermark up to this commit-id for every commit-id); {@code vtts}
    * is only non-null for the last (newest) commit-id.
+   *
+   * <p>{@code committedDataPaths} / {@code committedDeletePaths} carry, across the per-commit-id
+   * loop in {@link #commitToTable}, the paths of files already committed by an earlier commit-id in
+   * this batch. Files whose path is already present are skipped (and never re-appended), which keeps
+   * a file that appears under two commit-ids from producing duplicate rows.
    */
   private void commitDataForCommitId(
       Table table,
@@ -379,6 +399,8 @@ public class Coordinator extends Channel implements AutoCloseable {
       Optional<String> branch,
       UUID commitId,
       List<Envelope> envelopeList,
+      Set<String> committedDataPaths,
+      Set<String> committedDeletePaths,
       String offsetsJson,
       OffsetDateTime vtts) {
     Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
@@ -392,10 +414,13 @@ public class Coordinator extends Channel implements AutoCloseable {
                 })
             .collect(toList());
 
+    // Set.add returns false when the path was already committed by an earlier commit-id in this
+    // batch, so this both de-duplicates across commit-ids and records the survivors as committed.
     List<DataFile> dataFiles =
         Deduplicated.dataFiles(commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(dataFile -> dataFile.recordCount() > 0)
+            .filter(dataFile -> committedDataPaths.add(dataFile.path().toString()))
             .collect(toList());
 
     List<DeleteFile> deleteFiles =
@@ -403,6 +428,7 @@ public class Coordinator extends Channel implements AutoCloseable {
                 commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
             .filter(deleteFile -> deleteFile.recordCount() > 0)
+            .filter(deleteFile -> committedDeletePaths.add(deleteFile.path().toString()))
             .collect(toList());
 
     // Accumulate flag votes for this commit-id; draining/processing happens once in commitToTable
