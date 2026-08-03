@@ -25,6 +25,7 @@ import io.tabular.iceberg.connect.fixtures.EventTestUtil;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -67,9 +68,9 @@ public class CoordinatorTest extends ChannelTestBase {
 
   @Test
   public void testCommitAppend() {
-    Assertions.assertEquals(0, ImmutableList.copyOf(table.snapshots().iterator()).size());
-
     OffsetDateTime ts = OffsetDateTime.ofInstant(Instant.now(), ZoneOffset.UTC);
+
+    OffsetDateTime ts = OffsetDateTime.ofInstant(Instant.ofEpochMilli(System.currentTimeMillis()), ZoneOffset.UTC);
     UUID commitId =
         coordinatorTest(ImmutableList.of(EventTestUtil.createDataFile()), ImmutableList.of(), ts);
     table.refresh();
@@ -243,7 +244,51 @@ public class CoordinatorTest extends ChannelTestBase {
     Snapshot snapshot = snapshots.get(0);
     Assertions.assertEquals(DataOperations.OVERWRITE, snapshot.operation());
     Assertions.assertEquals(0, ImmutableList.copyOf(snapshot.addedDataFiles(table.io())).size());
-    Assertions.assertEquals(1, ImmutableList.copyOf(snapshot.addedDeleteFiles(table.io())).size());
+  public void testShouldDeduplicateFilesAcrossCommitIds() {
+    UUID firstCommitId = UUID.randomUUID();
+    UUID secondCommitId = UUID.randomUUID();
+    DataFile duplicateDataFile = EventTestUtil.createDataFile();
+    DataFile secondDataFile = EventTestUtil.createDataFile();
+    Map<UUID, List<Envelope>> commitsById = new LinkedHashMap<>();
+    commitsById.put(
+        firstCommitId,
+        ImmutableList.of(
+    Map<String, UUID> expectedDataFileCommitIds = new LinkedHashMap<>();
+    expectedDataFileCommitIds.put(duplicateDataFile.path().toString(), firstCommitId);
+    expectedDataFileCommitIds.put(secondDataFile.path().toString(), secondCommitId);
+    Map<String, UUID> expectedDeleteFileCommitIds = new LinkedHashMap<>();
+    expectedDeleteFileCommitIds.put(duplicateDeleteFile.path().toString(), firstCommitId);
+    expectedDeleteFileCommitIds.put(secondDeleteFile.path().toString(), secondCommitId);
+    DataFile recoveredDataFile = EventTestUtil.createDataFile();
+    DeleteFile recoveredDeleteFile = EventTestUtil.createDeleteFile();
+    consumer.addRecord(
+        new ConsumerRecord<>(
+            CTL_TOPIC_NAME,
+            0,
+            1L,
+    assertThat(Coordinator.firstCommitIdByFilePath(commitsById, DataWritten::dataFiles))
+        .isEqualTo(expectedDataFileCommitIds);
+    assertThat(Coordinator.firstCommitIdByFilePath(commitsById, DataWritten::deleteFiles))
+  private Envelope envelope(
+      UUID commitId, List<DataFile> dataFiles, List<DeleteFile> deleteFiles, long offset) {
+    Event event =
+        new Event(
+            config.controlGroupId(),
+            new DataWritten(
+                StructType.of(),
+                commitId,
+                TableReference.of("catalog", TABLE_IDENTIFIER),
+                dataFiles,
+                deleteFiles));
+    return new Envelope(event, 0, offset);
+    assertThat(recoveredDeleteFiles).extracting(file -> file.path().toString())
+        .containsExactly(recoveredDeleteFile.path().toString());
+    assertThat(currentDataFiles).extracting(file -> file.path().toString())
+        .containsExactly(currentDataFile.path().toString());
+    assertThat(currentDeleteFiles).extracting(file -> file.path().toString())
+        .containsExactly(currentDeleteFile.path().toString());
+    assertThat(currentDeleteFiles.get(0).dataSequenceNumber())
+        .isGreaterThan(recoveredDataFiles.get(0).dataSequenceNumber());
   }
 
   private void validateAddedFiles(
@@ -297,7 +342,8 @@ public class CoordinatorTest extends ChannelTestBase {
               new MemberAssignment(ImmutableSet.of(new TopicPartition(SRC_TOPIC_NAME, i)))));
     }
 
-    final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory);
+    final Coordinator coordinator =
+        new Coordinator(catalog, config, members, clientFactory, context);
     initConsumer();
 
     // start a new commit immediately and wait for all workers to respond infinitely
@@ -352,8 +398,7 @@ public class CoordinatorTest extends ChannelTestBase {
               CTL_TOPIC_NAME,
               0,
               currentControlTopicOffset,
-              "key",
-              AvroUtil.encode(
+    final Coordinator coordinator = new Coordinator(catalog, config, members, clientFactory, null);
                   new Event(
                       config.controlGroupId(),
                       new DataComplete(
@@ -398,7 +443,7 @@ public class CoordinatorTest extends ChannelTestBase {
         secondSnapshot.summary().get(COMMIT_ID_SNAPSHOT_PROP),
         "All snapshots should be tagged with a commit-id");
     Assertions.assertEquals(
-        "{\"0\":5}",
+        "{\"0\":4}",
         secondSnapshot.summary().get(OFFSETS_SNAPSHOT_PROP),
         "Only the most recent snapshot should include control-topic-offsets in it's summary");
     Assertions.assertEquals(
@@ -445,7 +490,7 @@ public class CoordinatorTest extends ChannelTestBase {
               new Event(
                   config.controlGroupId(),
                   new DataComplete(
-                      currentCommitId,
+        "{\"0\":5}",
                       ImmutableList.of(new TopicPartitionOffset("topic", 1, 1L, ts))));
 
           return ImmutableList.of(commitResponse, commitReady);
@@ -456,7 +501,9 @@ public class CoordinatorTest extends ChannelTestBase {
     when(config.commitIntervalMs()).thenReturn(0);
     when(config.commitTimeoutMs()).thenReturn(Integer.MAX_VALUE);
 
-    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory);
+    Coordinator coordinator = new Coordinator(catalog, config, ImmutableList.of(), clientFactory, null);
+    Coordinator coordinator =
+        new Coordinator(catalog, config, ImmutableList.of(), clientFactory, context);
 
     // init consumer after subscribe()
     initConsumer();

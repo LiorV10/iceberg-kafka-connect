@@ -22,6 +22,7 @@ import static java.util.stream.Collectors.toList;
 
 import io.tabular.iceberg.connect.IcebergSinkConfig;
 import io.tabular.iceberg.connect.data.SchemaUpdate.AddColumn;
+import io.tabular.iceberg.connect.data.SchemaUpdate.DropColumn;
 import io.tabular.iceberg.connect.data.SchemaUpdate.MakeOptional;
 import io.tabular.iceberg.connect.data.SchemaUpdate.UpdateType;
 import java.math.BigDecimal;
@@ -35,6 +36,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.UpdateSchema;
@@ -103,6 +106,12 @@ public class SchemaUtils {
             .filter(addCol -> !columnExists(table.schema(), addCol))
             .collect(toList());
 
+    // filter out columns that have already been dropped
+    List<DropColumn> dropColumns =
+            updates.dropColumns().stream()
+                    .filter(dropCol -> columnExists(table.schema(), dropCol)).
+                    collect(toList());
+
     // filter out columns that have the updated type
     List<UpdateType> updateTypes =
         updates.updateTypes().stream()
@@ -115,16 +124,22 @@ public class SchemaUtils {
             .filter(makeOptional -> !isOptional(table.schema(), makeOptional))
             .collect(toList());
 
-    if (addColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty()) {
+    if (addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty()) {
       // no updates to apply
       LOG.info("Schema for table {} already up-to-date", table.name());
       return;
     }
 
+    LOG.info("Adding columns: {}", addColumns.stream().map(AddColumn::name).collect(Collectors.joining(",")));
+    LOG.info("Dropping columns: {}", dropColumns.stream().map(DropColumn::name).collect(Collectors.joining(",")));
+    LOG.info("Updating types for columns: {}", updateTypes.stream().map(UpdateType::name).collect(Collectors.joining(",")));
+    LOG.info("Making optional columns: {}", makeOptionals.stream().map(MakeOptional::name).collect(Collectors.joining(",")));
+
     // apply the updates
     UpdateSchema updateSchema = table.updateSchema();
     addColumns.forEach(
         update -> updateSchema.addColumn(update.parentName(), update.name(), update.type()));
+    dropColumns.forEach(update -> updateSchema.deleteColumn(update.name()));
     updateTypes.forEach(update -> updateSchema.updateColumn(update.name(), update.type()));
     makeOptionals.forEach(update -> updateSchema.makeColumnOptional(update.name()));
     updateSchema.commit();
@@ -137,6 +152,10 @@ public class SchemaUtils {
             ? schema.asStruct()
             : schema.findType(update.parentName()).asStructType();
     return struct.field(update.name()) != null;
+  }
+
+  private static boolean columnExists(org.apache.iceberg.Schema schema, DropColumn update) {
+    return schema.findField(update.name()) != null;
   }
 
   private static boolean typeMatches(org.apache.iceberg.Schema schema, UpdateType update) {
@@ -331,6 +350,7 @@ public class SchemaUtils {
         List<NestedField> structFields =
             map.entrySet().stream()
                 .filter(entry -> entry.getKey() != null && entry.getValue() != null)
+                .filter((field -> !config.excludeFields().contains(field.getKey().toString())))
                 .map(
                     entry -> {
                       Optional<Type> valueType = inferIcebergType(entry.getValue());

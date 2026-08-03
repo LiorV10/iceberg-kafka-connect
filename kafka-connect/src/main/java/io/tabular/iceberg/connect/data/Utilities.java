@@ -31,10 +31,9 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Table;
@@ -56,6 +55,7 @@ import org.apache.iceberg.relocated.com.google.common.primitives.Ints;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.sink.SinkRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,6 +64,10 @@ public class Utilities {
   private static final Logger LOG = LoggerFactory.getLogger(Utilities.class.getName());
   private static final List<String> HADOOP_CONF_FILES =
       ImmutableList.of("core-site.xml", "hdfs-site.xml", "hive-site.xml");
+
+  public static boolean isFlagRecord(SinkRecord record, String prefix) {
+    return prefix != null && record.key() != null && record.key().toString().startsWith(prefix);
+  }
 
   public static Catalog loadCatalog(IcebergSinkConfig config) {
     return CatalogUtil.buildIcebergCatalog(
@@ -166,16 +170,19 @@ public class Utilities {
         PropertyUtil.propertyAsLong(
             tableProps, WRITE_TARGET_FILE_SIZE_BYTES, WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
 
-    Set<Integer> identifierFieldIds = table.schema().identifierFieldIds();
+    String idCols = table.properties().get("lakers.id-cols");
+    List<String> idColNames;
 
-    // override the identifier fields if the config is set
-    List<String> idCols = config.tableConfig(tableName).idColumns();
-    if (!idCols.isEmpty()) {
-      identifierFieldIds =
-          idCols.stream()
-              .map(colName -> table.schema().findField(colName).fieldId())
-              .collect(toSet());
+    if (idCols == null || idCols.isEmpty()) {
+      idColNames = config.tableConfig(tableName).idColumns();
+      table.updateProperties().set("lakers.id-cols", config.tablesDefaultIdColumns()).commit();
+    } else {
+      idColNames = Arrays.stream(idCols.split(",")).collect(Collectors.toList());
     }
+
+    Set<Integer> identifierFieldIds = idColNames.stream()
+            .map(colName -> table.schema().findField(colName).fieldId())
+            .collect(toSet());
 
     FileAppenderFactory<Record> appenderFactory;
     if (identifierFieldIds == null || identifierFieldIds.isEmpty()) {

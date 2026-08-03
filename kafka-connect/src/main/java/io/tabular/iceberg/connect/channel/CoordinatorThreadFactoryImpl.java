@@ -81,7 +81,7 @@ class CoordinatorThreadFactoryImpl implements CoordinatorThreadFactory {
       Collection<MemberDescription> members = groupDesc.members();
       if (isLeader(members, context.assignment())) {
         LOG.info("Task elected leader, starting commit coordinator");
-        Coordinator coordinator = new Coordinator(catalog, config, members, kafkaClientFactory);
+        Coordinator coordinator = new Coordinator(catalog, config, members, kafkaClientFactory, context);
         thread = new CoordinatorThread(coordinator);
         thread.start();
       }

@@ -23,17 +23,24 @@ import java.util.Map;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Type.PrimitiveType;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class SchemaUpdate {
 
   public static class Consumer {
+    private static final Logger LOG = LoggerFactory.getLogger(SchemaUpdate.class);
+
     private final Map<String, AddColumn> addColumns = Maps.newHashMap();
+    private final Map<String, DropColumn> dropColumns = Maps.newHashMap();
     private final Map<String, UpdateType> updateTypes = Maps.newHashMap();
     private final Map<String, MakeOptional> makeOptionals = Maps.newHashMap();
 
     public Collection<AddColumn> addColumns() {
       return addColumns.values();
     }
+
+    public Collection<DropColumn> dropColumns() { return dropColumns.values(); }
 
     public Collection<UpdateType> updateTypes() {
       return updateTypes.values();
@@ -44,20 +51,33 @@ public class SchemaUpdate {
     }
 
     public boolean empty() {
-      return addColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
+      return addColumns.isEmpty() && dropColumns.isEmpty() && updateTypes.isEmpty() && makeOptionals.isEmpty();
     }
 
     public void addColumn(String parentName, String name, Type type) {
       AddColumn addCol = new AddColumn(parentName, name, type);
       addColumns.put(addCol.key(), addCol);
+
+      LOG.debug("{} is about to be added.", name);
+    }
+
+    public void dropColumn(String name) {
+      DropColumn dropCol = new DropColumn(name);
+      dropColumns.put(name, dropCol);
+
+      LOG.debug("{} is about to be dropped.", name);
     }
 
     public void updateType(String name, PrimitiveType type) {
       updateTypes.put(name, new UpdateType(name, type));
+
+      LOG.debug("{} is about to be updated.", name);
     }
 
     public void makeOptional(String name) {
       makeOptionals.put(name, new MakeOptional(name));
+
+      LOG.debug("{} is about to become optional.", name);
     }
   }
 
@@ -86,6 +106,19 @@ public class SchemaUpdate {
 
     public Type type() {
       return type;
+    }
+  }
+
+
+  public static class DropColumn extends SchemaUpdate {
+    private final String name;
+
+    public DropColumn(String name) {
+      this.name = name;
+    }
+
+    public String name() {
+      return name;
     }
   }
 

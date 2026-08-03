@@ -31,13 +31,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import org.apache.iceberg.catalog.Catalog;
-import org.apache.iceberg.connect.events.DataComplete;
-import org.apache.iceberg.connect.events.DataWritten;
-import org.apache.iceberg.connect.events.Event;
-import org.apache.iceberg.connect.events.PayloadType;
-import org.apache.iceberg.connect.events.StartCommit;
-import org.apache.iceberg.connect.events.TableReference;
-import org.apache.iceberg.connect.events.TopicPartitionOffset;
+import org.apache.iceberg.connect.events.*;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -85,7 +79,9 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
         "committer",
         IcebergSinkConfig.DEFAULT_CONTROL_GROUP_PREFIX + UUID.randomUUID(),
         config,
-        clientFactory);
+        clientFactory,
+        context
+    );
 
     this.context = context;
     this.config = config;
@@ -133,7 +129,16 @@ public class CommitterImpl extends Channel implements Committer, AutoCloseable {
       UUID commitId = ((StartCommit) envelope.event().payload()).commitId();
       sendCommitResponse(commitId, committableSupplier);
       return true;
+    } else if (envelope.event().type() == PayloadType.COMMIT_TO_TABLE) {
+      CommitToTable commitToTable = (CommitToTable) envelope.event().payload();
+
+      if (Coordinator.FLAG_PROCESSED_SENTINEL_ID.equals(commitToTable.commitId())) {
+        committableSupplier.onFlagProcessed(commitToTable.tableReference().identifier());
+      }
+
+      return true;
     }
+
     return false;
   }
 

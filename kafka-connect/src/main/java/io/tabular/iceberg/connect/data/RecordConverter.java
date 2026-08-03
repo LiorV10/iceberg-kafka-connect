@@ -37,12 +37,9 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.format.DateTimeParseException;
 import java.time.temporal.Temporal;
-import java.util.Base64;
-import java.util.Date;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
+import java.util.stream.Collectors;
+
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
@@ -53,6 +50,7 @@ import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Type.PrimitiveType;
 import org.apache.iceberg.types.Types;
@@ -162,9 +160,32 @@ public class RecordConverter {
       int structFieldId,
       SchemaUpdate.Consumer schemaUpdateConsumer) {
     GenericRecord result = GenericRecord.create(schema);
+    Set<String> pendingColumns = Sets.newHashSet();
+
     map.forEach(
         (recordFieldNameObj, recordFieldValue) -> {
           String recordFieldName = recordFieldNameObj.toString();
+
+          // Skip excluded fields
+          if (config.excludeFields().contains(recordFieldName)) {
+            return;
+          }
+
+          NestedField reroutedTableField =
+                  lookupStructField(recordFieldName + "_pending_type_update", schema, structFieldId);
+          if (reroutedTableField != null) {
+            pendingColumns.add(reroutedTableField.name());
+
+            result.setField(
+                    reroutedTableField.name(),
+                    convertValue(
+                            recordFieldValue,
+                            reroutedTableField.type(),
+                            reroutedTableField.fieldId(),
+                            schemaUpdateConsumer));
+            return;
+          }
+
           NestedField tableField = lookupStructField(recordFieldName, schema, structFieldId);
           if (tableField == null) {
             // add the column if schema evolution is on, otherwise skip the value,
@@ -187,6 +208,20 @@ public class RecordConverter {
                     schemaUpdateConsumer));
           }
         });
+
+    // drop column if removed for schema and destructive evolution is on
+    if (config.destructiveSchemaEvolutionEnabled() && schemaUpdateConsumer != null) {
+      Set<String> incomingFieldNames = map.keySet().stream().map(Object::toString).collect(Collectors.toSet());
+      incomingFieldNames.addAll(pendingColumns);
+      incomingFieldNames.addAll(config.excludeFields());
+
+      List<NestedField> columnsToDrop = tableSchema.columns().stream()
+              .filter(col -> !incomingFieldNames.contains(col.name()))
+              .collect(toList());
+
+      columnsToDrop.forEach(col -> schemaUpdateConsumer.dropColumn(col.name()));
+    }
+
     return result;
   }
 

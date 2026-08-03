@@ -19,15 +19,22 @@
 package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
+import static java.util.stream.Collectors.toMap;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.OffsetDateTime;
-import java.util.List;
-import java.util.Objects;
-import java.util.UUID;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -69,6 +76,7 @@ import org.slf4j.LoggerFactory;
  */
 class Deduplicated {
   private static final Logger LOG = LoggerFactory.getLogger(Deduplicated.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
 
   private Deduplicated() {}
 
@@ -100,6 +108,128 @@ class Deduplicated {
         "delete",
         DataWritten::deleteFiles,
         deleteFile -> deleteFile.path().toString());
+  }
+
+  public static Map<String, Pair<TableContext, Map<String, Object>>> flagMessages(
+          UUID currentCommitId, TableIdentifier tableIdentifier, List<Envelope> envelopes, String regex,
+          String flagTypeField) {
+    return envelopes.stream()
+            .map(envelope -> (DataWritten) envelope.event().payload())
+            .filter(dataWritten -> {
+              List<DataFile> dataFiles = dataWritten.dataFiles();
+
+              if (dataFiles == null || dataFiles.isEmpty()) {
+                return false;
+              }
+
+              return dataFiles.stream()
+                      .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+            })
+            .collect(toMap(
+                    dataWritten -> extractFlagType(dataWritten, flagTypeField),
+                    dataWritten -> {
+                      String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+                              .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+                      Map<String, Object> envelope = parseRecordJson(recordJson);
+                      TableContext tableContext = TableContext.parse(
+                              dataWritten.tableReference().identifier(), regex);
+                      return Pair.of(tableContext, envelope);
+                    },
+                    // Deduplicate: when the same flag type is reported by multiple tasks (one per
+                    // partition in a broadcast scenario) keep the first occurrence and discard the rest.
+                    (existing, duplicate) -> {
+                      LOG.debug("Deduplicating flag: type already seen, discarding copy from additional partition");
+                      return existing;
+                    }));
+  }
+
+  static Map<String, Set<Integer>> flagMessageSourcePartitions(
+          List<Envelope> envelopes, String flagTypeField) {
+    return envelopes.stream()
+            .map(envelope -> (DataWritten) envelope.event().payload())
+            .filter(
+                    dataWritten -> {
+                      List<DataFile> dataFiles = dataWritten.dataFiles();
+                      return dataFiles != null
+                              && !dataFiles.isEmpty()
+                              && dataFiles.stream()
+                              .allMatch(
+                                      f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+                    })
+            .collect(
+                    Collectors.groupingBy(
+                            dw -> extractFlagType(dw, flagTypeField),
+                            Collectors.mapping(
+                                    Deduplicated::extractSourcePartition, Collectors.toSet())));
+  }
+
+    public static String extractTopic(
+            List<Envelope> envelopes
+    ) {
+      AtomicReference<String> topic = new AtomicReference<>();
+
+      envelopes
+        .stream()
+        .map(envelope -> (DataWritten) envelope.event().payload())
+        .filter(dataWritten -> {
+            List<DataFile> dataFiles = dataWritten.dataFiles();
+
+            if (dataFiles == null || dataFiles.isEmpty()) {
+                return false;
+            }
+
+            return dataFiles.stream()
+                    .allMatch(f -> f.path().toString().startsWith(FlagWriterResult.FLAG_PREFIX));
+        })
+        .findFirst()
+        .ifPresent(dataWritten -> {
+            String recordJson =
+                    dataWritten
+                            .dataFiles()
+                            .get(0)
+                            .path()
+                            .toString()
+                            .substring(FlagWriterResult.FLAG_PREFIX.length());
+            Map<String, Object> record = parseRecordJson(recordJson);
+            topic.set(record.get("topic").toString());
+        });
+
+      return topic.get();
+    }
+
+  @SuppressWarnings("unchecked")
+  private static String extractFlagType(DataWritten dataWritten, String flagTypeField) {
+    String recordJson = dataWritten.dataFiles().stream().findFirst().get()
+            .path().toString().substring(FlagWriterResult.FLAG_PREFIX.length());
+    Map<String, Object> envelope = parseRecordJson(recordJson);
+    // The type field lives inside the "value" sub-map of the envelope.
+    Object valueObj = envelope.get("value");
+    if (valueObj instanceof Map) {
+      Object type = ((Map<String, Object>) valueObj).get(flagTypeField);
+      return type != null ? type.toString() : "";
+    }
+    return "";
+  }
+
+  private static int extractSourcePartition(DataWritten dataWritten) {
+    String recordJson =
+            dataWritten
+                    .dataFiles()
+                    .get(0)
+                    .path()
+                    .toString()
+                    .substring(FlagWriterResult.FLAG_PREFIX.length());
+    Map<String, Object> record = parseRecordJson(recordJson);
+    Object partition = record.get("partition");
+    return partition instanceof Number ? ((Number) partition).intValue() : -1;
+  }
+
+  private static Map<String, Object> parseRecordJson(String recordJson) {
+    try {
+      return MAPPER.readValue(recordJson, new TypeReference<Map<String, Object>>() {});
+    } catch (IOException e) {
+      throw new UncheckedIOException(e);
+    }
   }
 
   private static <F> List<F> deduplicatedFiles(

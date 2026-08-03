@@ -20,6 +20,7 @@ package io.tabular.iceberg.connect;
 
 import static java.util.stream.Collectors.toList;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
@@ -27,7 +28,11 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.HashSet;
 import java.util.regex.Pattern;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.iceberg.IcebergBuild;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -52,7 +57,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final Logger LOG = LoggerFactory.getLogger(IcebergSinkConfig.class.getName());
 
   public static final String INTERNAL_TRANSACTIONAL_SUFFIX_PROP =
-      "iceberg.coordinator.transactional.suffix";
+          "iceberg.coordinator.transactional.suffix";
   private static final String ROUTE_REGEX = "route-regex";
   private static final String ID_COLUMNS = "id-columns";
   private static final String PARTITION_BY = "partition-by";
@@ -74,15 +79,15 @@ public class IcebergSinkConfig extends AbstractConfig {
   private static final String TABLES_DEFAULT_PARTITION_BY = "iceberg.tables.default-partition-by";
   private static final String TABLES_CDC_FIELD_PROP = "iceberg.tables.cdc-field";
   private static final String TABLES_UPSERT_MODE_ENABLED_PROP =
-      "iceberg.tables.upsert-mode-enabled";
+          "iceberg.tables.upsert-mode-enabled";
   private static final String TABLES_AUTO_CREATE_ENABLED_PROP =
-      "iceberg.tables.auto-create-enabled";
+          "iceberg.tables.auto-create-enabled";
   private static final String TABLES_EVOLVE_SCHEMA_ENABLED_PROP =
-      "iceberg.tables.evolve-schema-enabled";
+          "iceberg.tables.evolve-schema-enabled";
   private static final String TABLES_SCHEMA_FORCE_OPTIONAL_PROP =
-      "iceberg.tables.schema-force-optional";
+          "iceberg.tables.schema-force-optional";
   private static final String TABLES_SCHEMA_CASE_INSENSITIVE_PROP =
-      "iceberg.tables.schema-case-insensitive";
+          "iceberg.tables.schema-case-insensitive";
   private static final String CONTROL_TOPIC_PROP = "iceberg.control.topic";
   private static final String CONTROL_GROUP_ID_PROP = "iceberg.control.group-id";
   private static final String COMMIT_INTERVAL_MS_PROP = "iceberg.control.commit.interval-ms";
@@ -102,6 +107,23 @@ public class IcebergSinkConfig extends AbstractConfig {
 
   public static final int SCHEMA_UPDATE_RETRIES = 2; // 3 total attempts
   public static final int CREATE_TABLE_RETRIES = 2; // 3 total attempts
+
+  /************************************************************************/
+  /*                  Custom Lakers Configs - Props                       */
+  /************************************************************************/
+  private static final String TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP =
+          "iceberg.tables.destructive-schema-evolution-enabled";
+
+  private static final String TABLES_EXCLUDE_FIELDS_PROP = "iceberg.tables.exclude-fields";
+
+  private static final String BRANCH_DYNAMIC_PROP = "iceberg.branch.dynamic-enabled";
+  private static final String BRANCH_DELIMITER_PROP = "iceberg.branch.delimiter";
+  private static final String BRANCHES_AUTO_CREATE_ENABLED_PROP =
+          "iceberg.branch.auto-create-enabled";
+
+  public static final String FLAG_MESSAGE_PREFIX = "iceberg.flags.key-prefix";
+  public static final String FLAG_TYPE_FIELD = "iceberg.flags.type-field";
+  public static final String FLAGS_CONFIG_PROP = "iceberg.flags.config";
 
   @VisibleForTesting static final String COMMA_NO_PARENS_REGEX = ",(?![^()]*+\\))";
 
@@ -237,9 +259,71 @@ public class IcebergSinkConfig extends AbstractConfig {
         null,
         Importance.MEDIUM,
         "Coordinator threads to use for table commits, default is (cores * 2)");
+
+    customConfigDef(configDef);
+
     return configDef;
   }
 
+  private static void customConfigDef(ConfigDef configDef) {
+    configDef.define(
+            TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to drop missing record fields from table schema, false otherwise"
+    );
+    configDef.define(TABLES_EXCLUDE_FIELDS_PROP,
+            Type.LIST,
+            null,
+            Importance.MEDIUM,
+            "Fields to exclude from final schema"
+    );
+    configDef.define(
+            BRANCH_DYNAMIC_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Enable dynamic routing to branches based on a record value"
+    );
+    configDef.define(
+            BRANCH_DELIMITER_PROP,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "Delimiter separating table name and branch in target table field"
+    );
+    configDef.define(
+            BRANCHES_AUTO_CREATE_ENABLED_PROP,
+            Type.BOOLEAN,
+            false,
+            Importance.MEDIUM,
+            "Set to true to automatically create destination branches, false otherwise"
+    );
+    configDef.define(
+            FLAG_MESSAGE_PREFIX,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "The key prefix used to detect flag messages"
+    );
+    configDef.define(
+            FLAG_TYPE_FIELD,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "The field that identifies the type of the flag"
+    );
+    configDef.define(
+            FLAGS_CONFIG_PROP,
+            Type.STRING,
+            null,
+            Importance.MEDIUM,
+            "JSON object grouping all flag-message settings: key-prefix, type-field, field-name, and any additional variables"
+    );
+  }
+
+  private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
   private final Map<String, String> originalProps;
   private final Map<String, String> catalogProps;
   private final Map<String, String> hadoopProps;
@@ -248,6 +332,7 @@ public class IcebergSinkConfig extends AbstractConfig {
   private final Map<String, String> writeProps;
   private final Map<String, TableSinkConfig> tableConfigMap = Maps.newHashMap();
   private final JsonConverter jsonConverter;
+  private final FlagConfig flagConfig;
 
   public IcebergSinkConfig(Map<String, String> originalProps) {
     super(CONFIG_DEF, originalProps);
@@ -271,7 +356,23 @@ public class IcebergSinkConfig extends AbstractConfig {
             ConverterConfig.TYPE_CONFIG,
             ConverterType.VALUE.getName()));
 
+    this.flagConfig = parseFlagConfig();
+
+    LOG.info("Initialized using following flag config: {}", this.flagConfig.toString());
+
     validate();
+  }
+
+  private FlagConfig parseFlagConfig() {
+    String json = getString(FLAGS_CONFIG_PROP);
+    if (json == null || json.isEmpty()) {
+      return null;
+    }
+    try {
+      return OBJECT_MAPPER.readValue(json, FlagConfig.class);
+    } catch (IOException e) {
+      throw new ConfigException(FLAGS_CONFIG_PROP, json, "Must be a valid JSON object: " + e.getMessage());
+    }
   }
 
   private void validate() {
@@ -296,6 +397,33 @@ public class IcebergSinkConfig extends AbstractConfig {
     return originalProps.get(NAME_PROP);
   }
 
+  /**
+   * Returns a <strong>deterministic</strong> Kafka transactional ID scoped to the given logical
+   * role (e.g. {@code "committer"} or {@code "coordinator"}).
+   *
+   * <p>A deterministic, per-connector ID is required for Kafka's zombie-fencing mechanism to work.
+   * When a new task instance calls {@code KafkaProducer.initTransactions()} with the same
+   * transactional ID as a lingering zombie, Kafka increments the producer epoch and any subsequent
+   * transactional operation by the zombie will throw a
+   * {@link org.apache.kafka.common.errors.ProducerFencedException}, cleanly terminating it.
+   *
+   * <p>The ID is of the form: {@code "<controlTopic>-<controlGroupId>-<role>"}, which ensures
+   * uniqueness per connector instance while remaining stable across task restarts.
+   *
+   * @param role the logical name of the producer (e.g. {@code "committer"} or
+   *     {@code "coordinator"})
+   * @return a deterministic transactional ID
+   */
+  public String transactionalIdFor(String role, String assignedTasks) {
+    return role + "-" + controlTopic() + "-" + controlGroupId() + "-" + assignedTasks;
+  }
+
+  /**
+   * @deprecated Use {@link #transactionalIdFor(String)} instead. This method returned a random or
+   *     null suffix, which prevented Kafka's epoch-bump zombie-fencing from working correctly
+   *     across connector restarts.
+   */
+  @Deprecated
   public String transactionalSuffix() {
     // this is for internal use and is not part of the config definition...
     return originalProps.get(INTERNAL_TRANSACTIONAL_SUFFIX_PROP);
@@ -446,6 +574,34 @@ public class IcebergSinkConfig extends AbstractConfig {
   public boolean schemaCaseInsensitive() {
     return getBoolean(TABLES_SCHEMA_CASE_INSENSITIVE_PROP);
   }
+
+  /************************************************************************/
+  /*                  Custom Lakers Configs - Getters                     */
+  /************************************************************************/
+  public boolean destructiveSchemaEvolutionEnabled() { return getBoolean(TABLES_DESTRUCTIVE_SCHEMA_EVOLUTION_ENABLED_PROP); }
+
+  public Set<String> excludeFields() {
+    return new HashSet<>(getList(TABLES_EXCLUDE_FIELDS_PROP));
+  }
+
+  public boolean dynamicBranchesEnabled() {
+    return getBoolean(BRANCH_DYNAMIC_PROP);
+  }
+
+  public String branchesDelimiter() {
+    return getString(BRANCH_DELIMITER_PROP);
+  }
+
+  public boolean branchAutoCreateEnabled() {
+    return getBoolean(BRANCHES_AUTO_CREATE_ENABLED_PROP);
+  }
+
+  public String flagKeyPrefix() { return getString(FLAG_MESSAGE_PREFIX); }
+
+  public String flagTypeField() { return getString(FLAG_TYPE_FIELD); }
+
+  public FlagConfig flagConfig() { return this.flagConfig; }
+
 
   public JsonConverter jsonConverter() {
     return jsonConverter;

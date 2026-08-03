@@ -20,22 +20,30 @@ package io.tabular.iceberg.connect.channel;
 
 import static java.util.stream.Collectors.toList;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.tabular.iceberg.connect.IcebergSinkConfig;
+import io.tabular.iceberg.connect.TableContext;
+import io.tabular.iceberg.connect.data.FlagWriterResult;
 import io.tabular.iceberg.connect.data.IcebergWriterFactory;
 import io.tabular.iceberg.connect.data.Offset;
 import io.tabular.iceberg.connect.data.RecordWriter;
 import io.tabular.iceberg.connect.data.Utilities;
 import io.tabular.iceberg.connect.data.WriterResult;
 import java.io.IOException;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
+import java.io.UncheckedIOException;
+import java.util.*;
+
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTaskContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -43,33 +51,85 @@ import org.slf4j.LoggerFactory;
 class Worker implements Writer, AutoCloseable {
 
   private static final Logger LOG = LoggerFactory.getLogger(Worker.class);
+  private static final ObjectMapper MAPPER = new ObjectMapper();
   private final IcebergSinkConfig config;
   private final IcebergWriterFactory writerFactory;
   private final Map<String, RecordWriter> writers;
   private final Map<TopicPartition, Offset> sourceOffsets;
+  private final List<WriterResult> flagWriterResults;
+  private final SinkTaskContext context;
 
-  Worker(IcebergSinkConfig config, Catalog catalog) {
-    this(config, new IcebergWriterFactory(catalog, config));
+  // Per-partition pausing: tracks which partitions are currently paused and the flag that caused it
+  private final Map<TopicPartition, SinkRecord> pausedPartitions;
+  // Maps table identifier → set of partitions that sent a flag for that table
+  private final Map<TableIdentifier, Set<TopicPartition>> tableToFlagPartitions;
+
+  Worker(IcebergSinkConfig config, Catalog catalog, SinkTaskContext context) {
+    this(config, new IcebergWriterFactory(catalog, config), context);
   }
 
   @VisibleForTesting
   Worker(IcebergSinkConfig config, IcebergWriterFactory writerFactory) {
+    this(config, writerFactory, null);
+  }
+
+  @VisibleForTesting
+  Worker(IcebergSinkConfig config, IcebergWriterFactory writerFactory, SinkTaskContext context) {
     this.config = config;
     this.writerFactory = writerFactory;
     this.writers = Maps.newHashMap();
     this.sourceOffsets = Maps.newHashMap();
+    this.flagWriterResults = Lists.newArrayList();
+    this.context = context;
+    this.pausedPartitions = Maps.newHashMap();
+    this.tableToFlagPartitions = Maps.newHashMap();
   }
 
   @Override
   public Committable committable() {
     List<WriterResult> writeResults =
         writers.values().stream().flatMap(writer -> writer.complete().stream()).collect(toList());
+
+    // Add flag writer results to the list
+    writeResults.addAll(flagWriterResults);
+
     Map<TopicPartition, Offset> offsets = Maps.newHashMap(sourceOffsets);
 
     writers.clear();
     sourceOffsets.clear();
+    flagWriterResults.clear();
+
+    LOG.debug("Committing {} records", writeResults.size());
 
     return new Committable(offsets, writeResults);
+  }
+
+  /**
+   * Called by {@link CommitterImpl} when it receives the per-table sentinel
+   * {@link org.apache.iceberg.connect.events.CommitToTable} event that the Coordinator broadcasts
+   * after it has collected flag-containing {@code DataWritten} events from <em>all</em> source
+   * partitions for a specific table and executed the flag action (e.g. branch switch).
+   * <p>
+   * Only resumes partitions that sent a flag for the given {@code tableIdentifier}. Partitions
+   * paused for other tables, or partitions that never detected a flag, are unaffected.
+   */
+  @Override
+  public void onFlagProcessed(TableIdentifier tableIdentifier) {
+    Set<TopicPartition> partitionsForTable = tableToFlagPartitions.remove(tableIdentifier);
+
+    if (partitionsForTable == null || partitionsForTable.isEmpty()) {
+      // No partitions were paused for this table — nothing to do.
+      return;
+    }
+
+    LOG.debug(
+        "Flag-processed signal received for table {}, resuming {} partition(s)",
+        tableIdentifier,
+        partitionsForTable.size());
+
+    for (TopicPartition tp : partitionsForTable) {
+      resumePartition(tp);
+    }
   }
 
   @Override
@@ -77,6 +137,9 @@ class Worker implements Writer, AutoCloseable {
     writers.values().forEach(RecordWriter::close);
     writers.clear();
     sourceOffsets.clear();
+    flagWriterResults.clear();
+    pausedPartitions.clear();
+    tableToFlagPartitions.clear();
   }
 
   @Override
@@ -87,16 +150,50 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private void save(SinkRecord record) {
-    // the consumer stores the offsets that corresponds to the next record to consume,
-    // so increment the record offset by one
-    sourceOffsets.put(
-        new TopicPartition(record.topic(), record.kafkaPartition()),
-        new Offset(record.kafkaOffset() + 1, record.timestamp()));
+    TopicPartition recordPartition =
+        new TopicPartition(record.topic(), record.kafkaPartition());
 
-    if (config.dynamicTablesEnabled()) {
-      routeRecordDynamically(record);
+    // Only skip records from partitions that are currently paused
+    if (pausedPartitions.containsKey(recordPartition)) {
+      return;
+    }
+
+    if (Utilities.isFlagRecord(record, this.config.flagKeyPrefix())) {
+      LOG.info(
+          "Flag record detected at topic: {}, partition: {}, offset: {}",
+          record.topic(),
+          record.kafkaPartition(),
+          record.kafkaOffset());
+
+      String tableName = extractRouteValue(record.value(), this.config.tablesRouteField());
+      TableIdentifier tableIdentifier = TableIdentifier.parse(tableName);
+      TableContext tableContext =
+          TableContext.parse(tableIdentifier, this.config.branchesDelimiter());
+
+      String recordJson = serializeRecordToJson(record);
+      FlagWriterResult flagResult =
+          new FlagWriterResult(tableIdentifier, tableContext.branch(), recordJson);
+      flagWriterResults.add(flagResult);
+
+      pausePartition(record, tableIdentifier);
+      LOG.info(
+          "Flag detected — pausing partition {}-{} and rerouting to {} (branch: {})",
+          record.topic(),
+          record.kafkaPartition(),
+          tableContext.tableIdentifier(),
+          tableContext.branch());
     } else {
-      routeRecordStatically(record);
+      // the consumer stores the offsets that corresponds to the next record to consume,
+      // so increment the record offset by one
+      sourceOffsets.put(
+              recordPartition,
+              new Offset(record.kafkaOffset() + 1, record.timestamp()));
+
+      if (config.dynamicTablesEnabled()) {
+        routeRecordDynamically(record);
+      } else {
+        routeRecordStatically(record);
+      }
     }
   }
 
@@ -144,11 +241,78 @@ class Worker implements Writer, AutoCloseable {
   }
 
   private String extractRouteValue(Object recordValue, String routeField) {
+    return extractString(recordValue, routeField);
+  }
+
+  private String extractString(Object recordValue, String field) {
     if (recordValue == null) {
       return null;
     }
-    Object routeValue = Utilities.extractFromRecordValue(recordValue, routeField);
-    return routeValue == null ? null : routeValue.toString();
+
+    Object value = Utilities.extractFromRecordValue(recordValue, field);
+    return value == null ? null : value.toString();
+  }
+
+  private String serializeRecordToJson(SinkRecord record) {
+    try {
+      Map<String, Object> envelope = new LinkedHashMap<>();
+      envelope.put("topic", record.topic());
+      envelope.put("partition", record.kafkaPartition());
+      envelope.put("offset", record.kafkaOffset());
+      envelope.put("timestamp", record.timestamp());
+      envelope.put("key", record.key() != null ? record.key().toString() : null);
+      envelope.put("value", flattenValue(record.value()));
+      return MAPPER.writeValueAsString(envelope);
+    } catch (JsonProcessingException e) {
+      throw new UncheckedIOException(e);
+    }
+  }
+
+  @SuppressWarnings("unchecked")
+  private Object flattenValue(Object recordValue) {
+    if (recordValue instanceof Struct) {
+      Struct struct = (Struct) recordValue;
+      Map<String, Object> map = new LinkedHashMap<>();
+      struct.schema().fields().forEach(field -> map.put(field.name(), struct.get(field)));
+      return map;
+    } else if (recordValue instanceof Map) {
+      return new LinkedHashMap<>((Map<String, Object>) recordValue);
+    }
+    return recordValue;
+  }
+
+  /**
+   * Pauses only the partition that produced the flag record. Other partitions assigned to this
+   * task continue processing normally.
+   */
+  private void pausePartition(SinkRecord flagRecord, TableIdentifier tableIdentifier) {
+    TopicPartition tp = new TopicPartition(flagRecord.topic(), flagRecord.kafkaPartition());
+    LOG.debug("Pausing partition {}, context is {}", tp, context);
+
+    sourceOffsets.put(tp, new Offset(flagRecord.kafkaOffset(), flagRecord.timestamp()));
+
+    pausedPartitions.put(tp, flagRecord);
+    tableToFlagPartitions
+        .computeIfAbsent(tableIdentifier, k -> new HashSet<>())
+        .add(tp);
+  }
+
+  /**
+   * Resumes a single partition that was previously paused by a flag record. Advances the offset
+   * past the flag so it won't be reprocessed.
+   */
+  private void resumePartition(TopicPartition tp) {
+    SinkRecord flagRecord = pausedPartitions.remove(tp);
+    if (flagRecord == null) {
+      return;
+    }
+
+    LOG.debug("Resuming partition {}, context is {}", tp, context);
+
+    sourceOffsets.put(tp, new Offset(flagRecord.kafkaOffset() + 1, flagRecord.timestamp()));
+    if (context != null) {
+      context.offset(tp, flagRecord.kafkaOffset() + 1);
+    }
   }
 
   private RecordWriter writerForTable(
