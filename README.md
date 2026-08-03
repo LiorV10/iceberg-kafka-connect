@@ -24,6 +24,7 @@ The Apache Iceberg Sink Connector is under active development, with early access
 zip archive yourself by running:
 ```bash
 ./gradlew -xtest clean build
+./gradlew -xtest -xcheckStyleMain -xcheckStyleTest clean build
 ```
 The zip archive will be found under `./kafka-connect-runtime/build/distributions`.
 

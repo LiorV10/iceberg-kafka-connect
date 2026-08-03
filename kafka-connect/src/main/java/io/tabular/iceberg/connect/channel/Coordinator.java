@@ -33,6 +33,7 @@ import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import io.tabular.iceberg.connect.TableContext;
@@ -42,6 +43,7 @@ import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.connect.events.CommitComplete;
 import org.apache.iceberg.connect.events.CommitToTable;
+import org.apache.iceberg.connect.events.DataWritten;
 import org.apache.iceberg.connect.events.Event;
 import org.apache.iceberg.connect.events.StartCommit;
 import org.apache.iceberg.connect.events.TableReference;
@@ -299,6 +301,15 @@ public class Coordinator extends Channel implements AutoCloseable {
     List<Envelope> allEnvelopesForTable =
         commitsById.values().stream().flatMap(List::stream).collect(toList());
 
+    // Deduplication used to run over this entire list. Keep that scope even though each commit-id
+    // must now be written in a separate snapshot: a path belongs only to the first commit-id where
+    // it was seen. Build ownership before offset filtering because an already-committed envelope
+    // still has to reserve its paths when the buffer is replayed after a partial failure.
+    Map<String, UUID> dataFileCommitIds =
+        firstCommitIdByFilePath(commitsById, DataWritten::dataFiles);
+    Map<String, UUID> deleteFileCommitIds =
+        firstCommitIdByFilePath(commitsById, DataWritten::deleteFiles);
+
     int sourcePartitionCount =
         this.members.stream()
             .mapToInt(
@@ -341,6 +352,8 @@ public class Coordinator extends Channel implements AutoCloseable {
           branch,
           commitId,
           envelopes,
+          dataFileCommitIds,
+          deleteFileCommitIds,
           offsetsJson(accumulatedOffsets),
           i == lastIdx ? vtts : null);
     }
@@ -379,6 +392,8 @@ public class Coordinator extends Channel implements AutoCloseable {
       Optional<String> branch,
       UUID commitId,
       List<Envelope> envelopeList,
+      Map<String, UUID> dataFileCommitIds,
+      Map<String, UUID> deleteFileCommitIds,
       String offsetsJson,
       OffsetDateTime vtts) {
     Map<Integer, Long> committedOffsets = lastCommittedOffsetsForTable(table, branch.orElse(null));
@@ -395,6 +410,9 @@ public class Coordinator extends Channel implements AutoCloseable {
     List<DataFile> dataFiles =
         Deduplicated.dataFiles(commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
+            .filter(
+                dataFile ->
+                    commitId.equals(dataFileCommitIds.get(dataFile.path().toString())))
             .filter(dataFile -> dataFile.recordCount() > 0)
             .collect(toList());
 
@@ -402,6 +420,9 @@ public class Coordinator extends Channel implements AutoCloseable {
         Deduplicated.deleteFiles(
                 commitId, tableIdentifier, filteredEnvelopeList)
             .stream()
+            .filter(
+                deleteFile ->
+                    commitId.equals(deleteFileCommitIds.get(deleteFile.path().toString())))
             .filter(deleteFile -> deleteFile.recordCount() > 0)
             .collect(toList());
 
@@ -475,6 +496,24 @@ public class Coordinator extends Channel implements AutoCloseable {
         snapshotId,
         commitId,
         vtts);
+  }
+
+  static <F extends ContentFile<?>> Map<String, UUID> firstCommitIdByFilePath(
+      Map<UUID, List<Envelope>> commitsById,
+      Function<DataWritten, List<F>> filesFromPayload) {
+    Map<String, UUID> result = new LinkedHashMap<>();
+    commitsById.forEach(
+        (commitId, envelopes) ->
+            envelopes.forEach(
+                envelope -> {
+                  List<F> files =
+                      filesFromPayload.apply((DataWritten) envelope.event().payload());
+                  if (files != null) {
+                    files.forEach(
+                        file -> result.putIfAbsent(file.path().toString(), commitId));
+                  }
+                }));
+    return result;
   }
 
   private void accumulateFlagVotes(
