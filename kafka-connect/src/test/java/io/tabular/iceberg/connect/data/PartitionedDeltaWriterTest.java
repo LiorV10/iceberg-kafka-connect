@@ -67,4 +67,61 @@ public class PartitionedDeltaWriterTest extends BaseWriterTest {
     assertThat(result.deleteFiles())
         .allMatch(file -> file.format() == FileFormat.fromString(format));
   }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"parquet", "orc"})
+  public void testSameKeyDifferentPartitionInBatchProducesSingleRow(String format) {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.upsertModeEnabled()).thenReturn(true);
+    when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
+    when(config.writeProps()).thenReturn(ImmutableMap.of("write.format.default", format));
+
+    when(table.spec()).thenReturn(SPEC);
+
+    // Same primary key (id, id2) but the partition column "data" differs between the two records.
+    // Without per-key dedup these route to two different RowDataDeltaWriters and both versions are
+    // inserted (2 data files, no positional delete). After dedup, only the latest record survives
+    // as a single data row.
+    Record row1 = GenericRecord.create(SCHEMA);
+    row1.setField("id", 123L);
+    row1.setField("data", "partitionA");
+    row1.setField("id2", 123L);
+
+    Record row2 = GenericRecord.create(SCHEMA);
+    row2.setField("id", 123L);
+    row2.setField("data", "partitionB");
+    row2.setField("id2", 123L);
+
+    WriteResult result =
+        writeTest(ImmutableList.of(row1, row2), config, PartitionedDeltaWriter.class);
+
+    // The two records collapse to a single key, so exactly one data row is written.
+    assertThat(totalRecordCount(ImmutableList.copyOf(result.dataFiles()))).isEqualTo(1);
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"parquet", "orc"})
+  public void testSameKeySamePartitionInBatchProducesSingleRow(String format) {
+    IcebergSinkConfig config = mock(IcebergSinkConfig.class);
+    when(config.upsertModeEnabled()).thenReturn(true);
+    when(config.tableConfig(any())).thenReturn(mock(TableSinkConfig.class));
+    when(config.writeProps()).thenReturn(ImmutableMap.of("write.format.default", format));
+
+    when(table.spec()).thenReturn(SPEC);
+
+    Record row1 = GenericRecord.create(SCHEMA);
+    row1.setField("id", 123L);
+    row1.setField("data", "samePartition");
+    row1.setField("id2", 123L);
+
+    Record row2 = GenericRecord.create(SCHEMA);
+    row2.setField("id", 123L);
+    row2.setField("data", "samePartition");
+    row2.setField("id2", 123L);
+
+    WriteResult result =
+        writeTest(ImmutableList.of(row1, row2), config, PartitionedDeltaWriter.class);
+
+    assertThat(totalRecordCount(ImmutableList.copyOf(result.dataFiles()))).isEqualTo(1);
+  }
 }
